@@ -339,6 +339,9 @@ bool parse_double(std::string_view s, double lo, double hi, double& out) {
 
 int main(int argc, char** argv) {
   uint16_t ws_port = 9000;
+  // WS 监听地址默认只回环：cued 没有鉴权，默认对外等于把解码/转码入口交给整个网络。
+  // 跨机演示必须显式 --bind 0.0.0.0（并在报告/README 里说明）。
+  std::string bind_addr = "127.0.0.1";
   std::string probe_host = "127.0.0.1";
   uint16_t probe_port = 9001;
 
@@ -374,6 +377,13 @@ int main(int argc, char** argv) {
     };
     if (a == "--ws-port") {
       ws_port = static_cast<uint16_t>(want_int(1, 65535));
+    } else if (a == "--bind") {
+      const auto val = next();
+      if (val.empty()) bad(val);
+      beast::error_code bec;
+      net::ip::make_address(std::string(val), bec);  // 非法地址在启动前就拒掉
+      if (bec) bad(val);
+      bind_addr = std::string(val);
     } else if (a == "--probe-host") {
       const auto val = next();
       if (val.empty()) bad(val);
@@ -424,10 +434,12 @@ int main(int argc, char** argv) {
       fec_enabled = (val == "on");
     } else if (a == "--help") {
       std::printf(
-          "cued --ws-port 9000 --probe-host 127.0.0.1 --probe-port 9001\n"
+          "cued --ws-port 9000 [--bind 127.0.0.1] --probe-host 127.0.0.1 --probe-port 9001\n"
           "     [--transcode on|off] [--width N --height N] [--bitrate kbps] [--fps N]\n"
           "     [--gop N] [--preset NAME] [--threads N] [--send-mbps F]\n"
-          "     [--inject-drop 0..100] [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n");
+          "     [--inject-drop 0..100] [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
+          "  --bind 默认 127.0.0.1（只回环）；跨机演示才用 --bind 0.0.0.0，\n"
+          "  并且必须自己限制网络可达性（cued 本身没有鉴权）。\n");
       return 0;
     } else {
       std::fprintf(stderr, "[cued] 未知参数: %.*s\n", static_cast<int>(a.size()), a.data());
@@ -472,14 +484,26 @@ int main(int argc, char** argv) {
 
   net::io_context ioc;
   beast::error_code ec;
+  const auto bind_ip = net::ip::make_address(bind_addr, ec);
+  if (ec) {
+    std::fprintf(stderr, "[cued] --bind 地址非法: %s\n", bind_addr.c_str());
+    return 2;
+  }
   tcp::acceptor acc(ioc);
-  acc.open(tcp::v4(), ec);
+  acc.open(bind_ip.is_v6() ? tcp::v6() : tcp::v4(), ec);
   acc.set_option(net::socket_base::reuse_address(true), ec);
-  acc.bind(tcp::endpoint(net::ip::make_address("0.0.0.0"), ws_port), ec);
+  acc.bind(tcp::endpoint(bind_ip, ws_port), ec);
   acc.listen(net::socket_base::max_listen_connections, ec);
   if (ec) {
-    std::fprintf(stderr, "[cued] listen %u failed: %s\n", ws_port, ec.message().c_str());
+    std::fprintf(stderr, "[cued] listen %s:%u failed: %s\n", bind_addr.c_str(), ws_port,
+                 ec.message().c_str());
     return 1;
+  }
+  if (!bind_ip.is_loopback()) {
+    // 默认回环，显式对外时把风险说清楚：cued 不做任何鉴权
+    std::fprintf(stderr,
+                 "[cued] 警告：WS 监听 %s:%u（对外可达，cued 无鉴权），请自行限制网络访问\n",
+                 bind_addr.c_str(), ws_port);
   }
   // 用原生 fd：主线程 sendto，NACK 线程 recvfrom（同一个 UDP socket 全双工）
   const int usock = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -588,13 +612,14 @@ int main(int argc, char** argv) {
     }
   } nack_guard{stop_nack, nack_thread};
 
-  std::fprintf(stderr, "[cued] ws :%u  udp -> %s:%u (M2a: decode + 6-stage profile)\n", ws_port,
-               probe_host.c_str(), probe_port);
+  std::fprintf(stderr, "[cued] ws %s:%u  udp -> %s:%u (M2a: decode + 6-stage profile)\n",
+               bind_addr.c_str(), ws_port, probe_host.c_str(), probe_port);
 
   // pipeline.started：一次 cued 生命周期的起点（重启会再出现一条，带新的 pid）
   emit_event("pipeline.started",
              json{{"pid", ::getpid()},
                   {"ws_port", ws_port},
+                  {"bind", bind_addr},
                   {"probe_host", probe_host},
                   {"probe_port", probe_port},
                   {"fps", out_fps},
