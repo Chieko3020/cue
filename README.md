@@ -23,8 +23,8 @@
 推流页（原生 HTML/JS）  agent 内核                  媒体管线               下行接收端
  · Canvas 合成源        外层：阶段状态机             WS 接收/重组            · 重组 / NACK / FEC
  · WebCodecs 编码       内层：ReAct 工具循环         解码（libavcodec）      · 指标
- · WS 上行  ─────────▶  工具层（三级风险）           算子图（缩放/转码）     · 指标
- · SSE 事件（M5 计划）  session / 上下文预算         编码（libx264）        · 跨平台
+ · WS 上行  ─────────▶  工具层（三级风险）           算子图（缩放/转码）     · 跨机部署
+ · SSE 事件（M5 计划）  session / 上下文预算         编码（libx264）
  · HTTP 控制（M5 计划） 审批 · 事件流（M5）           发送（整形/FEC）
                         评测引擎（case/注入/判分）   ◀── 损伤注入点（用户态）
 ```
@@ -43,7 +43,7 @@
 | 前端 | 原生 HTML + Canvas + WebCodecs（零构建、无外部 CDN） |
 | LLM 接入 | libcurl（OpenAI 兼容接口） |
 | 音频 | Opus（SPEC §7.8，未实现） |
-| 沙箱 | landlock + rlimit（M6 计划） |
+| 沙箱 | landlock + rlimit（SPEC §6 M3 要求，未实现） |
 
 ## 快速开始
 
@@ -119,7 +119,7 @@ src/           与 include 分层对应的实现
 web/           推流页（Canvas 合成源 + WebCodecs + WS 上行）
 suites/        评测用例（m2-constraints.json、m4-diagnosis.json）
 scripts/       run.sh · test-client.mjs · e2e-browser.cjs
-tests/         doctest 单测
+tests/         无框架单测（手写 check，靠 ctest 退出码）
 ```
 
 ## 设计文档
