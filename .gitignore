@@ -1,0 +1,37 @@
+# ── 开发过程文档（仅 README 入库）──
+/docs/
+/discussion/
+/research/
+/SPEC.md
+/RECEIPT.md
+/tickets/
+
+# ── 构建产物 ──
+/build/
+/cmake-build-*/
+/compile_commands.json
+*.o
+*.a
+*.so
+*.d
+*.gcda
+*.gcno
+*.profraw
+
+# ── 运行时数据 ──
+/runs/
+/cassettes/
+/logs/
+*.log
+*.jsonl
+
+# ── 前端 ──
+/web/node_modules/
+/web/dist/
+.vite/
+
+# ── 本地环境 ──
+.env
+.env.local
+*.local
+.DS_Store
