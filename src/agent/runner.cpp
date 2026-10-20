@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "cue/agent/agent.h"
+#include "cue/agent/context.h"
 #include "cue/common/clock.h"
 
 namespace cue::agent {
@@ -104,6 +105,15 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
     req.tools.push_back(stage_complete_schema());
     // 阶段提示作为最后一条 user 消息里追加（不污染历史）
     req.messages.push_back(llm::ChatMessage{.role = "user", .content = stage_hint(stage)});
+    // 上下文预算：超限丢最旧观测，保留 system 与最近若干条
+    {
+      ContextBudget cb;
+      cb.max_tokens = cfg_.max_context_tokens;
+      const std::size_t dropped = trim(req.messages, cb);
+      if (dropped > 0) {
+        emit("context.trim", {{"dropped", dropped}, {"est_tokens", estimate_tokens(req.messages)}});
+      }
+    }
 
     auto resp = llm_.chat(req);
     if (!resp) {

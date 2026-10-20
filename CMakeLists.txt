@@ -55,3 +55,7 @@ add_test(NAME wire COMMAND test_wire)
 add_executable(test_agent tests/test_agent.cpp)
 target_link_libraries(test_agent PRIVATE cue_core)
 add_test(NAME agent COMMAND test_agent)
+
+add_executable(test_context tests/test_context.cpp)
+target_link_libraries(test_context PRIVATE cue_core)
+add_test(NAME context COMMAND test_context)

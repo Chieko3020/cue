@@ -53,6 +53,8 @@ class Runner {
     tool::CallContext ctx;
     // 每 1M prompt+completion token 的价格（元），用于成本预算；0 表示不计量
     double yuan_per_mtok = 2.0;
+    // 上下文预算：超出后丢最旧观测（system 与最近若干条必须保留）
+    std::size_t max_context_tokens = 24000;
   };
 
   Runner(llm::ILlmClient& llm, const tool::Registry& tools, Config cfg);
