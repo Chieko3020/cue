@@ -193,14 +193,90 @@ inline std::optional<DatagramHeader> decode_datagram(std::span<const uint8_t> b)
   return h;
 }
 
+// ---------------------------------------------------------------- NACK / FEC 载荷
+// NACK 条目与 FEC 载荷统一在这里编解码：两端各写一份 memcpy 的旧写法，谁先把一边
+// 改成小端谁就静默不兼容（review #18）。
+inline constexpr std::size_t kNackEntrySize = 6;
+inline constexpr std::size_t kMaxNackEntries = 64;  // SPEC §7.2：单包 ≤ 64 条
+
+struct NackEntry {
+  uint32_t frame_id = 0;
+  uint16_t frag_index = 0;
+};
+
+inline void append_nack_entry(std::vector<uint8_t>& out, const NackEntry& e) {
+  const std::size_t off = out.size();
+  out.resize(off + kNackEntrySize);
+  detail::put_u32(&out[off], e.frame_id);
+  detail::put_u16(&out[off + 4], e.frag_index);
+}
+
+inline std::vector<NackEntry> decode_nack_entries(std::span<const uint8_t> b) {
+  const std::size_t n = b.size() / kNackEntrySize;
+  std::vector<NackEntry> out;
+  out.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    const uint8_t* p = b.data() + i * kNackEntrySize;
+    out.push_back(NackEntry{detail::get_u32(p), detail::get_u16(p + 4)});
+  }
+  return out;
+}
+
+// FEC 载荷：u32 base_frame_id | u16 group_index | u16 member_count | data（SPEC §7.2）
+inline constexpr std::size_t kFecPayloadHeaderSize = 8;
+
+struct FecPayloadHeader {
+  uint32_t base_frame_id = 0;
+  uint16_t group_index = 0;   // 一帧一组：显式写 0，不再靠"整段零填充"隐式约定
+  uint16_t member_count = 0;  // 必须与数据报头的 frag_count 一致（probe 侧交叉校验）
+};
+
+inline std::array<uint8_t, kFecPayloadHeaderSize> encode(const FecPayloadHeader& h) {
+  std::array<uint8_t, kFecPayloadHeaderSize> b{};
+  detail::put_u32(&b[0], h.base_frame_id);
+  detail::put_u16(&b[4], h.group_index);
+  detail::put_u16(&b[6], h.member_count);
+  return b;
+}
+
+inline std::optional<FecPayloadHeader> decode_fec_payload_header(std::span<const uint8_t> b) {
+  if (b.size() < kFecPayloadHeaderSize) return std::nullopt;
+  FecPayloadHeader h;
+  h.base_frame_id = detail::get_u32(&b[0]);
+  h.group_index = detail::get_u16(&b[4]);
+  h.member_count = detail::get_u16(&b[6]);
+  return h;
+}
+
+// ---------------------------------------------------------------- 下行分片
+// 切片失败的原因：调用方（cued）要能区分"空帧"与"超协议上限"，而不是一律当丢帧（review #34）
+enum class SplitError : uint8_t { None = 0, EmptyFrame, TooManyFragments };
+
+inline const char* split_error_reason(SplitError e) {
+  switch (e) {
+    case SplitError::None: return "ok";
+    case SplitError::EmptyFrame: return "empty_frame";
+    case SplitError::TooManyFragments: return "too_many_fragments";
+  }
+  return "unknown";
+}
+
 // 把一帧切成 ≤kMaxUdpPayload 的分片，返回每个分片的完整数据报（头 + payload）。
+// why 非空时写回失败原因（成功写 None）。
 inline std::vector<std::vector<uint8_t>> split_into_datagrams(
     std::span<const uint8_t> frame, uint32_t session_id, uint32_t frame_id,
-    uint64_t pts_us, bool keyframe) {
+    uint64_t pts_us, bool keyframe, SplitError* why = nullptr) {
+  if (why) *why = SplitError::None;
   std::vector<std::vector<uint8_t>> out;
-  if (frame.empty()) return out;
+  if (frame.empty()) {
+    if (why) *why = SplitError::EmptyFrame;
+    return out;
+  }
   const std::size_t total = (frame.size() + kMaxUdpPayload - 1) / kMaxUdpPayload;
-  if (total > kMaxFragPerFrame) return out;  // 超限帧直接丢弃（M1 不处理）
+  if (total > kMaxFragPerFrame) {
+    if (why) *why = SplitError::TooManyFragments;  // 超限帧不再静默丢弃
+    return out;
+  }
   out.reserve(total);
   for (std::size_t i = 0; i < total; ++i) {
     const std::size_t off = i * kMaxUdpPayload;

@@ -4,9 +4,10 @@
 # 用法：
 #   ./scripts/run.sh              # 等价 demo-min：起媒体链路，Ctrl-C 结束
 #   ./scripts/run.sh demo-min     # 同上
-#   ./scripts/run.sh demo         # 构建后跑 ./build/cue demo（脚本化 LLM，不联网、不花钱）
+#   ./scripts/run.sh demo         # 构建后跑 <BUILD_DIR>/cue demo（脚本化 LLM，不联网、不花钱）
 #
-# 环境变量：BIND（静态页监听地址，默认 127.0.0.1）、WS_PORT、PROBE_PORT、HTTP_PORT、JOBS
+# 环境变量：BIND（静态页监听地址，默认 127.0.0.1）、WS_PORT、PROBE_PORT、HTTP_PORT、JOBS、
+#           BUILD_DIR（构建目录，默认 build）、CXX（默认 g++-14，找不到时退回 g++）
 #
 # 安全口径（如实说明）：cued 目前没有 --bind 参数，WS 端口无条件 bind 0.0.0.0；
 # BIND 只作用于静态页。即 WS 端口（默认 9000）对可达网络开放，跨机演示请自行限制防火墙。
@@ -29,6 +30,7 @@ WS_PORT="${WS_PORT:-9000}"
 PROBE_PORT="${PROBE_PORT:-9001}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 JOBS="${JOBS:-$(nproc)}"
+BUILD_DIR="${BUILD_DIR:-build}"
 CXX="${CXX:-$(command -v g++-14 || command -v g++)}"
 
 PIDS=()
@@ -70,24 +72,35 @@ for spec in "WS_PORT:$WS_PORT:tcp" "HTTP_PORT:$HTTP_PORT:tcp" "PROBE_PORT:$PROBE
   fi
 done
 
+# CMake 不允许在已有 build 目录里原地更换编译器：缓存里若还是 g++（13），
+# 直接传 g++-14 只会在 configure 阶段报一堆"变量已改变"，看不懂。先给出可执行的处置。
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+  CACHED_CXX="$(sed -n 's/^CMAKE_CXX_COMPILER:FILEPATH=//p' "$BUILD_DIR/CMakeCache.txt" | head -1)"
+  if [[ -n "$CACHED_CXX" ]] && [[ "$(basename "$CACHED_CXX")" != "$(basename "$CXX")" ]]; then
+    echo "[cue] $BUILD_DIR 是用 $CACHED_CXX 配置的，与 CXX=$CXX 不一致；" >&2
+    echo "[cue] CMake 不能原地换编译器，请先 rm -rf $BUILD_DIR 再重跑，或 CXX=$CACHED_CXX ./scripts/run.sh" >&2
+    exit 1
+  fi
+fi
+
 echo "[cue] build（$CXX）"
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER="$CXX" >/dev/null
-cmake --build build -j"$JOBS" 2>&1 | tail -2
+cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER="$CXX" >/dev/null
+cmake --build "$BUILD_DIR" -j"$JOBS" 2>&1 | tail -2
 
 if [[ "$MODE" == demo ]]; then
   echo "[cue] demo：脚本化 LLM 跑一次完整诊断（离线）"
-  ./build/cue demo
+  "$BUILD_DIR/cue" demo
   exit 0
 fi
 
 echo "[cue] probe  udp :$PROBE_PORT"
-./build/cue-probe --port "$PROBE_PORT" &
+"$BUILD_DIR/cue-probe" --port "$PROBE_PORT" &
 PROBE_PID=$!
 PIDS+=("$PROBE_PID")
 
 echo "[cue] cued   ws  :$WS_PORT  -> udp :$PROBE_PORT"
 echo "[cue] 注意：cued 无 --bind，WS :$WS_PORT 监听 0.0.0.0（BIND 仅作用于静态页）"
-./build/cued --ws-port "$WS_PORT" --probe-port "$PROBE_PORT" &
+"$BUILD_DIR/cued" --ws-port "$WS_PORT" --probe-port "$PROBE_PORT" &
 MEDIA_PID=$!
 PIDS+=("$MEDIA_PID")
 

@@ -25,6 +25,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <map>
 #include <string>
@@ -119,27 +120,57 @@ class RetransmitCache {
   std::deque<std::pair<uint32_t, std::vector<std::vector<uint8_t>>>> frames_;
 };
 
-// 令牌桶：按字节计费（SPEC §7.2 的每会话限速）
+// 令牌桶：SPEC §7.2「10 Mbps / 64 包突发」。
+// 口径按**包**计费（包大小按 kMaxUdpPayload + 24 B 头折算成包速率），这样 24 B/包的
+// 头开销不会被漏算；突发是 64 包常量而不是"5% 窗口字节数"。
+// 不足时先丢非关键帧：关键帧允许透支，但透支上限也是 64 包，关键帧风暴不能无限超发。
 class TokenBucket {
  public:
-  TokenBucket(double bits_per_sec, double burst_bytes)
-      : rate_bytes_(bits_per_sec / 8.0), burst_(burst_bytes), tokens_(burst_bytes) {}
+  static constexpr double kBurstPackets = 64.0;
+  static constexpr double kPacketBytes =
+      double(cue::proto::kMaxUdpPayload + cue::proto::kDatagramHeaderSize);
 
-  bool take(std::size_t bytes, int64_t now_us) {
-    if (last_us_ == 0) last_us_ = now_us;
-    const double dt = double(now_us - last_us_) / 1e6;
-    last_us_ = now_us;
-    tokens_ = std::min(burst_, tokens_ + dt * rate_bytes_);
-    if (tokens_ < double(bytes)) return false;
-    tokens_ -= double(bytes);
+  explicit TokenBucket(double bits_per_sec) : rate_pkts_(bits_per_sec / 8.0 / kPacketBytes) {}
+
+  // 非关键帧：令牌不够就丢（不排队）
+  bool take_nonkey(std::size_t pkts, int64_t now_us) {
+    refill(now_us);
+    if (tokens_ < double(pkts)) return false;
+    tokens_ -= double(pkts);
+    return true;
+  }
+  // 关键帧：允许透支到 -burst，保证"先丢非关键帧"这条语义真的成立
+  bool take_key(std::size_t pkts, int64_t now_us) {
+    refill(now_us);
+    if (tokens_ - double(pkts) < -kBurstPackets) return false;
+    tokens_ -= double(pkts);
     return true;
   }
 
  private:
-  double rate_bytes_;
-  double burst_;
-  double tokens_;
+  void refill(int64_t now_us) {
+    if (last_us_ == 0) last_us_ = now_us;
+    // 时间回拨（NTP/CLOCK_MONOTONIC 不会，但参数注入的假时钟可能）不能让 dt 变负
+    const double dt = now_us > last_us_ ? double(now_us - last_us_) / 1e6 : 0.0;
+    last_us_ = now_us;
+    tokens_ = std::min(kBurstPackets, tokens_ + dt * rate_pkts_);
+  }
+
+  double rate_pkts_;
+  double tokens_ = kBurstPackets;
   int64_t last_us_ = 0;
+};
+
+// 限流日志：同一类错误 1 s 内只打一行（弱网/配置错误不能把 stderr 刷爆）
+struct RateLimitedLog {
+  void log(int64_t now_us, std::string msg) {
+    if (msg == last && now_us - t_last_us < 1'000'000) return;
+    std::fprintf(stderr, "[cued] %s\n", msg.c_str());
+    last = std::move(msg);
+    t_last_us = now_us;
+  }
+  int64_t t_last_us = 0;
+  std::string last;
 };
 
 struct FrameAcc {
@@ -158,12 +189,15 @@ struct Counters {
   uint64_t frames_decoded = 0;
   uint64_t decode_errors = 0;
   uint64_t injected_drops = 0;
-  uint64_t rejected = 0;  // 协议边界拒绝（wire.h 的 validate_media 给出具体原因）
+  uint64_t rejected = 0;      // 协议边界拒绝（wire.h 的 validate_media 给出具体原因）
+  uint64_t budget_drops = 0;  // 令牌桶不足丢的帧（先丢非关键帧）
+  uint64_t send_errors = 0;   // sendto 失败的包（ENOBUFS/EMSGSIZE 不再被当成"已发送"）
 };
 
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counters& c) {
   for (auto it = pending.begin(); it != pending.end();) {
     if (now_us - it->second.first_seen_us > 2'000'000) {
+      ++c.frames_in;  // 帧在"完成或超时"处结算，重复首片/缺首片都不会再算错
       ++c.frames_dropped;
       it = pending.erase(it);
     } else {
@@ -177,10 +211,13 @@ const char* kStageNames[6] = {"recv", "buffer", "decode", "op", "encode", "send"
 void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, uint64_t& frames_prev) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
-  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu dec=%llu dec_err=%llu rej=%llu MB=%.2f",
+  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu bkt=%llu serr=%llu dec=%llu "
+              "dec_err=%llu rej=%llu MB=%.2f",
               double(df) / dt, static_cast<unsigned long long>(c.frames_in),
               static_cast<unsigned long long>(c.frames_out), static_cast<unsigned long long>(c.frames_dropped),
               static_cast<unsigned long long>(c.injected_drops),
+              static_cast<unsigned long long>(c.budget_drops),
+              static_cast<unsigned long long>(c.send_errors),
               static_cast<unsigned long long>(c.frames_decoded),
               static_cast<unsigned long long>(c.decode_errors),
               static_cast<unsigned long long>(c.rejected),
@@ -205,7 +242,9 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
          {"injected", c.injected_drops},
          {"decoded", c.frames_decoded},
          {"decode_errors", c.decode_errors},
-         {"rejected", c.rejected}};
+         {"rejected", c.rejected},
+         {"budget_drops", c.budget_drops},
+         {"send_errors", c.send_errors}};
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
       m[kStageNames[i]] = nullptr;
@@ -280,7 +319,8 @@ int main(int argc, char** argv) {
 
   cue::media::TranscodeChain chain;
   bool chain_ready = false;
-  TokenBucket bucket(send_mbps * 1e6, send_mbps * 1e6 / 8.0 * 0.05);
+  // 10 Mbps / 64 包突发（SPEC §7.2）：包速率按 1224 B/包折算，头开销一并计入
+  TokenBucket bucket(send_mbps * 1e6);
 
   net::io_context ioc;
   beast::error_code ec;
@@ -315,32 +355,63 @@ int main(int argc, char** argv) {
   }
   RetransmitCache xmit_cache;
 
+  // NACK 重传线程：阻塞在 poll(200ms) 上而不是裸 recvfrom——退出路径才能
+  // stop_nack=true 后 join()；旧实现从不 join，主循环哪天能正常退出就会被
+  // std::thread 析构里的 std::terminate 打死（review #21）。
   std::atomic<bool> stop_nack{false};
+  std::atomic<uint64_t> nack_resends{0};
   std::thread nack_thread([&] {
     std::vector<uint8_t> nbuf(2048);
+    RateLimitedLog err_log;
     while (!stop_nack.load(std::memory_order_relaxed)) {
+      pollfd pfd{usock, POLLIN, 0};
+      const int pr = ::poll(&pfd, 1, 200);
+      if (pr < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      if (pr == 0) continue;  // 超时：回到循环头检查停止位
       sockaddr_in from{};
       socklen_t fl = sizeof(from);
-      const ssize_t n = ::recvfrom(usock, nbuf.data(), nbuf.size(), 0,
+      const ssize_t n = ::recvfrom(usock, nbuf.data(), nbuf.size(), MSG_DONTWAIT,
                                    reinterpret_cast<sockaddr*>(&from), &fl);
       if (n < static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) continue;
+      // 只服务本会话的 probe：任意源都能触发重传就是一个反射放大器（review #20）
+      if (from.sin_addr.s_addr != probe_addr.sin_addr.s_addr ||
+          from.sin_port != probe_addr.sin_port) {
+        continue;
+      }
       auto nh = cue::proto::decode_datagram({nbuf.data(), static_cast<size_t>(n)});
       if (!nh || nh->type != static_cast<uint8_t>(cue::proto::DownType::Nack)) continue;
-      const uint8_t* p = nbuf.data() + cue::proto::kDatagramHeaderSize;
-      std::size_t remain = static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize;
-      while (remain >= 6) {
-        uint32_t fid = 0;
-        uint16_t idx = 0;
-        std::memcpy(&fid, p, 4);
-        std::memcpy(&idx, p + 4, 2);
-        p += 6;
-        remain -= 6;
-        if (auto pkt = xmit_cache.find(fid, idx)) {
-          ::sendto(usock, pkt->data(), pkt->size(), 0, reinterpret_cast<const sockaddr*>(&from), fl);
+      const auto entries = cue::proto::decode_nack_entries(
+          {nbuf.data() + cue::proto::kDatagramHeaderSize,
+           static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize});
+      for (const auto& e : entries) {
+        auto pkt = xmit_cache.find(e.frame_id, e.frag_index);
+        if (!pkt) continue;
+        // SPEC §7.2 下行 flags bit1：重传包必须能被接收端识别成重传
+        if (pkt->size() > 2) {
+          (*pkt)[2] = static_cast<uint8_t>((*pkt)[2] | cue::proto::kDownFlagRetransmit);
         }
+        const ssize_t sn = ::sendto(usock, pkt->data(), pkt->size(), 0,
+                                    reinterpret_cast<const sockaddr*>(&from), fl);
+        if (sn < 0) {
+          err_log.log(cue::now_us(), std::string("nack 重传 sendto 失败: ") + std::strerror(errno));
+          continue;
+        }
+        nack_resends.fetch_add(1, std::memory_order_relaxed);
       }
     }
   });
+  // 退出路径的 RAII：即使将来给主循环加了正常退出条件，也不会漏 join
+  struct NackGuard {
+    std::atomic<bool>& stop;
+    std::thread& th;
+    ~NackGuard() {
+      stop.store(true);
+      if (th.joinable()) th.join();
+    }
+  } nack_guard{stop_nack, nack_thread};
 
   std::fprintf(stderr, "[cued] ws :%u  udp -> %s:%u (M2a: decode + 6-stage profile)\n", ws_port,
                probe_host.c_str(), probe_port);
@@ -371,6 +442,7 @@ int main(int argc, char** argv) {
     // 旧口径 frame_id*64+pk 在 1080p 关键帧（>63 分片）时会与 FEC 包 / 下一帧撞号，
     // 丢包不再独立同分布；FEC 冗余包与数据包共用这一序号空间。
     uint64_t pkt_seq = 0;
+    RateLimitedLog err_log;  // 每连接一份：重启 cued 后限流状态跟着新会话走
 
     for (;;) {
       beast::flat_buffer buf;
@@ -416,7 +488,8 @@ int main(int argc, char** argv) {
 
       session_id = h->stream_id;
       c.bytes_in += n;
-      if (h->frag_index == 0) ++c.frames_in;
+      // frames_in 不再按 "frag_index==0" 计：首片丢失会少计、重复首片会多计。
+      // 改成「帧完成或超时」时结算（review #35），与 probe 侧的 frames 口径一致。
 
       const int64_t now = cue::now_us();
       auto& fa = pending[h->frame_id];
@@ -428,7 +501,10 @@ int main(int argc, char** argv) {
         fa.parts.resize(fa.count);
       }
       if (h->frag_index < fa.count) {
-        fa.parts[h->frag_index].assign(p + cue::proto::kMediaHeaderSize, p + n);
+        // 只吃 payload_len 字节：整段剩余字节可能带尾随垃圾（review #17）；
+        // validate_media 已保证 payload_len <= n - 32
+        const uint8_t* frag = p + cue::proto::kMediaHeaderSize;
+        fa.parts[h->frag_index].assign(frag, frag + h->payload_len);
         if (h->flags & cue::proto::kUpFlagKeyframe) fa.keyframe = true;
       }
 
@@ -440,6 +516,7 @@ int main(int argc, char** argv) {
         }
       }
       if (!complete) continue;
+      ++c.frames_in;  // 帧在「完成或超时」处结算（#35）
 
       const int64_t t_buffer_done = cue::now_us();
       rings[0].push(t_buffer_done - fa.first_seen_us);
@@ -503,66 +580,96 @@ int main(int argc, char** argv) {
       if (enc_sampled) rings[4].push(enc_us);
 
       const int64_t t_send0 = cue::now_us();
-      if (skip_send || !bucket.take(payload.size(), t_send0)) {
+      std::vector<std::vector<uint8_t>> datagrams;
+      cue::proto::SplitError split_err = cue::proto::SplitError::None;
+      bool budget_ok = false;
+      if (!skip_send) {
+        datagrams = cue::proto::split_into_datagrams(payload, session_id, h->frame_id, fa.pts_us,
+                                                     keyframe, &split_err);
+        if (!datagrams.empty()) {
+          // SPEC §7.2 令牌桶：按包计费（含 24 B 头）、64 包突发、不足时先丢非关键帧
+          budget_ok = keyframe ? bucket.take_key(datagrams.size(), t_send0)
+                               : bucket.take_nonkey(datagrams.size(), t_send0);
+        }
+      }
+      if (skip_send) {
+        ++c.frames_dropped;
+      } else if (split_err != cue::proto::SplitError::None) {
+        // 空帧 / 超过单帧 1024 分片：协议上限内发不出去，计 rejected 而不是静默丢（#34）
+        ++c.rejected;
+        ++c.frames_dropped;
+        err_log.log(cue::now_us(),
+                    std::string("帧无法切片: ") + cue::proto::split_error_reason(split_err));
+      } else if (!budget_ok) {
+        ++c.budget_drops;
         ++c.frames_dropped;
       } else {
-        auto datagrams =
-            cue::proto::split_into_datagrams(payload, session_id, h->frame_id, fa.pts_us, keyframe);
-        if (datagrams.empty()) {
-          ++c.frames_dropped;
-        } else {
-          xmit_cache.put(h->frame_id, datagrams);
+        xmit_cache.put(h->frame_id, datagrams);
 
-          // 注入丢包：判定序号必须是整条连接全局单调、且与 FEC 包共用一个序号空间。
-          // 旧口径 frame_id*64+pk 在分片数 >64（720p 关键帧）时会与 FEC 包撞号，
-          // 且 frame_id*64+64 == (frame_id+1)*64 会跨帧撞号 → 丢包不再独立同分布。
-          std::size_t pk = 0;
-          for (auto& d : datagrams) {
-            const std::size_t cur_pk = pk++;
-            if (injector.drop(pkt_seq++)) {
-              ++c.injected_drops;
-              if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", h->frame_id, cur_pk);
-              continue;
-            }
-            ::sendto(usock, d.data(), d.size(), 0,
-                     reinterpret_cast<const sockaddr*>(&probe_addr), sizeof(probe_addr));
+        // sendto 的返回值与 errno 不能丢：ENOBUFS/EMSGSIZE 会被算成「已发送」（review #16）
+        auto send_dgram = [&](const std::vector<uint8_t>& d) -> bool {
+          const ssize_t sn = ::sendto(usock, d.data(), d.size(), 0,
+                                      reinterpret_cast<const sockaddr*>(&probe_addr),
+                                      sizeof(probe_addr));
+          if (sn < 0) {
+            ++c.send_errors;
+            err_log.log(cue::now_us(), std::string("sendto 失败: ") + std::strerror(errno));
+            return false;
           }
+          return true;
+        };
 
-          // XOR-FEC：一帧的所有分片为一组，生成 1 个冗余包
-          if (fec_enabled && datagrams.size() > 1) {
-            std::size_t maxlen = 0;
-            for (auto& d : datagrams) {
-              maxlen = std::max(maxlen, d.size() - cue::proto::kDatagramHeaderSize);
-            }
-            std::vector<uint8_t> parity(maxlen, 0);
-            for (auto& d : datagrams) {
-              const std::size_t plen = d.size() - cue::proto::kDatagramHeaderSize;
-              for (std::size_t i = 0; i < plen; ++i) {
-                parity[i] ^= d[cue::proto::kDatagramHeaderSize + i];
-              }
-            }
-            cue::proto::DatagramHeader fh;
-            fh.type = static_cast<uint8_t>(cue::proto::DownType::Fec);
-            fh.session_id = session_id;
-            fh.frame_id = h->frame_id;
-            fh.frag_index = 0;
-            fh.frag_count = static_cast<uint16_t>(datagrams.size());
-            fh.pts_us = fa.pts_us;
-            auto hdr = cue::proto::encode(fh);
-            std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
-            const std::size_t base = fpkt.size();
-            fpkt.resize(base + 8 + maxlen, 0);
-            std::memcpy(fpkt.data() + base, &h->frame_id, 4);
-            const uint16_t mc = static_cast<uint16_t>(datagrams.size());
-            std::memcpy(fpkt.data() + base + 6, &mc, 2);
-            std::memcpy(fpkt.data() + base + 8, parity.data(), maxlen);
-            if (!injector.drop(pkt_seq++)) {
-              ::sendto(usock, fpkt.data(), fpkt.size(), 0,
-                       reinterpret_cast<const sockaddr*>(&probe_addr), sizeof(probe_addr));
-            }
+        // 注入丢包：判定序号必须是整条连接全局单调、且与 FEC 包共用一个序号空间。
+        // 旧口径 frame_id*64+pk 在分片数 >64（720p 关键帧）时会与 FEC 包撞号，
+        // 且 frame_id*64+64 == (frame_id+1)*64 会跨帧撞号 → 丢包不再独立同分布。
+        bool all_sent = true;
+        std::size_t pk = 0;
+        for (auto& d : datagrams) {
+          const std::size_t cur_pk = pk++;
+          if (injector.drop(pkt_seq++)) {
+            ++c.injected_drops;
+            if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", h->frame_id, cur_pk);
+            continue;
           }
-          ++c.frames_out;
+          if (!send_dgram(d)) all_sent = false;
         }
+
+        // XOR-FEC：一帧的所有分片为一组，生成 1 个冗余包。
+        // 载荷的字节序/字段顺序收在 wire.h（两端不再各写一份 memcpy，review #18）。
+        if (fec_enabled && datagrams.size() > 1) {
+          std::size_t maxlen = 0;
+          for (auto& d : datagrams) {
+            maxlen = std::max(maxlen, d.size() - cue::proto::kDatagramHeaderSize);
+          }
+          std::vector<uint8_t> parity(maxlen, 0);
+          for (auto& d : datagrams) {
+            const std::size_t plen = d.size() - cue::proto::kDatagramHeaderSize;
+            for (std::size_t i = 0; i < plen; ++i) {
+              parity[i] ^= d[cue::proto::kDatagramHeaderSize + i];
+            }
+          }
+          cue::proto::DatagramHeader fh;
+          fh.type = static_cast<uint8_t>(cue::proto::DownType::Fec);
+          fh.session_id = session_id;
+          fh.frame_id = h->frame_id;
+          fh.frag_index = 0;
+          fh.frag_count = static_cast<uint16_t>(datagrams.size());
+          fh.pts_us = fa.pts_us;
+          const auto hdr = cue::proto::encode(fh);
+          std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
+          cue::proto::FecPayloadHeader ph;
+          ph.base_frame_id = h->frame_id;
+          ph.group_index = 0;  // 一帧一组：显式写 0，不再靠"零填充"隐式约定
+          ph.member_count = static_cast<uint16_t>(datagrams.size());
+          const auto phb = cue::proto::encode(ph);
+          fpkt.insert(fpkt.end(), phb.begin(), phb.end());
+          fpkt.insert(fpkt.end(), parity.begin(), parity.end());
+          if (!injector.drop(pkt_seq++)) {
+            if (!send_dgram(fpkt)) all_sent = false;
+          }
+        }
+        // 真实上线率：只要有一包没被内核接受，这一帧就不算发出去（review #16）
+        if (all_sent) ++c.frames_out;
       }
       rings[5].push(cue::now_us() - t_send0);
 

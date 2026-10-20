@@ -15,7 +15,8 @@ option(CUE_WERROR "把警告当错误（CI 口径，SPEC §9）" ON)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
   message(FATAL_ERROR
     "需要 GCC >= 14（C++23 std::expected）；当前 ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
-    "重新配置并显式指定编译器：cmake -S . -B build -DCMAKE_CXX_COMPILER=g++-14")
+    "重新配置并显式指定编译器：cmake -S . -B build -DCMAKE_CXX_COMPILER=g++-14\n"
+    "若 build/ 里已有旧编译器的缓存，先 rm -rf build（CMake 不允许原地更换编译器）")
 endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
