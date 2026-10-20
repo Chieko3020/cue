@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -262,6 +263,28 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
   t_last = now_us;
 }
 
+// CLI 解析：不用 std::stoi/std::stod —— 非法值抛出的异常会穿透 main（SPEC §9 禁止
+// 异常穿透模块边界）。from_chars + 范围校验，失败打一行原因并以退出码 2 结束（review #22）。
+bool parse_int(std::string_view s, long long lo, long long hi, long long& out) {
+  if (s.empty()) return false;
+  long long v = 0;
+  const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+  if (ec != std::errc() || p != s.data() + s.size()) return false;
+  if (v < lo || v > hi) return false;
+  out = v;
+  return true;
+}
+
+bool parse_double(std::string_view s, double lo, double hi, double& out) {
+  if (s.empty()) return false;
+  double v = 0;
+  const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+  if (ec != std::errc() || p != s.data() + s.size()) return false;
+  if (!(v >= lo && v <= hi)) return false;  // 同时挡掉 NaN
+  out = v;
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -283,28 +306,79 @@ int main(int argc, char** argv) {
   bool fec_enabled = true;
 
   for (int i = 1; i < argc; ++i) {
-    std::string_view a = argv[i];
-    auto next = [&]() -> std::string {
-      return (i + 1 < argc) ? std::string(argv[++i]) : std::string();
+    const std::string_view a = argv[i];
+    auto next = [&]() -> std::string_view {
+      return (i + 1 < argc) ? std::string_view(argv[++i]) : std::string_view();
     };
-    if (a == "--ws-port") ws_port = static_cast<uint16_t>(std::stoi(next()));
-    else if (a == "--probe-host") probe_host = next();
-    else if (a == "--probe-port") probe_port = static_cast<uint16_t>(std::stoi(next()));
-    else if (a == "--transcode") transcode_enabled = (next() == "on");
-    else if (a == "--width") out_w = std::stoi(next());
-    else if (a == "--height") out_h = std::stoi(next());
-    else if (a == "--bitrate") out_kbps = std::stoi(next());
-    else if (a == "--fps") out_fps = std::stoi(next());
-    else if (a == "--gop") out_gop = std::stoi(next());
-    else if (a == "--preset") preset = next();
-    else if (a == "--send-mbps") send_mbps = std::stod(next());
-    else if (a == "--inject-drop") inject_drop = std::stod(next());
-    else if (a == "--inject-seed") inject_seed = std::stoull(next());
-    else if (a == "--inject-trace") inject_trace = next();
-    else if (a == "--fec") fec_enabled = (next() == "on");
-    else if (a == "--help") {
-      std::printf("cued --ws-port 9000 --probe-host 127.0.0.1 --probe-port 9001\n");
+    auto bad = [&](std::string_view val) {
+      std::fprintf(stderr, "[cued] 参数 %.*s 非法: '%.*s'\n", static_cast<int>(a.size()), a.data(),
+                   static_cast<int>(val.size()), val.data());
+      std::exit(2);
+    };
+    auto want_int = [&](long long lo, long long hi) {
+      long long v = 0;
+      const auto val = next();
+      if (!parse_int(val, lo, hi, v)) bad(val);
+      return v;
+    };
+    if (a == "--ws-port") {
+      ws_port = static_cast<uint16_t>(want_int(1, 65535));
+    } else if (a == "--probe-host") {
+      const auto val = next();
+      if (val.empty()) bad(val);
+      probe_host = std::string(val);
+    } else if (a == "--probe-port") {
+      probe_port = static_cast<uint16_t>(want_int(1, 65535));
+    } else if (a == "--transcode") {
+      const auto val = next();
+      if (val != "on" && val != "off") bad(val);
+      transcode_enabled = (val == "on");
+    } else if (a == "--width") {
+      out_w = static_cast<int>(want_int(0, 4096));
+    } else if (a == "--height") {
+      out_h = static_cast<int>(want_int(0, 4096));
+    } else if (a == "--bitrate") {
+      out_kbps = static_cast<int>(want_int(1, 20000));
+    } else if (a == "--fps") {
+      out_fps = static_cast<int>(want_int(1, 240));
+    } else if (a == "--gop") {
+      out_gop = static_cast<int>(want_int(1, 600));
+    } else if (a == "--preset") {
+      const auto val = next();
+      if (val.empty()) bad(val);
+      preset = std::string(val);
+    } else if (a == "--send-mbps") {
+      const auto val = next();
+      if (!parse_double(val, 0.1, 10000.0, send_mbps)) bad(val);
+    } else if (a == "--inject-drop") {
+      // 旧实现用 stod + static_cast<uint64_t>，负数会变成巨大值（UB）
+      const auto val = next();
+      if (!parse_double(val, 0.0, 100.0, inject_drop)) bad(val);
+    } else if (a == "--inject-seed") {
+      const auto val = next();
+      if (val.empty()) bad(val);
+      unsigned long long v = 0;
+      const auto [pe, ec] = std::from_chars(val.data(), val.data() + val.size(), v);
+      if (ec != std::errc() || pe != val.data() + val.size()) bad(val);
+      inject_seed = static_cast<uint64_t>(v);
+    } else if (a == "--inject-trace") {
+      const auto val = next();
+      if (val.empty()) bad(val);
+      inject_trace = std::string(val);
+    } else if (a == "--fec") {
+      const auto val = next();
+      if (val != "on" && val != "off") bad(val);
+      fec_enabled = (val == "on");
+    } else if (a == "--help") {
+      std::printf(
+          "cued --ws-port 9000 --probe-host 127.0.0.1 --probe-port 9001\n"
+          "     [--transcode on|off] [--width N --height N] [--bitrate kbps] [--fps N]\n"
+          "     [--gop N] [--preset NAME] [--send-mbps F]\n"
+          "     [--inject-drop 0..100] [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n");
       return 0;
+    } else {
+      std::fprintf(stderr, "[cued] 未知参数: %.*s\n", static_cast<int>(a.size()), a.data());
+      return 2;
     }
   }
 
@@ -360,6 +434,7 @@ int main(int argc, char** argv) {
   // std::thread 析构里的 std::terminate 打死（review #21）。
   std::atomic<bool> stop_nack{false};
   std::atomic<uint64_t> nack_resends{0};
+  std::atomic<uint32_t> cur_session{0};  // 当前连接的会话号：NACK 线程据此过滤（review #20）
   std::thread nack_thread([&] {
     std::vector<uint8_t> nbuf(2048);
     RateLimitedLog err_log;
@@ -382,7 +457,33 @@ int main(int argc, char** argv) {
         continue;
       }
       auto nh = cue::proto::decode_datagram({nbuf.data(), static_cast<size_t>(n)});
-      if (!nh || nh->type != static_cast<uint8_t>(cue::proto::DownType::Nack)) continue;
+      if (!nh) continue;
+      if (nh->type == static_cast<uint8_t>(cue::proto::DownType::StatsReq)) {
+        // SPEC §7.1 时钟对齐：probe 发下行回环请求（载荷 = 它的发戳），这里原样回显发戳
+        // 并附上自己的时钟；跨机部署的端到端延迟由此有确定口径（review #9）。
+        if (n < static_cast<ssize_t>(cue::proto::kDatagramHeaderSize + 8)) continue;
+        cue::proto::DatagramHeader sh;
+        sh.type = static_cast<uint8_t>(cue::proto::DownType::StatsReq);
+        sh.session_id = nh->session_id;
+        const auto shb = cue::proto::encode(sh);
+        std::vector<uint8_t> rep(shb.begin(), shb.end());
+        const std::size_t base = rep.size();
+        rep.resize(base + 16, 0);
+        std::memcpy(rep.data() + base, nbuf.data() + cue::proto::kDatagramHeaderSize, 8);
+        cue::proto::detail::put_u64(rep.data() + base + 8,
+                                    static_cast<uint64_t>(cue::now_us()));
+        if (::sendto(usock, rep.data(), rep.size(), 0, reinterpret_cast<const sockaddr*>(&from),
+                     fl) < 0) {
+          err_log.log(cue::now_us(), std::string("stats 回包 sendto 失败: ") +
+                                         std::strerror(errno));
+        }
+        continue;
+      }
+      if (nh->type != static_cast<uint8_t>(cue::proto::DownType::Nack)) continue;
+      // 会话号校验（review #20）：probe 回带下行头里的 session_id
+      const uint32_t sid = nh->session_id;
+      const uint32_t cur = cur_session.load(std::memory_order_relaxed);
+      if (sid != 0 && cur != 0 && sid != cur) continue;
       const auto entries = cue::proto::decode_nack_entries(
           {nbuf.data() + cue::proto::kDatagramHeaderSize,
            static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize});
@@ -487,6 +588,7 @@ int main(int argc, char** argv) {
       if (h->type != static_cast<uint8_t>(cue::proto::MediaType::Video)) continue;
 
       session_id = h->stream_id;
+      cur_session.store(session_id, std::memory_order_relaxed);
       c.bytes_in += n;
       // frames_in 不再按 "frag_index==0" 计：首片丢失会少计、重复首片会多计。
       // 改成「帧完成或超时」时结算（review #35），与 probe 侧的 frames 口径一致。
