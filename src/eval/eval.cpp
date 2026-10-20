@@ -638,10 +638,11 @@ std::expected<std::vector<Case>, std::string> load_suite(const std::string& path
 std::string Engine::config_hash() const {
   std::string cued_hash;
   if (!cfg_.cued_bin.empty()) cued_hash = cue::sha256_file(cfg_.cued_bin);
-  return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" +
-                         fmt_double(cfg_.max_yuan) + "|" + cfg_.model + "|" + cfg_.cued_bin + "|" +
-                         cued_hash + "|" + fmt_double(cfg_.yuan_per_mtok) + "|" +
-                         std::to_string(cfg_.warmup_s));
+  // max_yuan（成本闸门）不进指纹：它只是"跑多少"的护栏，不是被测配置。
+  // 进指纹会让"闸门触发后续跑"因为换了闸门值而全量作废，与断点续跑语义冲突。
+  return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
+                         "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
+                         fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s));
 }
 
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
@@ -1102,6 +1103,7 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   std::map<std::string, int> pass_count;   // case_id -> 全成功次数
   std::map<std::string, int> attempt_count;
   bool stop = false;
+  int skipped_manual = 0;
 
   for (std::size_t ci = 0; ci < cases.size() && !stop; ++ci) {
     const auto& c = cases[ci];
@@ -1117,6 +1119,7 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
       // 不进入成功率分母（否则会被当成"答错"污染统计）
       if (c.manual_only && cfg_.agent_mode == "real") {
         if (k == 0) r.failure_modes.push_back("skipped manual_only: " + c.id);
+        ++skipped_manual;
         continue;
       }
       CaseOutcome o;
@@ -1155,7 +1158,7 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
     }
   }
   // 截断 = 闸门/取消导致没跑完计划数（manual_only 跳过不算截断）
-  r.truncated = r.gated || cancelled();
+  r.truncated = cancelled() || (r.executed + skipped_manual < r.planned);
   if (r.truncated) {
     r.failure_modes.push_back("truncated: 计划 " + std::to_string(r.planned) + " 次，实际执行 " +
                               std::to_string(r.executed) + " 次");

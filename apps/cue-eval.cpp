@@ -276,6 +276,8 @@ int main(int argc, char** argv) {
   }
   if (report.io_errors > 0) return 5;
   if (report.scored == 0) return 1;
+  // 截断（成本闸门/取消）不是"全过"：剩余 case 没跑，CI 不能绿灯
+  if (report.truncated) return 1;
   // 退出码必须覆盖三级成功率与 pass^k：只看 root/evidence 时 SLA 全灭也会返回 0（假绿灯）
   return (report.run_errors == 0 && report.root_rate >= 1.0 && report.evidence_rate >= 1.0 &&
           report.sla_rate >= 1.0 && report.pass_k >= 1.0)
