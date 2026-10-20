@@ -4,7 +4,18 @@
 //   cue-eval --suite ... --mode real --repeat 1 --warmup 6        # 需并行推流
 //   cue-eval --resume run-<id>                                    # 断点续跑
 //   cue-eval --diff run-<a> run-<b>                               # 回归对比
+//
+// 退出码：
+//   0  全部通过（三级成功率与 pass^k 都是 100%，无 run_error）
+//   1  有未通过（含 SLA 未达成、pass^k 不足、run_error）
+//   2  用法错误 / 无法产出结果（state 写不进、run 被并发占用）
+//   3  --diff 两边不可比（指纹/suite/mode/repeat 不同）
+//   4  --diff case 集变动（仅 A 有 / 仅 B 有）
+//   5  报告/state 写入失败
+//   130 被 SIGINT/SIGTERM 取消
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -19,6 +30,10 @@ namespace eval = cue::eval;
 
 namespace {
 
+std::atomic<bool> g_cancel{false};
+
+void on_signal(int) { g_cancel.store(true); }
+
 int usage() {
   std::printf(
       "cue-eval — Cue 评测 CLI\n"
@@ -27,44 +42,94 @@ int usage() {
       "           [--out dir] [--warmup s] [--model name] [--cued path]\n"
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
       "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
-
       "\n"
-      "real 模式需环境变量 CUE_API_KEY / CUE_BASE_URL / CUE_MODEL，且需外部推流。\n");
+      "  --suite 必填（scripted 只是引擎自检，不会默认替用户选一个 suite）。\n"
+      "  real 模式需环境变量 CUE_API_KEY / CUE_BASE_URL，且需外部推流。\n"
+      "  单价可用 CUE_YUAN_PER_MTOK 覆盖（估算，不是账单）。\n"
+      "\n"
+      "  退出码：0 全过 / 1 有未通过 / 2 用法或无法产出 / 3 diff 不可比 /\n"
+      "          4 diff case 集变动 / 5 写入失败 / 130 被取消\n");
   return 0;
 }
 
+std::string header_str(const nlohmann::json& h, const char* key) {
+  if (!h.is_object() || !h.contains(key) || !h[key].is_string()) return {};
+  return h[key].get<std::string>();
+}
+
+int header_int(const nlohmann::json& h, const char* key, int fallback) {
+  if (!h.is_object() || !h.contains(key) || !h[key].is_number_integer()) return fallback;
+  return h[key].get<int>();
+}
+
 int do_diff(const std::string& run_a, const std::string& run_b, const std::string& out_dir) {
-  eval::StateMap a;
-  eval::StateMap b;
-  std::string err;
-  if (!eval::load_state(out_dir + "/" + run_a + "/state.jsonl", a, err)) {
-    std::fprintf(stderr, "读取 A 失败: %s\n", err.c_str());
-    return 1;
+  const std::string pa = out_dir + "/" + run_a + "/state.jsonl";
+  const std::string pb = out_dir + "/" + run_b + "/state.jsonl";
+  eval::RunInfo ia;
+  eval::RunInfo ib;
+  ia.run_id = run_a;
+  ib.run_id = run_b;
+  auto hdr_a = eval::read_state_header(pa);
+  auto hdr_b = eval::read_state_header(pb);
+  if (!hdr_a) {
+    std::fprintf(stderr, "读取 A header 失败: %s\n", hdr_a.error().c_str());
+    return 2;
   }
-  if (!eval::load_state(out_dir + "/" + run_b + "/state.jsonl", b, err)) {
-    std::fprintf(stderr, "读取 B 失败: %s\n", err.c_str());
-    return 1;
+  if (!hdr_b) {
+    std::fprintf(stderr, "读取 B header 失败: %s\n", hdr_b.error().c_str());
+    return 2;
   }
-  const auto d = eval::diff_runs(run_a, a, run_b, b);
+  // 指纹/配置必须参与 diff：判分器升级后的差异不能被读成"已修复 N"（review-eval.md #16）
+  ia.fingerprint = header_str(*hdr_a, "fingerprint");
+  ib.fingerprint = header_str(*hdr_b, "fingerprint");
+  ia.suite = header_str(*hdr_a, "suite");
+  ib.suite = header_str(*hdr_b, "suite");
+  ia.mode = header_str(*hdr_a, "mode");
+  ib.mode = header_str(*hdr_b, "mode");
+  ia.repeat = header_int(*hdr_a, "repeat", 1);
+  ib.repeat = header_int(*hdr_b, "repeat", 1);
+
+  auto a = eval::load_state(pa);
+  if (!a) {
+    std::fprintf(stderr, "读取 A 失败: %s\n", a.error().c_str());
+    return 2;
+  }
+  auto b = eval::load_state(pb);
+  if (!b) {
+    std::fprintf(stderr, "读取 B 失败: %s\n", b.error().c_str());
+    return 2;
+  }
+  const auto d = eval::diff_runs(ia, *a, ib, *b);
   const std::string md = eval::render_diff_markdown(d);
   const std::string path = out_dir + "/diff-" + run_a + "-" + run_b + ".md";
   std::ofstream out(path);
   if (!out) {
     std::fprintf(stderr, "无法写入 %s\n", path.c_str());
-  } else {
-    out << md;
-    std::printf("[eval] diff 已写入 %s\n", path.c_str());
+    return 5;
+  }
+  out << md;
+  out.flush();
+  if (!out) {
+    std::fprintf(stderr, "写 diff 失败 %s\n", path.c_str());
+    return 5;
   }
   std::printf("%s", md.c_str());
-  // 有回归（新增失败）时以非零退出码提示 CI
-  return d.new_failures > 0 ? 1 : 0;
+  std::printf("[eval] diff 已写入 %s\n", path.c_str());
+  if (d.new_failures > 0) return 1;            // 有回归：CI 拦截
+  if (!d.comparable) return 3;                 // 配置不同：差异不可归因
+  if (d.only_a > 0 || d.only_b > 0) return 4;  // case 集变了：不能让 CI 静默通过
+  return 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Ctrl-C：置位取消标志，让评测把当前 case 的管线停掉再退出（AC-8：无残留子进程）
+  std::signal(SIGINT, on_signal);
+  std::signal(SIGTERM, on_signal);
+
   eval::RunConfig cfg;
-  cfg.suite_path = "suites/m2-constraints.json";
+  cfg.suite_path.clear();
   std::string diff_a, diff_b;
   bool suite_set = false;
   bool mode_set = false;
@@ -82,18 +147,22 @@ int main(int argc, char** argv) {
     } else if (a == "--repeat") {
       cfg.repeat = std::max(1, std::atoi(next().c_str()));
       repeat_set = true;
-    }
-    else if (a == "--max-yuan") cfg.max_yuan = std::atof(next().c_str());
-    else if (a == "--out") cfg.out_dir = next();
-    else if (a == "--warmup") cfg.warmup_s = std::max(0, std::atoi(next().c_str()));
-    else if (a == "--model") cfg.model = next();
-    else if (a == "--cued") cfg.cued_bin = next();
-    else if (a == "--resume") cfg.resume_run_id = next();
-    else if (a == "--diff") {
+    } else if (a == "--max-yuan") {
+      cfg.max_yuan = std::atof(next().c_str());
+    } else if (a == "--out") {
+      cfg.out_dir = next();
+    } else if (a == "--warmup") {
+      cfg.warmup_s = std::max(0, std::atoi(next().c_str()));
+    } else if (a == "--model") {
+      cfg.model = next();
+    } else if (a == "--cued") {
+      cfg.cued_bin = next();
+    } else if (a == "--resume") {
+      cfg.resume_run_id = next();
+    } else if (a == "--diff") {
       diff_a = next();
       diff_b = next();
-    }
-    else if (a == "--help" || a == "-h") {
+    } else if (a == "--help" || a == "-h") {
       return usage();
     } else {
       std::fprintf(stderr, "未知参数: %s\n", a.c_str());
@@ -109,21 +178,33 @@ int main(int argc, char** argv) {
     return do_diff(diff_a, diff_b, cfg.out_dir);
   }
 
+  // 单价：环境变量优先（报告里回显的单价必须是实际使用的那个）
+  if (const char* price = std::getenv("CUE_YUAN_PER_MTOK"); price && *price) {
+    const double v = std::atof(price);
+    if (v > 0) cfg.yuan_per_mtok = v;
+  }
+
+  if (cfg.agent_mode != "scripted" && cfg.agent_mode != "real") {
+    std::fprintf(stderr, "--mode 只能是 scripted 或 real（收到 %s）\n", cfg.agent_mode.c_str());
+    return 2;
+  }
+
   if (!cfg.resume_run_id.empty()) {
     const std::string state = cfg.out_dir + "/" + cfg.resume_run_id + "/state.jsonl";
     if (!std::filesystem::exists(state)) {
       std::fprintf(stderr, "续跑失败：%s 不存在（用新 run 请去掉 --resume）\n", state.c_str());
       return 2;
     }
-    // 续跑必须沿用原 run 的 suite/mode/repeat：否则指纹全变，缓存全废
+    // 续跑必须沿用原 run 的 suite/mode/repeat：显式传入却与 header 不一致时直接拒绝，
+    // 否则会拿新配置去撞旧指纹，缓存全废还报出"复用"（review-eval.md #20）
     auto hdr = eval::read_state_header(state);
     if (!hdr) {
       std::fprintf(stderr, "续跑失败：%s\n", hdr.error().c_str());
       return 2;
     }
-    const std::string h_suite = hdr->value("suite", std::string());
-    const std::string h_mode = hdr->value("mode", cfg.agent_mode);
-    const int h_repeat = hdr->value("repeat", cfg.repeat);
+    const std::string h_suite = header_str(*hdr, "suite");
+    const std::string h_mode = header_str(*hdr, "mode");
+    const int h_repeat = header_int(*hdr, "repeat", cfg.repeat);
     if (!h_suite.empty()) {
       if (suite_set && cfg.suite_path != h_suite) {
         std::fprintf(stderr, "续跑失败：--suite=%s 与原 run 的 %s 不一致\n", cfg.suite_path.c_str(),
@@ -132,32 +213,67 @@ int main(int argc, char** argv) {
       }
       cfg.suite_path = h_suite;
     }
-    if (!mode_set) cfg.agent_mode = h_mode;
-    if (!repeat_set) cfg.repeat = std::max(1, h_repeat);
+    if (mode_set && cfg.agent_mode != h_mode) {
+      std::fprintf(stderr, "续跑失败：--mode=%s 与原 run 的 %s 不一致\n", cfg.agent_mode.c_str(),
+                   h_mode.c_str());
+      return 2;
+    }
+    cfg.agent_mode = h_mode.empty() ? cfg.agent_mode : h_mode;
+    if (repeat_set && cfg.repeat != h_repeat) {
+      std::fprintf(stderr, "续跑失败：--repeat=%d 与原 run 的 %d 不一致\n", cfg.repeat, h_repeat);
+      return 2;
+    }
+    cfg.repeat = std::max(1, h_repeat);
     std::printf("[eval] 续跑沿用原 run 配置：suite=%s mode=%s repeat=%d\n", cfg.suite_path.c_str(),
                 cfg.agent_mode.c_str(), cfg.repeat);
   }
 
-  std::string err;
-  const auto cases = eval::load_suite(cfg.suite_path, err);
-  if (!err.empty()) {
-    std::fprintf(stderr, "加载 suite 失败: %s\n", err.c_str());
+  // scripted 只是引擎自检，不允许再"默认选一个 suite"糊出 100% 报告
+  if (!suite_set && cfg.suite_path.empty()) {
+    std::fprintf(stderr, "缺 --suite：scripted 模式只是引擎自检，必须显式指定要跑的 suite\n");
+    return 2;
+  }
+
+  auto cases = eval::load_suite(cfg.suite_path);
+  if (!cases) {
+    std::fprintf(stderr, "加载 suite 失败: %s\n", cases.error().c_str());
     return 1;
   }
-  std::printf("[eval] suite=%s cases=%zu mode=%s repeat=%d\n", cfg.suite_path.c_str(), cases.size(),
+  std::printf("[eval] suite=%s cases=%zu mode=%s repeat=%d\n", cfg.suite_path.c_str(), cases->size(),
               cfg.agent_mode.c_str(), cfg.repeat);
 
+  cfg.cancel = &g_cancel;
   eval::Engine engine(cfg);
-  const auto report = engine.run(cases);
+  const auto report = engine.run(*cases);
+  if (!report.fatal_error.empty()) {
+    // 不能写 report.md：resume 失败时会把原 run 的报告覆盖成 0 分（review-eval.md #8）
+    std::fprintf(stderr, "[eval] 未产出结果：%s\n", report.fatal_error.c_str());
+    return 2;
+  }
   const std::string md = engine.render_markdown(report);
 
   std::error_code ec;
   std::filesystem::create_directories(cfg.out_dir + "/" + report.run_id, ec);
+  const std::string report_path = cfg.out_dir + "/" + report.run_id + "/report.md";
   {
-    std::ofstream out(cfg.out_dir + "/" + report.run_id + "/report.md");
+    std::ofstream out(report_path);
+    if (!out) {
+      std::fprintf(stderr, "无法写入 %s\n", report_path.c_str());
+      return 5;
+    }
     out << md;
+    out.flush();
+    if (!out) {
+      std::fprintf(stderr, "写 %s 失败\n", report_path.c_str());
+      return 5;
+    }
   }
   std::printf("%s\n", md.c_str());
+  if (g_cancel.load()) {
+    std::fprintf(stderr, "[eval] 已按信号取消（已完成部分已落盘，可 --resume）\n");
+    return 130;
+  }
+  if (report.io_errors > 0) return 5;
   if (report.scored == 0) return 1;
   // 退出码必须覆盖三级成功率与 pass^k：只看 root/evidence 时 SLA 全灭也会返回 0（假绿灯）
   return (report.run_errors == 0 && report.root_rate >= 1.0 && report.evidence_rate >= 1.0 &&

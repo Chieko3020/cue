@@ -1,22 +1,16 @@
 {
   "suite": "m2-constraints",
   "version": 1,
-  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。M2 阶段先以声明形式存在，用于人工复现与 M4 的接入契约。",
+  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。两者都只能人工复现（AVC level 由浏览器侧 configure 决定，FEC 幽灵帧不在 8 类根因枚举内），因此标 manual_only：real 模式跳过、不计入成功率分母。suite 字段必须全部被引擎认识——未知字段一律报错，避免『写错字段 → SLA 恒真 → 假绿灯』。",
   "cases": [
     {
       "id": "avc-level-mismatch",
       "seed": 1,
+      "manual_only": true,
       "fault": {
-        "kind": "config",
-        "params": {
-          "codec": "avc1.42001E",
-          "width": 1920,
-          "height": 1080,
-          "expected_error": "coded area 2088960 exceeds maximum 414720"
-        }
+        "kind": "none"
       },
       "pipeline": {
-        "profile": "p1080p30",
         "transcode": false
       },
       "prompt": "上行 VideoEncoder.configure() 直接抛错：coded area 2088960 exceeds maximum 414720 (AVC level 3.0)。定位原因并修复，使 1080p 能正常编码。",
@@ -44,16 +38,14 @@
     {
       "id": "fec-ghost-frame",
       "seed": 1,
+      "manual_only": true,
       "fault": {
-        "kind": "fec",
+        "kind": "drop",
         "params": {
-          "inject_drop_pct": 5,
-          "fec": true,
-          "nack": true
+          "inject_drop_pct": 5
         }
       },
       "pipeline": {
-        "profile": "p480p30",
         "transcode": false
       },
       "prompt": "下行注入 5% 丢包并启用 XOR-FEC。检查 probe 侧是否出现『完成帧数超过发送帧数』或 frames_no_data 异常增长（幽灵帧），并给出根因。",
@@ -76,8 +68,7 @@
         "max_turns": 8,
         "max_yuan": 0.15,
         "max_wall_s": 180
-      },
-      "manual_only": true
+      }
     }
   ]
 }

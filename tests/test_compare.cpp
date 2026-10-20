@@ -1,4 +1,4 @@
-// M4b 回归对比测试：case 级 diff 分类（新增失败 / 已修复 / 仍失败 / 仍通过）+ run_error 口径
+// M4b 回归对比测试：case 级 diff 分类 + run_error 单列 + 指纹不可比告警
 #include <cstdio>
 #include <string>
 
@@ -31,42 +31,91 @@ eval::CaseOutcome make_outcome(const std::string& id, bool root, bool evidence, 
   return o;
 }
 
+eval::CaseOutcome make_error(const std::string& id) {
+  eval::CaseOutcome o;
+  o.id = id;
+  o.scored = false;
+  o.error_kind = "agent_timeout";
+  return o;
+}
+
+eval::RunInfo info(const std::string& id, const std::string& fp) {
+  eval::RunInfo r;
+  r.run_id = id;
+  r.fingerprint = fp;
+  r.suite = "suites/m4-diagnosis.json";
+  r.mode = "real";
+  r.repeat = 1;
+  return r;
+}
+
 }  // namespace
 
 int main() {
-  // 回归对比分类
+  // 1) 基本分类：新增失败 / 已修复 / 仍失败 / 仍通过 / 仅 B 有
   {
-    // A：c1 过，c2 失败，c3 过；B：c1 失败（新增失败），c2 过（已修复），c3 过，c4 仅 B 有
     eval::StateMap a;
     eval::StateMap b;
     a[{0, 0}] = eval::CachedOutcome{make_outcome("c1", true, true, true), "fp"};
     a[{1, 0}] = eval::CachedOutcome{make_outcome("c2", false, true, true), "fp"};
-    a[{2, 0}] = eval::CachedOutcome{make_outcome("c3", true, true, true), "fp"};
+    a[{2, 0}] = eval::CachedOutcome{make_outcome("c3", false, true, true), "fp"};
+    a[{3, 0}] = eval::CachedOutcome{make_outcome("c4", true, true, true), "fp"};
     b[{0, 0}] = eval::CachedOutcome{make_outcome("c1", true, true, false), "fp"};
     b[{1, 0}] = eval::CachedOutcome{make_outcome("c2", true, true, true), "fp"};
-    b[{2, 0}] = eval::CachedOutcome{make_outcome("c3", true, true, true), "fp"};
-    b[{3, 0}] = eval::CachedOutcome{make_outcome("c4", true, true, true), "fp"};
+    b[{2, 0}] = eval::CachedOutcome{make_outcome("c3", false, true, true), "fp"};
+    b[{4, 0}] = eval::CachedOutcome{make_outcome("c5", true, true, true), "fp"};
 
-    const auto d = eval::diff_runs("runA", a, "runB", b);
+    const auto d = eval::diff_runs(info("runA", "fp1"), a, info("runB", "fp1"), b);
+    check(d.comparable, "同指纹 → 可比");
     check(d.new_failures == 1, "diff 新增失败 = 1");
     check(d.fixed == 1, "diff 已修复 = 1");
-    check(d.still_passing == 1, "diff 仍通过 = 1");
-    check(d.still_failing == 0, "diff 仍失败 = 0");
-    check(d.only_b == 1, "diff 仅 B 有 = 1");
+    check(d.still_failing == 1, "diff 仍失败 = 1");
+    check(d.still_passing == 0, "diff 仍通过 = 0");
+    check(d.only_a == 1 && d.only_b == 1, "diff 仅 A/仅 B 各有 1");
     const auto md = eval::render_diff_markdown(d);
     check(md.find("新增失败") != std::string::npos && md.find("已修复") != std::string::npos,
           "diff markdown 含分类");
-    check(md.find("c1") != std::string::npos && md.find("c4") != std::string::npos, "diff markdown 含 case");
-
-    // run_error 不算通过
-    eval::StateMap er;
-    eval::CaseOutcome o = make_outcome("c5", true, true, true);
-    o.scored = false;
-    o.error_kind = "agent_timeout";
-    er[{0, 0}] = eval::CachedOutcome{o, "fp"};
-    const auto agg = eval::aggregate(er);
-    check(agg.at("c5").run_errors == 1 && !agg.at("c5").pass(), "run_error 不计为通过");
+    check(md.find("c1") != std::string::npos && md.find("c5") != std::string::npos, "diff markdown 含 case");
+    check(md.find("case 集发生变化") != std::string::npos, "case 集变动有醒目提示");
   }
+
+  // 2) run_error 单列 Inconclusive：不能报成"新增失败"（CI 会误红）
+  {
+    eval::StateMap a;
+    eval::StateMap b;
+    a[{0, 0}] = eval::CachedOutcome{make_outcome("c1", true, true, true), "fp"};
+    b[{0, 0}] = eval::CachedOutcome{make_error("c1"), "fp"};
+    eval::StateMap ea;  // A 侧也是 run_error
+    ea[{0, 0}] = eval::CachedOutcome{make_error("c1"), "fp"};
+    b[{1, 0}] = eval::CachedOutcome{make_outcome("c2", true, true, true), "fp"};
+    ea[{1, 0}] = eval::CachedOutcome{make_error("c2"), "fp"};
+
+    const auto d = eval::diff_runs(info("A", "fp"), a, info("B", "fp"), b);
+    check(d.new_failures == 0, "run_error 不算新增失败");
+    check(d.inconclusive == 1, "run_error 计入不可判定");
+    const auto md = eval::render_diff_markdown(d);
+    check(md.find("不可判定") != std::string::npos, "diff markdown 有不可判定分组");
+    const auto agg = eval::aggregate(ea);
+    check(agg.at("c1").run_errors == 1 && !agg.at("c1").pass(), "run_error 不计为通过");
+  }
+
+  // 3) 不可比：指纹/suite/mode/repeat 不一致时必须显式告警（不能被读成"已修复 N"）
+  {
+    eval::StateMap a;
+    eval::StateMap b;
+    a[{0, 0}] = eval::CachedOutcome{make_outcome("c1", false, true, true), "fp"};
+    b[{0, 0}] = eval::CachedOutcome{make_outcome("c1", true, true, true), "fp"};
+    auto ib = info("B", "fp2");
+    ib.suite = "suites/other.json";
+    ib.mode = "scripted";
+    ib.repeat = 3;
+    const auto d = eval::diff_runs(info("A", "fp1"), a, ib, b);
+    check(!d.comparable, "指纹/配置不同 → 不可比");
+    check(d.warnings.size() >= 4, "指纹/suite/mode/repeat 各有一条告警");
+    const auto md = eval::render_diff_markdown(d);
+    check(md.find("两 run 不可比") != std::string::npos, "diff markdown 有不可比 banner");
+  }
+
   if (failures == 0) {
     std::printf("test_compare: OK\n");
     return 0;
