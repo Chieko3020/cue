@@ -82,6 +82,8 @@ class Runner {
   llm::ILlmClient& llm_;
   const tool::Registry& tools_;
   Config cfg_;
+  // 上下文 token 估算的在线校准系数 k（SPEC §7.9：事后以 usage 为真值）
+  double ctx_k_ = 1.0;
 };
 
 }  // namespace cue::agent

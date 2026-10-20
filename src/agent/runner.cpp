@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <expected>
@@ -224,9 +225,15 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     {
       ContextBudget cb;
       cb.max_tokens = cfg_.max_context_tokens;
-      const std::size_t dropped = trim(req.messages, cb);
-      if (dropped > 0) {
-        emit("context.trim", {{"dropped", dropped}, {"est_tokens", estimate_tokens(req.messages)}});
+      cb.k = ctx_k_;
+      // tools schema 每轮都发，必须单独计入（漏算会系统性低估预算）
+      cb.reserve_tokens = estimate_tokens(req.tools);
+      const TrimResult tr = trim_report(req.messages, cb);
+      if (tr.dropped > 0 || tr.truncated > 0) {
+        emit("context.trim", {{"dropped", tr.dropped},
+                              {"truncated", tr.truncated},
+                              {"est_tokens", estimate_tokens(req.messages)},
+                              {"k", ctx_k_}});
       }
     }
 
@@ -236,6 +243,14 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       break;
     }
     ++r.turns;
+    // SPEC §7.9：以 API usage 为真值校准估算系数（一阶平滑，限幅避免单次异常打乱预算）
+    if (resp->usage.prompt_tokens > 0) {
+      const std::size_t est = estimate_tokens(req.messages);
+      if (est > 0) {
+        const double sample = double(resp->usage.prompt_tokens) / double(est);
+        ctx_k_ = std::min(5.0, std::max(0.3, 0.5 * ctx_k_ + 0.5 * sample));
+      }
+    }
     r.cost_yuan +=
         (double(resp->usage.prompt_tokens) * price_in + double(resp->usage.completion_tokens) * price_out) / 1e6;
     emit("llm.response",
