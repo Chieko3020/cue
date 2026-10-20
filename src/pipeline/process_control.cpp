@@ -213,6 +213,9 @@ bool ProcessPipelineControl::set_param(const std::string& key, const std::string
     else if (key == "gop") next.gop = std::stoi(value);
     else if (key == "preset") next.preset = value;
     else if (key == "transcode") next.transcode = (value == "on" || value == "true" || value == "1");
+    // SPEC §7.4 的 key 枚举含 width/height：档位表驱动的「降分辨率」必须能执行
+    else if (key == "width") next.width = std::stoi(value);
+    else if (key == "height") next.height = std::stoi(value);
     else {
       err = "unsupported key: " + key;
       return false;
@@ -229,6 +232,21 @@ bool ProcessPipelineControl::set_param(const std::string& key, const std::string
   if (next.gop < 1 || next.gop > 300) {
     err = "gop out of range [1, 300]";
     return false;
+  }
+  // 0/0 表示「沿用解码尺寸」；只给一个维度没有意义（cued 侧无法推断另一边）
+  if ((next.width == 0) != (next.height == 0)) {
+    err = "width/height must be set together (0/0 = follow decoded size)";
+    return false;
+  }
+  if (next.width > 0) {
+    if (next.width < 16 || next.width > 4096 || next.height < 16 || next.height > 4096) {
+      err = "width/height out of range [16, 4096]";
+      return false;
+    }
+    if (next.width % 2 != 0 || next.height % 2 != 0) {
+      err = "width/height must be even (x264 I420 requirement)";
+      return false;
+    }
   }
   // 幂等：配置没变就不重启（重启会断流，agent 反复 set 同值会空转）
   if (next.bitrate_kbps == cfg_.bitrate_kbps && next.gop == cfg_.gop && next.preset == cfg_.preset &&

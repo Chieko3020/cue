@@ -32,6 +32,10 @@ class H264Decoder {
   void close();
   bool is_open() const { return ctx_ != nullptr; }
 
+  // 丢弃解码器内部状态（参考帧/延迟帧）。新连接或上行分辨率变化后必须调用，
+  // 否则旧参考帧会残留到下一个 IDR，表现为持续花屏。
+  void flush();
+
   // 喂一帧 Annex-B 数据；返回解码出的最后一张帧（借用指针，下次 decode 前有效；nullptr 表示无输出）
   AVFrame* decode(std::span<const uint8_t> frame, std::string& err);
 
@@ -40,7 +44,8 @@ class H264Decoder {
     uint64_t packets = 0;
     uint64_t frames = 0;
     uint64_t errors = 0;
-    uint64_t dropped = 0;
+    uint64_t dropped = 0;  // 未被解码器消费的包（send_packet 失败 / 持续 EAGAIN）
+    uint64_t flushes = 0;
   };
   const Stats& stats() const { return stats_; }
 

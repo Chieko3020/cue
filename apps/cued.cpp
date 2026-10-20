@@ -354,6 +354,21 @@ int main(int argc, char** argv) {
       ws.read(buf, ec);
       if (ec) break;
 
+      // 周期任务必须与「帧是否完成」解耦：丢尾片的帧走不到完成路径，若把清理挂在
+      // 完成之后，pending 只增不减、2 s 阈值形同虚设（review #5）。这里每包都检查，
+      // 500 ms 一次真正清理。
+      {
+        const int64_t now_tick = cue::now_us();
+        if (now_tick - t_last_cleanup >= 500'000) {
+          cleanup_stale(pending, now_tick, c);
+          t_last_cleanup = now_tick;
+        }
+        // 报告同样不能挂在「帧完成」上：整帧持续丢尾片时 fps/丢帧仍要可见
+        if (now_tick - t_last_report >= 1'000'000) {
+          report(rings, c, now_tick, t_last_report, frames_prev);
+        }
+      }
+
       const auto* p = static_cast<const uint8_t*>(buf.data().data());
       const std::size_t n = buf.data().size();
 
@@ -428,6 +443,8 @@ int main(int argc, char** argv) {
       std::span<const uint8_t> payload{frame};
       bool keyframe = fa.keyframe;
       bool skip_send = false;
+      int64_t enc_us = 0;      // 编码段真实耗时（review #3：不再无条件记 0）
+      bool enc_sampled = false;  // transcode 关闭时该段不采样，报告里显示 "-"
 
       if (transcode_enabled && decoded) {
         if (!chain_ready) {
@@ -445,7 +462,8 @@ int main(int argc, char** argv) {
         }
         if (chain_ready) {
           std::string eerr;
-          auto enc = chain.process(decoded, fa.pts_us, eerr);
+          auto enc = chain.process(decoded, fa.pts_us, eerr, &enc_us);
+          enc_sampled = enc_us > 0;
           if (enc) {
             encoded_buf = std::move(enc->data);
             payload = encoded_buf;
@@ -455,8 +473,11 @@ int main(int argc, char** argv) {
           }
         }
       }
-      rings[3].push(cue::now_us() - t_op0);
-      rings[4].push(0);
+      // op 段只算 ProcessorChain 里除编码以外的部分（M2a 为 passthrough ≈0），
+      // encode 段单列 —— 两段互不重叠，否则「op 含编码」会让六段口径名不副实。
+      const int64_t t_op_end = cue::now_us();
+      rings[3].push(std::max<int64_t>(0, t_op_end - t_op0 - enc_us));
+      if (enc_sampled) rings[4].push(enc_us);
 
       const int64_t t_send0 = cue::now_us();
       if (skip_send || !bucket.take(payload.size(), t_send0)) {
@@ -469,12 +490,13 @@ int main(int argc, char** argv) {
         } else {
           xmit_cache.put(h->frame_id, datagrams);
 
-          // 注入丢包：序号必须全局唯一。若每帧从 0 重新计数，固定几个序号会被反复判定
-          // （实测踩过：seed=42 时 seq 0..9 恰好全不丢，导致注入率恒为 0）
+          // 注入丢包：判定序号必须是整条连接全局单调、且与 FEC 包共用一个序号空间。
+          // 旧口径 frame_id*64+pk 在分片数 >64（720p 关键帧）时会与 FEC 包撞号，
+          // 且 frame_id*64+64 == (frame_id+1)*64 会跨帧撞号 → 丢包不再独立同分布。
           std::size_t pk = 0;
           for (auto& d : datagrams) {
             const std::size_t cur_pk = pk++;
-            if (injector.drop(uint64_t(h->frame_id) * 64ULL + cur_pk)) {
+            if (injector.drop(pkt_seq++)) {
               ++c.injected_drops;
               if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", h->frame_id, cur_pk);
               continue;
@@ -522,15 +544,6 @@ int main(int argc, char** argv) {
       rings[5].push(cue::now_us() - t_send0);
 
       pending.erase(h->frame_id);
-      // 未完成帧必须周期性清理：只挂在"完成路径"上时，丢了尾片的帧永远不会过期
-      if (cue::now_us() - t_last_cleanup >= 1'000'000) {
-        cleanup_stale(pending, cue::now_us(), c);
-        t_last_cleanup = cue::now_us();
-      }
-
-      if (cue::now_us() - t_last_report >= 1'000'000) {
-        report(rings, c, cue::now_us(), t_last_report, frames_prev);
-      }
     }
     std::fprintf(stderr, "[cued] client disconnected\n");
   }

@@ -61,7 +61,8 @@ class ProcessPipelineControl {
   // 返回最近一次统计（无样本时 samples=0）
   PipelineMetrics latest() const;
 
-  // key ∈ bitrate_kbps / gop / preset / transcode；通过重启生效
+  // key ∈ bitrate_kbps / gop / preset / transcode / width / height；通过重启生效
+  // width/height 必须成对给出且为偶数，0/0 表示沿用解码尺寸
   bool set_param(const std::string& key, const std::string& value, std::string& err);
   bool inject_fault(const std::string& kind, double value, std::string& err);
   std::string observation(const std::string& source, int tail, std::string& err) const;

@@ -50,42 +50,73 @@ void H264Decoder::close() {
 }
 
 AVFrame* H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
+  err.clear();  // 调用方常复用同一个 string：不清空会读到上一次的旧错误
   if (!ctx_ || data.empty()) return nullptr;
 
   av_packet_unref(pkt_);
   if (av_new_packet(pkt_, static_cast<int>(data.size())) < 0) {
     err = "av_new_packet failed";
     ++stats_.errors;
+    ++stats_.dropped;
     return nullptr;
   }
   std::memcpy(pkt_->data, data.data(), data.size());
   pkt_->pts = AV_NOPTS_VALUE;
 
+  // 把解码器里已就绪的帧全部收走，最后一张留在 last_ 返回。
+  // 返回是否取到过帧；err 由调用方判断。
+  bool got = false;
+  auto drain = [&](bool* failed) {
+    for (;;) {
+      const int r = avcodec_receive_frame(ctx_, frame_);
+      if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return;
+      if (r < 0) {
+        ++stats_.errors;
+        err = "receive_frame failed: " + std::to_string(r);
+        if (failed) *failed = true;
+        return;
+      }
+      ++stats_.frames;
+      // 低延迟模式下一次 send 通常只产出 0~1 帧；若产出多帧只保留最后一帧
+      if (got) av_frame_unref(last_);
+      av_frame_move_ref(last_, frame_);
+      got = true;
+    }
+  };
+
   int ret = avcodec_send_packet(ctx_, pkt_);
-  if (ret < 0 && ret != AVERROR(EAGAIN)) {
+  if (ret == AVERROR(EAGAIN)) {
+    // 上一包还没被取走：EAGAIN 不等于成功。先排空，再重试 send；
+    // 仍 EAGAIN 说明本包确实未被消费 → 计入 dropped，不能静默当成功。
+    drain(nullptr);
+    ret = avcodec_send_packet(ctx_, pkt_);
+    if (ret == AVERROR(EAGAIN)) {
+      ++stats_.dropped;
+      err = "send_packet EAGAIN (packet not consumed)";
+      return got ? last_ : nullptr;
+    }
+  }
+  if (ret < 0) {
     ++stats_.errors;
+    ++stats_.dropped;
     err = "send_packet failed: " + std::to_string(ret);
-    return nullptr;
+    // 错误分支也要先把已就绪的帧排空，否则会白丢一帧（review P1 #12）
+    drain(nullptr);
+    return got ? last_ : nullptr;
   }
   ++stats_.packets;
 
-  bool got = false;
-  for (;;) {
-    ret = avcodec_receive_frame(ctx_, frame_);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-    if (ret < 0) {
-      ++stats_.errors;
-      err = "receive_frame failed: " + std::to_string(ret);
-      break;
-    }
-    ++stats_.frames;
-    // 低延迟模式下一次 send 通常只产出 0~1 帧；若产出多帧只保留最后一帧
-    if (got) av_frame_unref(last_);
-    av_frame_move_ref(last_, frame_);
-    got = true;
-  }
+  drain(nullptr);
   if (!got) return nullptr;
   return last_;
+}
+
+void H264Decoder::flush() {
+  if (!ctx_) return;
+  avcodec_flush_buffers(ctx_);
+  if (last_) av_frame_unref(last_);
+  flushed_ = true;
+  ++stats_.flushes;
 }
 
 }  // namespace cue::media
