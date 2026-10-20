@@ -3,6 +3,7 @@
 //   cue-eval --suite suites/m4-diagnosis.json --mode scripted --repeat 1
 //   cue-eval --suite ... --mode real --repeat 1 --warmup 6        # 需并行推流
 //   cue-eval --resume run-<id>                                    # 断点续跑
+//   cue-eval --diff run-<a> run-<b>                               # 回归对比
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <string>
 
+#include "cue/eval/compare.h"
 #include "cue/eval/eval.h"
 #include "cue/eval/state.h"
 
@@ -24,10 +26,38 @@ int usage() {
       "  cue-eval --suite <path> [--mode scripted|real] [--repeat k] [--max-yuan N]\n"
       "           [--out dir] [--warmup s] [--model name] [--cued path]\n"
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
+      "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
 
       "\n"
       "real 模式需环境变量 CUE_API_KEY / CUE_BASE_URL / CUE_MODEL，且需外部推流。\n");
   return 0;
+}
+
+int do_diff(const std::string& run_a, const std::string& run_b, const std::string& out_dir) {
+  eval::StateMap a;
+  eval::StateMap b;
+  std::string err;
+  if (!eval::load_state(out_dir + "/" + run_a + "/state.jsonl", a, err)) {
+    std::fprintf(stderr, "读取 A 失败: %s\n", err.c_str());
+    return 1;
+  }
+  if (!eval::load_state(out_dir + "/" + run_b + "/state.jsonl", b, err)) {
+    std::fprintf(stderr, "读取 B 失败: %s\n", err.c_str());
+    return 1;
+  }
+  const auto d = eval::diff_runs(run_a, a, run_b, b);
+  const std::string md = eval::render_diff_markdown(d);
+  const std::string path = out_dir + "/diff-" + run_a + "-" + run_b + ".md";
+  std::ofstream out(path);
+  if (!out) {
+    std::fprintf(stderr, "无法写入 %s\n", path.c_str());
+  } else {
+    out << md;
+    std::printf("[eval] diff 已写入 %s\n", path.c_str());
+  }
+  std::printf("%s", md.c_str());
+  // 有回归（新增失败）时以非零退出码提示 CI
+  return d.new_failures > 0 ? 1 : 0;
 }
 
 }  // namespace
@@ -35,6 +65,7 @@ int usage() {
 int main(int argc, char** argv) {
   eval::RunConfig cfg;
   cfg.suite_path = "suites/m2-constraints.json";
+  std::string diff_a, diff_b;
   bool suite_set = false;
   bool mode_set = false;
   bool repeat_set = false;
@@ -58,12 +89,24 @@ int main(int argc, char** argv) {
     else if (a == "--model") cfg.model = next();
     else if (a == "--cued") cfg.cued_bin = next();
     else if (a == "--resume") cfg.resume_run_id = next();
+    else if (a == "--diff") {
+      diff_a = next();
+      diff_b = next();
+    }
     else if (a == "--help" || a == "-h") {
       return usage();
     } else {
       std::fprintf(stderr, "未知参数: %s\n", a.c_str());
       return 2;
     }
+  }
+
+  if (!diff_a.empty() || !diff_b.empty()) {
+    if (diff_a.empty() || diff_b.empty()) {
+      std::fprintf(stderr, "--diff 需要两个 run_id\n");
+      return 2;
+    }
+    return do_diff(diff_a, diff_b, cfg.out_dir);
   }
 
   if (!cfg.resume_run_id.empty()) {
