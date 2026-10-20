@@ -105,6 +105,12 @@ target_link_libraries(cue PRIVATE cue_agent cue_pipeline)
 add_executable(cue-eval apps/cue-eval.cpp)
 target_link_libraries(cue-eval PRIVATE cue_eval)
 
+# ---- M5 控制台后端 ----
+# 独立 target（而非 cue 的子命令）：serve 是长期驻留进程，信号/退出码语义与一次性 CLI 不同；
+# 它复用 cue_pipeline（事件源）与 cue_agent（Registry/工具/审批），不另起一套管线控制。
+add_executable(cue-serve apps/cue-serve.cpp)
+target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline Boost::system Threads::Threads)
+
 # ---- 测试 ----
 enable_testing()
 add_executable(test_wire tests/test_wire.cpp)
@@ -133,3 +139,10 @@ add_executable(test_compare tests/test_compare.cpp)
 target_link_libraries(test_compare PRIVATE cue_eval)
 add_test(NAME compare COMMAND test_compare)
 set_tests_properties(compare PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# M5 控制台纯逻辑（SSE hub / 审批队列 / report.md 解析）
+add_executable(test_console tests/test_console.cpp)
+target_include_directories(test_console PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+target_link_libraries(test_console PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
+add_test(NAME console COMMAND test_console)
+set_tests_properties(console PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

@@ -26,6 +26,11 @@ struct ToolTrace {
 // 放在同一处，避免两条入口的 agent 语义分叉。
 const char* real_ops_system_prompt();
 
+// 指标快照 → JSON（分位无样本输出 null，pid=null 表示当前没有 cued）。
+// 导出给 M5 控制台后端复用：控制台与工具层必须看到同一份字段、同一套「没采到 ≠ 0」
+// 口径，否则页面上会出现工具里查不到的伪读数。
+nlohmann::json metrics_json(const PipelineMetrics& m, int64_t now_us);
+
 // 注册 4 个真实工具：query_metrics / pipeline_set_param / inject_fault / fetch_observation。
 // trace 可为空（交互模式不需要留痕）。
 void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::vector<ToolTrace>* trace);

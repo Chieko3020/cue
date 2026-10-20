@@ -8,14 +8,6 @@ namespace cue::pipeline {
 
 using json = nlohmann::json;
 
-namespace {
-
-// 统一的留痕包装：工具 handler 返回前把结果记进 trace（失败也要记，证据校验只认真实观测）
-tool::ToolResult record(std::vector<ToolTrace>* trace, const char* name, tool::ToolResult r) {
-  if (trace) trace->push_back(ToolTrace{name, r.content, r.data});
-  return r;
-}
-
 // data 只放"我看到了什么"（真实测量值），不放"我做了什么"（请求参数）。
 // 否则 agent 可以引用自己的动作当观测证据（review-eval.md #26）。
 // age_ms / samples 让 agent 能判断这条是不是 cued 重启前的旧指标（#27）。
@@ -51,6 +43,14 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"budget_drops", m.budget_drops},
               {"samples", m.samples},
               {"age_ms", age_us < 0 ? -1 : age_us / 1000}};
+}
+
+namespace {
+
+// 统一的留痕包装：工具 handler 返回前把结果记进 trace（失败也要记，证据校验只认真实观测）
+tool::ToolResult record(std::vector<ToolTrace>* trace, const char* name, tool::ToolResult r) {
+  if (trace) trace->push_back(ToolTrace{name, r.content, r.data});
+  return r;
 }
 
 // 动作类工具的返回：动作写进 text，data 只带动作之后重新测到的指标
