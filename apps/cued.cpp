@@ -15,8 +15,17 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
 #include <span>
+#include <thread>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <map>
 #include <string>
 #include <string_view>
@@ -64,6 +73,52 @@ class Ring {
   std::size_t head_ = 0;
 };
 
+// splitmix64：由包序号直接决定是否丢包，保证同一 (seed, seq) 结果完全一致
+inline uint64_t splitmix64(uint64_t x) {
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+  return x ^ (x >> 31);
+}
+
+class Injector {
+ public:
+  Injector(uint64_t seed, double drop_pct)
+      : seed_(seed), permille_(static_cast<uint64_t>(drop_pct * 10.0)) {}
+  bool drop(uint64_t seq) const {
+    if (permille_ == 0) return false;
+    return (splitmix64(seed_ * 0x9E3779B97F4A7C15ULL + seq) % 1000) < permille_;
+  }
+  uint64_t permille() const { return permille_; }
+
+ private:
+  uint64_t seed_;
+  uint64_t permille_;
+};
+
+// 最近 N 帧的分片缓存，供 NACK 重传
+class RetransmitCache {
+ public:
+  void put(uint32_t frame_id, const std::vector<std::vector<uint8_t>>& dg) {
+    std::lock_guard<std::mutex> lk(mu_);
+    frames_.emplace_back(frame_id, dg);
+    while (frames_.size() > 256) frames_.pop_front();
+  }
+  std::optional<std::vector<uint8_t>> find(uint32_t frame_id, uint16_t frag_index) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+      if (it->first != frame_id) continue;
+      if (frag_index < it->second.size()) return it->second[frag_index];
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+
+ private:
+  std::mutex mu_;
+  std::deque<std::pair<uint32_t, std::vector<std::vector<uint8_t>>>> frames_;
+};
+
 // 令牌桶：按字节计费（SPEC §7.2 的每会话限速）
 class TokenBucket {
  public:
@@ -102,6 +157,7 @@ struct Counters {
   uint64_t bytes_in = 0;
   uint64_t frames_decoded = 0;
   uint64_t decode_errors = 0;
+  uint64_t injected_drops = 0;
 };
 
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counters& c) {
@@ -120,9 +176,10 @@ const char* kStageNames[6] = {"recv", "buffer", "decode", "op", "encode", "send"
 void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, uint64_t& frames_prev) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
-  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu dec=%llu dec_err=%llu MB=%.2f",
+  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu dec=%llu dec_err=%llu MB=%.2f",
               double(df) / dt, static_cast<unsigned long long>(c.frames_in),
               static_cast<unsigned long long>(c.frames_out), static_cast<unsigned long long>(c.frames_dropped),
+              static_cast<unsigned long long>(c.injected_drops),
               static_cast<unsigned long long>(c.frames_decoded),
               static_cast<unsigned long long>(c.decode_errors),
               double(c.bytes_in) / (1024.0 * 1024.0));
@@ -156,6 +213,9 @@ int main(int argc, char** argv) {
   int out_gop = 60;
   std::string preset = "veryfast";
   double send_mbps = 10.0;
+  double inject_drop = 0.0;
+  uint64_t inject_seed = 42;
+  bool fec_enabled = true;
 
   for (int i = 1; i < argc; ++i) {
     std::string_view a = argv[i];
@@ -173,6 +233,9 @@ int main(int argc, char** argv) {
     else if (a == "--gop") out_gop = std::stoi(next());
     else if (a == "--preset") preset = next();
     else if (a == "--send-mbps") send_mbps = std::stod(next());
+    else if (a == "--inject-drop") inject_drop = std::stod(next());
+    else if (a == "--inject-seed") inject_seed = std::stoull(next());
+    else if (a == "--fec") fec_enabled = (next() == "on");
     else if (a == "--help") {
       std::printf("cued --ws-port 9000 --probe-host 127.0.0.1 --probe-port 9001\n");
       return 0;
@@ -203,8 +266,45 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[cued] listen %u failed: %s\n", ws_port, ec.message().c_str());
     return 1;
   }
-  udp::socket usock(ioc, udp::v4());
-  const udp::endpoint probe_ep(net::ip::make_address(probe_host), probe_port);
+  // 用原生 fd：主线程 sendto，NACK 线程 recvfrom（同一个 UDP socket 全双工）
+  const int usock = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (usock < 0) {
+    std::fprintf(stderr, "[cued] udp socket failed\n");
+    return 1;
+  }
+  sockaddr_in probe_addr{};
+  probe_addr.sin_family = AF_INET;
+  probe_addr.sin_port = htons(probe_port);
+  ::inet_pton(AF_INET, probe_host.c_str(), &probe_addr.sin_addr);
+  const Injector injector(inject_seed, inject_drop);
+  RetransmitCache xmit_cache;
+
+  std::atomic<bool> stop_nack{false};
+  std::thread nack_thread([&] {
+    std::vector<uint8_t> nbuf(2048);
+    while (!stop_nack.load(std::memory_order_relaxed)) {
+      sockaddr_in from{};
+      socklen_t fl = sizeof(from);
+      const ssize_t n = ::recvfrom(usock, nbuf.data(), nbuf.size(), 0,
+                                   reinterpret_cast<sockaddr*>(&from), &fl);
+      if (n < static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) continue;
+      auto nh = cue::proto::decode_datagram({nbuf.data(), static_cast<size_t>(n)});
+      if (!nh || nh->type != static_cast<uint8_t>(cue::proto::DownType::Nack)) continue;
+      const uint8_t* p = nbuf.data() + cue::proto::kDatagramHeaderSize;
+      std::size_t remain = static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize;
+      while (remain >= 6) {
+        uint32_t fid = 0;
+        uint16_t idx = 0;
+        std::memcpy(&fid, p, 4);
+        std::memcpy(&idx, p + 4, 2);
+        p += 6;
+        remain -= 6;
+        if (auto pkt = xmit_cache.find(fid, idx)) {
+          ::sendto(usock, pkt->data(), pkt->size(), 0, reinterpret_cast<const sockaddr*>(&from), fl);
+        }
+      }
+    }
+  });
 
   std::fprintf(stderr, "[cued] ws :%u  udp -> %s:%u (M2a: decode + 6-stage profile)\n", ws_port,
                probe_host.c_str(), probe_port);
@@ -346,7 +446,53 @@ int main(int argc, char** argv) {
         if (datagrams.empty()) {
           ++c.frames_dropped;
         } else {
-          for (auto& d : datagrams) usock.send_to(net::buffer(d), probe_ep, 0, ec);
+          xmit_cache.put(h->frame_id, datagrams);
+
+          // 注入丢包：序号必须全局唯一。若每帧从 0 重新计数，固定几个序号会被反复判定
+          // （实测踩过：seed=42 时 seq 0..9 恰好全不丢，导致注入率恒为 0）
+          std::size_t pk = 0;
+          for (auto& d : datagrams) {
+            if (injector.drop(uint64_t(h->frame_id) * 64ULL + pk++)) {
+              ++c.injected_drops;
+              continue;
+            }
+            ::sendto(usock, d.data(), d.size(), 0,
+                     reinterpret_cast<const sockaddr*>(&probe_addr), sizeof(probe_addr));
+          }
+
+          // XOR-FEC：一帧的所有分片为一组，生成 1 个冗余包
+          if (fec_enabled && datagrams.size() > 1) {
+            std::size_t maxlen = 0;
+            for (auto& d : datagrams) {
+              maxlen = std::max(maxlen, d.size() - cue::proto::kDatagramHeaderSize);
+            }
+            std::vector<uint8_t> parity(maxlen, 0);
+            for (auto& d : datagrams) {
+              const std::size_t plen = d.size() - cue::proto::kDatagramHeaderSize;
+              for (std::size_t i = 0; i < plen; ++i) {
+                parity[i] ^= d[cue::proto::kDatagramHeaderSize + i];
+              }
+            }
+            cue::proto::DatagramHeader fh;
+            fh.type = static_cast<uint8_t>(cue::proto::DownType::Fec);
+            fh.session_id = session_id;
+            fh.frame_id = h->frame_id;
+            fh.frag_index = 0;
+            fh.frag_count = static_cast<uint16_t>(datagrams.size());
+            fh.pts_us = fa.pts_us;
+            auto hdr = cue::proto::encode(fh);
+            std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
+            const std::size_t base = fpkt.size();
+            fpkt.resize(base + 8 + maxlen, 0);
+            std::memcpy(fpkt.data() + base, &h->frame_id, 4);
+            const uint16_t mc = static_cast<uint16_t>(datagrams.size());
+            std::memcpy(fpkt.data() + base + 6, &mc, 2);
+            std::memcpy(fpkt.data() + base + 8, parity.data(), maxlen);
+            if (!injector.drop(uint64_t(h->frame_id) * 64ULL + 63ULL)) {
+              ::sendto(usock, fpkt.data(), fpkt.size(), 0,
+                       reinterpret_cast<const sockaddr*>(&probe_addr), sizeof(probe_addr));
+            }
+          }
           ++c.frames_out;
         }
       }
