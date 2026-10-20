@@ -1,15 +1,19 @@
 #include "cue/pipeline/process_control.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <algorithm>
 #include <cstring>
 #include <sstream>
 #include <string>
@@ -21,61 +25,84 @@ namespace cue::pipeline {
 
 namespace {
 
-bool extract_double(const std::string& line, const char* key, double& out) {
-  const std::string pat = std::string(key) + "=";
-  auto pos = line.find(pat);
-  if (pos == std::string::npos) return false;
-  pos += pat.size();
-  try {
-    out = std::stod(line.substr(pos));
-  } catch (...) {
-    return false;
+using json = nlohmann::json;
+
+// log_tail_ 的上限：fetch_observation(logs) 的字节预算靠它兜底
+constexpr std::size_t kLogTailMax = 200;
+// 崩溃重启预算与退避：AC-2 要求至少能重启成功一次，但崩溃循环不能无限刷
+constexpr int kMaxRestarts = 3;
+constexpr auto kRestartBackoff = std::chrono::milliseconds(200);
+constexpr auto kReapPoll = std::chrono::milliseconds(50);
+
+// cued 的每秒指标行前缀。严格整行前缀匹配（不是子串），cued 哪天多打一个
+// frames_in= 也不会串味（review #29）。
+constexpr std::string_view kMetricsTag = "METRICS ";
+
+std::string describe_status(int status) {
+  if (WIFSIGNALED(status)) {
+    return "signal=" + std::to_string(WTERMSIG(status)) +
+           (WCOREDUMP(status) ? "(core)" : "");
   }
-  return true;
+  if (WIFEXITED(status)) return "exit=" + std::to_string(WEXITSTATUS(status));
+  return "status=" + std::to_string(status);
 }
 
-bool extract_u64(const std::string& line, const char* key, uint64_t& out) {
-  const std::string pat = std::string(key) + "=";
-  auto pos = line.find(pat);
-  if (pos == std::string::npos) return false;
-  pos += pat.size();
-  try {
-    out = std::stoull(line.substr(pos));
-  } catch (...) {
-    return false;
+// 给 fd 打上 CLOEXEC：fork 后 exec 前把父进程的其它 fd 全部关掉，
+// 否则 cue 的监听 socket 会被 cued 白持有（review #23）。
+void mark_inherited_fds_cloexec() {
+  long maxfd = ::sysconf(_SC_OPEN_MAX);
+  if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+  for (int fd = 3; fd < static_cast<int>(maxfd); ++fd) {
+    (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
   }
-  return true;
-}
-
-// 解析 "decode=1.030/1.441/13.940" 这类三分位
-bool extract_triplet(const std::string& line, const char* key, double* p50, double* p95, double* p99) {
-  const std::string pat = std::string(key) + "=";
-  auto pos = line.find(pat);
-  if (pos == std::string::npos) return false;
-  pos += pat.size();
-  const auto slash1 = line.find('/', pos);
-  if (slash1 == std::string::npos) return false;
-  const auto slash2 = line.find('/', slash1 + 1);
-  if (slash2 == std::string::npos) return false;
-  try {
-    if (p50) *p50 = std::stod(line.substr(pos, slash1 - pos));
-    if (p95) *p95 = std::stod(line.substr(slash1 + 1, slash2 - slash1 - 1));
-    if (p99) *p99 = std::stod(line.substr(slash2 + 1));
-  } catch (...) {
-    return false;
-  }
-  return true;
 }
 
 }  // namespace
 
-ProcessPipelineControl::ProcessPipelineControl(Config cfg) : cfg_(std::move(cfg)) {}
-ProcessPipelineControl::~ProcessPipelineControl() { stop(); }
+ProcessPipelineControl::ProcessPipelineControl(Config cfg) : cfg_(std::move(cfg)) {
+  supervisor_ = std::thread([this] { supervisor_loop(); });
+}
+
+ProcessPipelineControl::~ProcessPipelineControl() {
+  stop();
+  stop_super_.store(true);
+  if (supervisor_.joinable()) supervisor_.join();
+}
 
 bool ProcessPipelineControl::spawn(std::string& err) {
+  std::lock_guard<std::mutex> lk(spawn_mu_);
+  return spawn_locked(err);
+}
+
+bool ProcessPipelineControl::spawn_locked(std::string& err) {
+  if (pid_.load() != 0) {
+    err = "cued already running";
+    return false;
+  }
+  // 自动重启路径不会经过 stop()：上一代的读线程与日志 fd 必须在这里收干净。
+  // 否则给 joinable 的 std::thread 重新赋值会直接 std::terminate（实测踩过）。
+  if (reader_.joinable()) {
+    stop_reader_.store(true);
+    reader_.join();
+  }
+  if (log_fd_ >= 0) {
+    ::close(log_fd_);
+    log_fd_ = -1;
+  }
+
+  // pipe2(O_CLOEXEC)：两个管道都不会被 cued 继承（review #23）
   int fds[2];
-  if (::pipe(fds) != 0) {
-    err = std::string("pipe: ") + std::strerror(errno);
+  if (::pipe2(fds, O_CLOEXEC) != 0) {
+    err = std::string("pipe2: ") + std::strerror(errno);
+    return false;
+  }
+  // exec 握手管道：execv 成功后写端被 CLOEXEC 关掉（父读到 EOF = 成功）；
+  // 失败则子进程写入 errno，父进程据此报"启动失败"而不是假装成功（review #10）
+  int hs[2];
+  if (::pipe2(hs, O_CLOEXEC) != 0) {
+    err = std::string("pipe2(handshake): ") + std::strerror(errno);
+    ::close(fds[0]);
+    ::close(fds[1]);
     return false;
   }
 
@@ -111,58 +138,172 @@ bool ProcessPipelineControl::spawn(std::string& err) {
     err = std::string("fork: ") + std::strerror(errno);
     ::close(fds[0]);
     ::close(fds[1]);
+    ::close(hs[0]);
+    ::close(hs[1]);
     return false;
   }
   if (pid == 0) {
+    // 自己是进程组长：stop() 可以整组回收，probe 之类的孙进程不会成孤儿（AC-8）
+    ::setpgid(0, 0);
     ::dup2(fds[1], STDOUT_FILENO);
     ::dup2(fds[1], STDERR_FILENO);
     ::close(fds[0]);
     ::close(fds[1]);
+    ::close(hs[0]);
+    mark_inherited_fds_cloexec();  // hs[1] 也已被标 CLOEXEC（本来就有）
     ::execv(cfg_.cued_bin.c_str(), argv.data());
+    const int exec_errno = errno;
+    // 唯一的出口：把 errno 交给父进程；_exit 不走 atexit/析构。
+    // 写失败只可能是父进程已经不在了，此时无从上报，直接退出。
+    const ssize_t ignored = ::write(hs[1], &exec_errno, sizeof(exec_errno));
+    (void)ignored;
     _exit(127);
   }
+
   ::close(fds[1]);
+  ::close(hs[1]);
+  int child_errno = 0;
+  ssize_t hn = 0;
+  do {
+    hn = ::read(hs[0], &child_errno, sizeof(child_errno));
+  } while (hn < 0 && errno == EINTR);
+  ::close(hs[0]);
+
+  if (hn == static_cast<ssize_t>(sizeof(child_errno))) {
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    ::close(fds[0]);
+    err = "exec " + cfg_.cued_bin + ": " + std::strerror(child_errno);
+    return false;
+  }
+
   log_fd_ = fds[0];
-  pid_ = pid;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // 新会话的指标必须清零：否则重启后 1 s 内 latest() 返回上一个 cued 的数字（#25）
+    metrics_ = PipelineMetrics{};
+    metrics_.pid = pid;
+    push_log_locked("[supervisor] cued started pid=" + std::to_string(pid));
+  }
+  pid_.store(pid);
   stop_reader_.store(false);
   reader_ = std::thread([this] { reader_loop(); });
   return true;
 }
 
 bool ProcessPipelineControl::start(std::string& err) {
-  if (pid_ != 0) return true;
+  if (pid_.load() != 0) return true;
   return spawn(err);
 }
 
 void ProcessPipelineControl::stop() {
-  if (pid_ == 0) return;
-  ::kill(pid_, SIGTERM);
-  for (int i = 0; i < 50; ++i) {  // 最多等 500ms
+  std::lock_guard<std::mutex> lk(spawn_mu_);
+  stopping_.store(true);
+  const pid_t pid = pid_.load();
+  if (pid != 0) {
+    // cued 是进程组长（forked 后 setpgid(0,0)），kill(-pid) 连它拉起的子进程一起收
+    ::kill(-pid, SIGTERM);
+    bool gone = false;
+    for (int i = 0; i < 50; ++i) {  // 最多等 500ms
+      if (pid_.load() != pid) {
+        gone = true;
+        break;
+      }
+      ::usleep(10 * 1000);
+    }
+    if (!gone) {
+      ::kill(-pid, SIGKILL);
+      for (int i = 0; i < 50; ++i) {
+        if (pid_.load() != pid) break;
+        ::usleep(10 * 1000);
+      }
+    }
+    // 兜底回收：监督线程可能还没轮询到。它若已回收，这里拿到 ECHILD，无副作用。
     int status = 0;
-    const pid_t r = ::waitpid(pid_, &status, WNOHANG);
-    if (r == pid_) break;
-    ::usleep(10 * 1000);
+    if (::waitpid(pid, &status, WNOHANG) == 0) {
+      while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+      }
+    }
+    pid_.store(0);
   }
-  if (::waitpid(pid_, nullptr, WNOHANG) == 0) {
-    ::kill(pid_, SIGKILL);
-    ::waitpid(pid_, nullptr, 0);
-  }
-  pid_ = 0;
+  // 先让读线程醒过来退出，再关 fd：旧顺序 close 在前，读线程可能正阻塞在同一 fd 上，
+  // 拿到 EBADF 或（fd 号被复用后）读到别人的数据（review #24）
   stop_reader_.store(true);
+  if (reader_.joinable()) reader_.join();
   if (log_fd_ >= 0) {
     ::close(log_fd_);
     log_fd_ = -1;
   }
-  if (reader_.joinable()) reader_.join();
+  restarts_ = 0;
+  stopping_.store(false);
+}
+
+void ProcessPipelineControl::supervisor_loop() {
+  while (!stop_super_.load()) {
+    const pid_t pid = pid_.load();
+    if (pid == 0) {
+      std::this_thread::sleep_for(kReapPoll);
+      continue;
+    }
+    int status = 0;
+    const pid_t r = ::waitpid(pid, &status, WNOHANG);
+    if (r == pid) {
+      pid_.store(0);
+      const bool was_stopping = stopping_.load();
+      std::string msg = "[supervisor] cued pid=" + std::to_string(pid) + " exited " +
+                        describe_status(status);
+      if (was_stopping) {
+        push_log(msg);
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> slk(spawn_mu_);
+        if (stopping_.load()) {
+          // stop() 抢到了锁：它会把这一代收干净，不再重启
+        } else if (restarts_ >= kMaxRestarts) {
+          msg += "（自动重启预算 " + std::to_string(kMaxRestarts) + " 次已耗尽，不再重启）";
+        } else {
+          ++restarts_;
+          std::this_thread::sleep_for(kRestartBackoff);
+          std::string rerr;
+          if (spawn_locked(rerr)) {
+            msg += " → 已自动重启 pid=" + std::to_string(pid_.load());
+          } else {
+            msg += " → 重启失败: " + rerr;
+          }
+        }
+      }
+      push_log(msg);
+      std::fprintf(stderr, "%s\n", msg.c_str());
+      continue;
+    }
+    if (r < 0 && errno != EINTR && errno != EAGAIN) {
+      // ECHILD：这个 pid 已经被别人回收（或本就是僵尸），保守地认为进程已不在
+      pid_.store(0);
+      push_log("[supervisor] waitpid(" + std::to_string(pid) + ") failed: " +
+               std::strerror(errno));
+      continue;
+    }
+    std::this_thread::sleep_for(kReapPoll);
+  }
 }
 
 void ProcessPipelineControl::reader_loop() {
   std::string buf;
-  char tmp[1024];
+  char tmp[4096];
   while (!stop_reader_.load()) {
+    pollfd pfd{log_fd_, POLLIN, 0};
+    const int pr = ::poll(&pfd, 1, 200);  // 200ms 超时：读线程天然可中断（#24）
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pr == 0) continue;
     const ssize_t n = ::read(log_fd_, tmp, sizeof(tmp));
-    if (n <= 0) {
-      if (n < 0 && errno == EINTR) continue;
+    if (n == 0) break;  // EOF：cued 已关掉写端
+    if (n < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
       break;
     }
     buf.append(tmp, static_cast<std::size_t>(n));
@@ -176,34 +317,64 @@ void ProcessPipelineControl::reader_loop() {
 }
 
 void ProcessPipelineControl::parse_line(const std::string& line) {
-  if (line.find("[cued] fps=") != std::string::npos) {
+  if (line.rfind(kMetricsTag, 0) == 0) {
+    const json j = json::parse(line.substr(kMetricsTag.size()), nullptr, false);
+    if (!j.is_object()) {
+      push_log("[pipeline] METRICS 行不是合法 JSON: " + line);
+      return;
+    }
     PipelineMetrics m;
-    extract_double(line, "fps", m.fps);
-    extract_u64(line, "in", m.frames_in);
-    extract_u64(line, "out", m.frames_out);
-    extract_u64(line, "drop", m.dropped);
-    extract_u64(line, "inj", m.injected);
-    extract_u64(line, "dec", m.decoded);
-    extract_u64(line, "dec_err", m.decode_errors);
-    extract_triplet(line, "recv", &m.recv_p50, nullptr, nullptr);
-    extract_triplet(line, "buffer", &m.buffer_p50, nullptr, nullptr);
-    extract_triplet(line, "decode", &m.decode_p50, nullptr, &m.decode_p99);
-    extract_triplet(line, "op", &m.op_p50, nullptr, &m.op_p99);
-    extract_triplet(line, "send", &m.send_p50, nullptr, nullptr);
+    m.fps = j.value("fps", 0.0);
+    m.frames_in = j.value("frames_in", static_cast<uint64_t>(0));
+    m.frames_out = j.value("frames_out", static_cast<uint64_t>(0));
+    m.dropped = j.value("dropped", static_cast<uint64_t>(0));
+    m.injected = j.value("injected", static_cast<uint64_t>(0));
+    m.decoded = j.value("decoded", static_cast<uint64_t>(0));
+    m.decode_errors = j.value("decode_errors", static_cast<uint64_t>(0));
+    m.rejected = j.value("rejected", static_cast<uint64_t>(0));
+    auto stage = [&j](const char* key, double& p50, double& p95, double& p99) {
+      if (!j.contains(key)) return;
+      const auto& s = j.at(key);
+      if (!s.is_object()) return;
+      p50 = s.value("p50", 0.0);
+      p95 = s.value("p95", 0.0);
+      p99 = s.value("p99", 0.0);
+    };
+    double sink_p95 = 0;
+    stage("recv", m.recv_p50, sink_p95, sink_p95);
+    stage("buffer", m.buffer_p50, sink_p95, sink_p95);
+    stage("decode", m.decode_p50, sink_p95, m.decode_p99);
+    stage("op", m.op_p50, sink_p95, m.op_p99);
+    stage("encode", m.encode_p50, sink_p95, m.encode_p99);
+    stage("send", m.send_p50, sink_p95, sink_p95);
     m.updated_us = now_us();
+    m.pid = pid_.load();
     std::lock_guard<std::mutex> lk(mu_);
     m.samples = metrics_.samples + 1;
+    m.alive = true;
     metrics_ = m;
     return;
   }
+  // 人的可读行留在 log_tail_，但每秒的 fps 摘要行不再重复堆进去（指标已结构化）
+  if (line.rfind("[cued] fps=", 0) == 0) return;
+  push_log(line);
+}
+
+void ProcessPipelineControl::push_log(std::string line) {
   std::lock_guard<std::mutex> lk(mu_);
-  log_tail_.push_back(line);
-  if (log_tail_.size() > 200) log_tail_.erase(log_tail_.begin());
+  push_log_locked(std::move(line));
+}
+
+void ProcessPipelineControl::push_log_locked(std::string line) {
+  log_tail_.push_back(std::move(line));
+  while (log_tail_.size() > kLogTailMax) log_tail_.pop_front();
 }
 
 PipelineMetrics ProcessPipelineControl::latest() const {
   std::lock_guard<std::mutex> lk(mu_);
-  return metrics_;
+  PipelineMetrics m = metrics_;
+  m.alive = pid_.load() != 0;
+  return m;
 }
 
 bool ProcessPipelineControl::set_param(const std::string& key, const std::string& value, std::string& err) {
@@ -282,9 +453,11 @@ std::string ProcessPipelineControl::observation(const std::string& source, int t
   std::ostringstream oss;
   if (source == "procs") {
     // 注意：不暴露真实注入值——那是"标准答案"，agent 必须从指标推断
-    oss << "cued pid=" << pid_ << " running=" << (pid_ != 0 ? "true" : "false")
-        << " transcode=" << (cfg_.transcode ? "on" : "off") << " bitrate=" << cfg_.bitrate_kbps
-        << "kbps gop=" << cfg_.gop;
+    // running=false + pid=0 是 cued 已不在的可靠信号（监督线程负责回收）
+    const pid_t pid = pid_.load();
+    oss << "cued pid=" << pid << " running=" << (pid != 0 ? "true" : "false")
+        << " restarts=" << restarts_ << " transcode=" << (cfg_.transcode ? "on" : "off")
+        << " bitrate=" << cfg_.bitrate_kbps << "kbps gop=" << cfg_.gop;
     return oss.str();
   }
   if (source == "frames") {
@@ -293,10 +466,11 @@ std::string ProcessPipelineControl::observation(const std::string& source, int t
         << " decoded=" << metrics_.decoded << " decode_errors=" << metrics_.decode_errors;
     return oss.str();
   }
+  if (log_tail_.empty()) return {};
   const int n = std::max(1, std::min<int>(tail <= 0 ? 20 : tail, static_cast<int>(log_tail_.size())));
   // 空 log_tail_ 时 size-n 会变成 -1（越界读，ASan 实测 SEGV）
   const int start = std::max(0, static_cast<int>(log_tail_.size()) - n);
-  for (int i = start; i < static_cast<int>(log_tail_.size()); ++i) oss << log_tail_[i] << '\n';
+  for (int i = start; i < static_cast<int>(log_tail_.size()); ++i) oss << log_tail_[static_cast<std::size_t>(i)] << '\n';
   return oss.str();
 }
 

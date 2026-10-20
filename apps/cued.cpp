@@ -195,6 +195,29 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
     }
   }
   std::printf(" ms(p50/p95/p99)\n");
+  // 结构化指标行：process_control 只认这一行（严格整行前缀 "METRICS "），不再靠裸子串
+  // 匹配 "in="/"dec="（cued 多打一个 frames_in= 就会串味，review #29）。
+  // 六段里未被采样的段写 null：报告里显示 n/a，不能被 0 冒充实测。
+  json m{{"fps", double(df) / dt},
+         {"frames_in", c.frames_in},
+         {"frames_out", c.frames_out},
+         {"dropped", c.frames_dropped},
+         {"injected", c.injected_drops},
+         {"decoded", c.frames_decoded},
+         {"decode_errors", c.decode_errors},
+         {"rejected", c.rejected}};
+  for (int i = 0; i < 6; ++i) {
+    if (rings[i].size() == 0) {
+      m[kStageNames[i]] = nullptr;
+    } else {
+      m[kStageNames[i]] = json{{"p50", double(rings[i].pct(0.50)) / 1000.0},
+                               {"p95", double(rings[i].pct(0.95)) / 1000.0},
+                               {"p99", double(rings[i].pct(0.99)) / 1000.0}};
+    }
+  }
+  const std::string line = "METRICS " + m.dump();
+  std::fwrite(line.data(), 1, line.size(), stdout);
+  std::fputc('\n', stdout);
   std::fflush(stdout);
   frames_prev = c.frames_out;
   t_last = now_us;

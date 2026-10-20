@@ -27,6 +27,8 @@ build-*/
 # 只忽略运行/录像产物，别把 suites 里将来可能加的 jsonl fixture 一起吞掉
 /runs/**/*.jsonl
 /cassettes/**/*.jsonl
+# 例外：suites 下将来若放 jsonl fixture，必须能入库
+!suites/**/*.jsonl
 
 # ── 测试与覆盖率 ──
 /coverage/

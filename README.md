@@ -21,8 +21,8 @@
 浏览器（设备侧）              harness                    cued                    cue-probe
 ────────────────       ─────────────────────      ─────────────────      ─────────────────
 推流页（原生 HTML/JS）  agent 内核                  媒体管线               下行接收端
- · Canvas 合成源        外层：阶段状态机             WS 接收/重组/抖动缓冲   · 重组 / NACK / FEC
- · WebCodecs 编码       内层：ReAct 工具循环         解码（libavcodec）      · 抖动缓冲
+ · Canvas 合成源        外层：阶段状态机             WS 接收/重组            · 重组 / NACK / FEC
+ · WebCodecs 编码       内层：ReAct 工具循环         解码（libavcodec）      · 指标
  · WS 上行  ─────────▶  工具层（三级风险）           算子图（缩放/转码）     · 指标
  · SSE 事件（M5 计划）  session / 上下文预算         编码（libx264）        · 跨平台
  · HTTP 控制（M5 计划） 审批 · 事件流（M5）           发送（整形/FEC）
@@ -52,8 +52,10 @@
 ```bash
 sudo apt install -y g++-14 cmake pkg-config \
   libavcodec-dev libavutil-dev libswscale-dev libx264-dev \
-  libcurl4-openssl-dev libboost-dev nlohmann-json3-dev
+  libcurl4-openssl-dev libboost-dev libboost-system-dev nlohmann-json3-dev
 ```
+
+`libboost-system-dev` 不能省：`find_package(Boost COMPONENTS system)` 在只有头文件时会失败（Boost.System 的库虽已 header-only，CMake 的 FindBoost 仍要求该组件可解析）。
 
 构建（CMake 会拒绝 GCC < 14，所以显式指定 `g++-14`）：
 
@@ -61,6 +63,8 @@ sudo apt install -y g++-14 cmake pkg-config \
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++-14
 cmake --build build -j
 ```
+
+> 默认 `CUE_WERROR=ON`：`-Wall -Wextra -Wpedantic -Werror`，与 SPEC §9 的 CI 口径一致，本仓库全量构建 0 warning。只想看警告、不愿被中断时，重新配置加 `-DCUE_WERROR=OFF`。
 
 单测：
 

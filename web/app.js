@@ -19,6 +19,17 @@ function resolveWsUrl() {
 }
 const WS_URL = resolveWsUrl();
 
+// SPEC §7.1 codec 字段：0x01 H264 / 0x02 VP8。目前只走 H264；映射集中在这里，
+// 降级到 VP8 时头部不会继续谎报 H264（服务端 decode_media 不校验 codec）。
+const CODEC_H264 = 0x01;
+const CODEC_VP8 = 0x02;
+function codecIdOf(codec) {
+  if (codec.startsWith('avc1')) return CODEC_H264;
+  if (codec.startsWith('vp8')) return CODEC_VP8;
+  return 0;
+}
+let codecId = CODEC_H264;
+
 const els = {
   start: document.getElementById('start'),
   stop: document.getElementById('stop'),
@@ -49,10 +60,17 @@ let reconnecting = false;
 let streaming = false;
 let encoderBroken = false;
 
+const LOG_MAX_LINES = 300;
+
+// 日志一律走 textContent：消息里可能带异常文本，拼 HTML 就是注入面；
+// 同时裁剪旧节点，避免长跑页面 DOM 无限增长。
 function log(msg, cls) {
   const time = new Date().toISOString().slice(11, 23);
-  const span = cls ? `<span class="${cls}">${msg}</span>` : msg;
-  els.log.insertAdjacentHTML('beforeend', `${time}  ${span}\n`);
+  const line = document.createElement('div');
+  line.textContent = `${time}  ${msg}`;
+  if (cls) line.className = cls;
+  els.log.appendChild(line);
+  while (els.log.childNodes.length > LOG_MAX_LINES) els.log.removeChild(els.log.firstChild);
   els.log.scrollTop = els.log.scrollHeight;
 }
 
@@ -104,7 +122,7 @@ function sendChunk(chunk) {
     const dv = new DataView(pkt.buffer);
     pkt[0] = 0xc1;
     pkt[1] = 0x01; // video
-    pkt[2] = 0x01; // h264
+    pkt[2] = codecId;
     pkt[3] = (key ? 0x01 : 0) | (i === fragCount - 1 ? 0x04 : 0);
     dv.setUint32(4, streamId, true);
     dv.setUint32(8, frameId, true);
@@ -129,23 +147,37 @@ function sendChunk(chunk) {
 // 8 次 ping/pong 取 RTT 最小的一次，offset = server_us - (client_us + rtt/2)
 // 每 30 s 重估；漂移 > 5 ms 重锚。事件留痕目前只有页面日志——结构化事件流在 C++/M5 侧。
 async function syncClock(reanchor) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // 整轮同步绑定发起时的 socket：cued 重启会把 ws 换成 null/新连接，
+  // 若继续用全局 ws 移除监听器会抛 TypeError 并让这轮 await 永不返回。
+  const sock = ws;
+  if (!sock || sock.readyState !== WebSocket.OPEN) return;
   let best = null;
   for (let i = 0; i < 8; i++) {
+    if (sock.readyState !== WebSocket.OPEN) break;
     const t = Math.round(performance.now() * 1000);
     const pong = await new Promise((resolve) => {
-      const onMsg = (ev) => {
+      let done = false;
+      let timerId = null;
+      function finish(v) {
+        if (done) return;
+        done = true;
+        if (timerId !== null) clearTimeout(timerId);
+        sock.removeEventListener('message', onMsg);
+        resolve(v);
+      }
+      function onMsg(ev) {
         try {
           const j = JSON.parse(typeof ev.data === 'string' ? ev.data : '');
-          if (j.op === 'pong' && j.t === t) {
-            ws.removeEventListener('message', onMsg);
-            resolve(j);
-          }
+          if (j.op === 'pong' && j.t === t) finish(j);
         } catch (_) {}
-      };
-      ws.addEventListener('message', onMsg);
-      ws.send(JSON.stringify({ op: 'ping', t }));
-      setTimeout(() => { ws.removeEventListener('message', onMsg); resolve(null); }, 200);
+      }
+      sock.addEventListener('message', onMsg);
+      timerId = setTimeout(() => finish(null), 200);
+      try {
+        sock.send(JSON.stringify({ op: 'ping', t }));
+      } catch (_) {
+        finish(null);
+      }
     });
     if (pong) {
       const nowUs = Math.round(performance.now() * 1000);
@@ -154,6 +186,7 @@ async function syncClock(reanchor) {
       if (!best || rtt < best.rtt) best = { rtt, off };
     }
   }
+  if (sock !== ws) return;  // 期间已重连，交给新连接的 syncClock(true)
   if (!best) {
     log('时钟同步失败，沿用上一个 offset（端到端延迟会含基准偏差）', 'warn');
     return;
@@ -220,6 +253,8 @@ async function start() {
   const fps = Number(els.fps.value);
   const codec = pickCodec(w, h);
   if (!codec) { log('分辨率超出 L4.0 上限', 'bad'); return; }
+  const newCodecId = codecIdOf(codec);
+  if (!newCodecId) { log(`不支持的 codec: ${codec}`, 'bad'); return; }
 
   manualStop = false;
   // 先置位：若 connectWs 期间连接掉了，onclose 的 scheduleReconnect 才不会因 !streaming 静默退出
@@ -255,6 +290,7 @@ async function start() {
     return;
   }
 
+  codecId = newCodecId;
   encoder = new VideoEncoder({
     output: (chunk) => sendChunk(chunk),
     error: (e) => {
