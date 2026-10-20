@@ -41,7 +41,8 @@ void print_usage() {
       "  cue run [--goal TEXT] [--warmup S] [--model NAME] [--approval ask|auto|deny]\n"
       "          [--allow-dangerous NAMES|none] [--max-turns N] [--max-yuan Y] [--max-wall S]\n"
       "      接真实 LLM 对真实 cued 管线跑一次诊断（M3b 已接入）。\n"
-      "      环境变量：CUE_API_KEY（必需）、CUE_BASE_URL、CUE_MODEL\n"
+      "      环境变量：CUE_API_KEY（必需）、CUE_BASE_URL、CUE_MODEL；\n"
+      "      CUE_RECORD=1 时把成功调用录成 cassette（目录 CUE_CASSETTE_DIR，默认 cassettes/）\n"
       "  cue help\n"
       "\n"
       "  --allow-dangerous 逗号分隔的危险工具白名单，默认 inject_fault（演练场景要能取消注入）；\n"
@@ -430,6 +431,12 @@ int run_real(const RunOptions& o) {
   cc.api_key = key;
   cc.model = model;
   cc.timeout_s = 60;
+  // 与 cue-eval 同一开关：CUE_RECORD=1 时把成功调用录进 CUE_CASSETTE_DIR（默认 cassettes/）
+  const char* rec = std::getenv("CUE_RECORD");
+  if (rec && *rec && std::strcmp(rec, "0") != 0) {
+    const char* dir = std::getenv("CUE_CASSETTE_DIR");
+    cc.record_dir = (dir && *dir) ? dir : "cassettes";
+  }
   llm::OpenAiCompatibleClient client(cc);
 
   agent::Runner::Config cfg;
