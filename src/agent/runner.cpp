@@ -47,8 +47,9 @@ std::string stage_hint(Stage s) {
       return "当前阶段 repair：执行 mutating 工具调整参数（至少一次成功后），"
              "然后调用 stage_complete，参数 {\"next\":\"verify\"}。";
     case Stage::Verify:
-      return "当前阶段 verify：再查一次指标确认是否满足目标；满足则调用 stage_complete，"
-             "参数 {\"next\":\"done\"}，否则回到 repair（stage_complete {\"next\":\"repair\"}）。";
+      return "当前阶段 verify：查一次指标并与目标对比。若已满足目标（例如 p99 正常、dropped 为 0），"
+             "**立即**调用 stage_complete 参数 {\"next\":\"done\"}，不要继续查询；"
+             "若仍未满足，调用 stage_complete {\"next\":\"repair\"}。";
     default:
       return "";
   }
