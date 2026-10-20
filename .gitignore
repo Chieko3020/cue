@@ -7,7 +7,7 @@
 /tickets/
 
 # ── 构建产物 ──
-/build/
+build/
 /cmake-build-*/
 /compile_commands.json
 *.o
