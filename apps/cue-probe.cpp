@@ -231,6 +231,7 @@ int main(int argc, char** argv) {
   uint32_t max_completed = 0;
   udp::endpoint peer{};
   bool have_peer = false;
+  int64_t t_last_peer_us = 0;
   uint32_t session_seen = 0;
   bool warned_clock = false;
   int64_t last_nack_us = 0;
@@ -322,11 +323,12 @@ int main(int argc, char** argv) {
       const uint64_t df = frames - frames_prev;
       std::printf(
           "[probe] fps=%.1f frames=%llu lost=%llu pend=%zu pkts=%llu nack=%llu pause=%llu "
-          "fec_rec=%llu loss=%.1f%% MB=%.2f  ",
+          "fec_rec=%llu rej=%llu loss=%.1f%% MB=%.2f  ",
           double(df) / dt, static_cast<unsigned long long>(frames),
           static_cast<unsigned long long>(lost_frames), pending.size(),
           static_cast<unsigned long long>(packets), static_cast<unsigned long long>(nack_sent),
           static_cast<unsigned long long>(nack_pauses), static_cast<unsigned long long>(fec_recovered),
+          static_cast<unsigned long long>(rejected),
           win_loss * 100.0, double(bytes) / (1024.0 * 1024.0));
       if (!clk.have) {
         std::printf("lat=unsynced(no clock offset yet, stats_req=%llu)\n",
@@ -358,14 +360,30 @@ int main(int argc, char** argv) {
     if (ec || n < cue::proto::kDatagramHeaderSize) continue;
     ++packets;
 
-    // 首包锁定对端：之后任何其它源发来的报文都不许并进重组/时钟估计（review #20）
+    // 首包锁定对端：之后其它源发来的报文不许并进重组/时钟估计（review #20）。
+    // 但 cued 的源端口是 ephemeral（它不 bind），重启后必变；若原 peer 已静默 3 s 就
+    // 允许重新锁定，否则一次重启会让 probe 永久拒收新 cued（AC-2 直接失败）。
     if (!have_peer) {
       peer = from;
       have_peer = true;
+      t_last_peer_us = now_tick;
       next_stats_us = 0;
     } else if (from != peer) {
-      ++rejected;
-      continue;
+      if (now_tick - t_last_peer_us > 3'000'000) {
+        std::fprintf(stderr,
+                     "[probe] 对端切换：原 peer 已静默 %lld ms，改认 %s:%u\n",
+                     static_cast<long long>((now_tick - t_last_peer_us) / 1000),
+                     from.address().to_string().c_str(), from.port());
+        peer = from;
+        t_last_peer_us = now_tick;
+        next_stats_us = 0;
+        clk.begin_batch();  // 重新估一次 offset
+      } else {
+        ++rejected;
+        continue;
+      }
+    } else {
+      t_last_peer_us = now_tick;
     }
 
     auto h = cue::proto::decode_datagram({buf.data(), n});
