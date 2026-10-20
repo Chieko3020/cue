@@ -359,7 +359,9 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
           emit("guard.reject", {{"next", next_j}, {"reason", reject}});
           msgs.push_back(tool_msg("拒绝：" + reject, tc.id, "stage_complete"));
           if (consecutive_rejects >= 2) {  // SPEC §7.5：连续 2 次守卫拒绝 → give_up
-            stop_reason = "consecutive guard rejects";
+            // 错误串保留 "too many guard rejects" 前缀：src/eval/eval.cpp 的
+            // classify_run_error 按这个子串分类为 agent_guard_loop（本轮不能改 eval/*）
+            stop_reason = "too many guard rejects (consecutive 2)";
             stage = Stage::GiveUp;
             emit("stage.enter", {{"stage", stage_name(stage)}, {"reason", stop_reason}});
             ++i;
