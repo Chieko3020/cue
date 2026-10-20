@@ -88,6 +88,8 @@ struct CaseOutcome {
   double final_fps = 0.0;
   uint64_t final_dropped = 0;
   uint64_t final_samples = 0;
+  // agent 实际看到的观测（落进 state.jsonl，出争议时可离线复核证据是否成立）
+  std::vector<Observation> observations;
 };
 
 struct RunConfig {

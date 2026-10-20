@@ -250,8 +250,39 @@ int main() {
     check(res.final_stage != agent::Stage::Done, "case6 must not claim done");
   }
 
+  // ---------- 用例 7：dangerous 工具也算修复动作（靠取消注入完成修复） ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm.push(call("g1", "query_metrics", json{{"window_ms", 5000}}));
+    llm.push(call("g2", "stage_complete", json{{"next", "diagnose"}}));
+    llm.push(call("g3", "stage_complete",
+                  json{{"next", "repair"},
+                       {"root_cause", "network_loss"},
+                       {"evidence", {"injected=59"}},
+                       {"confidence", 0.8}}));
+    llm.push(call("g4", "inject_fault", json{{"kind", "drop"}, {"value", 0}}));
+    llm.push(call("g5", "stage_complete", json{{"next", "verify"}}));
+    llm.push(call("g6", "query_metrics", json{{"window_ms", 5000}}));
+    llm.push(call("g7", "stage_complete", json{{"next", "done"}}));
+
+    auto cfg = make_cfg(tool::ApprovalMode::Auto);
+    cfg.ctx.allowed_dangerous = {"inject_fault"};
+    agent::Runner runner(llm, reg, cfg);
+    int rejects = 0;
+    const auto res = runner.run("x", agent::Budget{}, [&](const agent::Event& e) {
+      if (e.type == "guard.reject") ++rejects;
+    });
+    check(rejects == 0, "case7 dangerous tool satisfies repair guard");
+    check(res.final_stage == agent::Stage::Done, "case7 reaches done");
+    check(mocks.inject_calls == 1, "case7 inject executed once");
+  }
+
   if (failures == 0) {
-    std::printf("test_agent: OK (6 cases)\n");
+    std::printf("test_agent: OK (7 cases)\n");
     return 0;
   }
   std::printf("test_agent: %d failure(s)\n", failures);

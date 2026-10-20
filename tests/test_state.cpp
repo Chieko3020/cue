@@ -40,6 +40,11 @@ eval::CaseOutcome make_outcome(const std::string& id, bool root, bool evidence, 
   o.final_fps = 28.4;
   o.final_dropped = 7;
   o.final_samples = 12;
+  eval::Observation ob;
+  ob.tool = "query_metrics";
+  ob.text = "metrics={\"injected\":59}";
+  ob.data = nlohmann::json{{"injected", 59}};
+  o.observations.push_back(ob);
   return o;
 }
 
@@ -98,6 +103,9 @@ int main() {
       check(back->diagnosis.root_cause == "network_loss", "outcome 根因往返");
       check(back->cost_yuan > 0.049 && back->cost_yuan < 0.051, "outcome 成本往返");
       check(back->final_fps > 28.3 && back->final_fps < 28.5, "outcome 重测指标往返");
+      check(back->observations.size() == 1 && back->observations[0].tool == "query_metrics",
+            "outcome 观测留痕往返");
+      check(eval::evidence_matches("injected=59", back->observations), "落盘后证据仍可复核");
     }
     nlohmann::json bad{{"scored", true}};
     check(!eval::outcome_from_json(bad).has_value(), "缺 id 的 outcome 被拒");

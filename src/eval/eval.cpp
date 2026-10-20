@@ -4,10 +4,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -21,24 +23,7 @@ namespace cue::eval {
 
 namespace {
 
-std::string lower_trim(const std::string& s) {
-  std::string out;
-  out.reserve(s.size());
-  bool prev_space = false;
-  for (char ch : s) {
-    const unsigned char u = static_cast<unsigned char>(ch);
-    if (std::isspace(u)) {
-      if (!prev_space) out.push_back(' ');
-      prev_space = true;
-      continue;
-    }
-    prev_space = false;
-    out.push_back(static_cast<char>(std::tolower(u)));
-  }
-  return out;
-}
-
-// 提取 "key=数字" 里的数字（判分时容忍单位后缀）
+// 提取裸数字（没有 key 可挂时的兜底：证据只写了数字）
 std::vector<std::string> extract_numbers(const std::string& s) {
   std::vector<std::string> nums;
   std::string cur;
@@ -54,29 +39,167 @@ std::vector<std::string> extract_numbers(const std::string& s) {
   return nums;
 }
 
+// SPEC §7.6 要求「归一化子串」：把 JSON 的 "k": v 与证据里的 k=v 归一成同一种写法，
+// 否则模型写得再准也会因为多一个引号被判伪造。
+std::string normalize(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  bool prev_space = true;
+  for (char ch : s) {
+    const unsigned char u = static_cast<unsigned char>(ch);
+    if (std::isalnum(u) || ch == '.' || ch == '_') {
+      out.push_back(static_cast<char>(std::tolower(u)));
+      prev_space = false;
+    } else if (!prev_space) {
+      out.push_back(' ');
+      prev_space = true;
+    }
+  }
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  return out;
+}
+
+bool key_char(char ch) {
+  const unsigned char u = static_cast<unsigned char>(ch);
+  return std::isalnum(u) || ch == '_';
+}
+
+// 证据里的「指标引用」：key 后面跟 = : 空格 或括号，再接一个数字（如 injected=59 / "fps": 30.3）
+struct Citation {
+  std::string key;
+  double value = 0;
+};
+
+std::vector<Citation> citations(const std::string& raw) {
+  std::vector<Citation> out;
+  std::size_t i = 0;
+  while (i < raw.size()) {
+    const unsigned char u = static_cast<unsigned char>(raw[i]);
+    if (!(std::isalpha(u) || raw[i] == '_')) {
+      ++i;
+      continue;
+    }
+    const std::size_t k0 = i;
+    while (i < raw.size() && key_char(raw[i])) ++i;
+    std::string key;
+    key.reserve(i - k0);
+    for (std::size_t j = k0; j < i; ++j) {
+      key.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(raw[j]))));
+    }
+    std::size_t j = i;
+    while (j < raw.size() && (std::isspace(static_cast<unsigned char>(raw[j])) || raw[j] == '=' ||
+                              raw[j] == ':' || raw[j] == '"' || raw[j] == '\'' ||
+                              raw[j] == '(' || raw[j] == '[')) {
+      ++j;
+    }
+    const std::size_t num0 = j;
+    if (j < raw.size() && (std::isdigit(static_cast<unsigned char>(raw[j])) || raw[j] == '-' ||
+                           raw[j] == '+')) {
+      ++j;
+      while (j < raw.size() &&
+             (std::isdigit(static_cast<unsigned char>(raw[j])) || raw[j] == '.')) {
+        ++j;
+      }
+      try {
+        out.push_back(Citation{key, std::stod(raw.substr(num0, j - num0))});
+      } catch (const std::exception&) {
+        // 数字解析失败就当没引用
+      }
+    }
+    i = std::max(i, j);
+  }
+  return out;
+}
+
+// 计数类指标必须精确（injected=60 不能对上 injected=59），连续量按 SPEC §7.6 的 ±2% 容差
+bool value_close(double a, double b) {
+  const bool a_int = std::fabs(a - std::round(a)) < 1e-9;
+  const bool b_int = std::fabs(b - std::round(b)) < 1e-9;
+  if (a_int && b_int) return a == b;
+  return std::fabs(a - b) <= std::max(0.05, 0.02 * std::fabs(b));
+}
+
+std::optional<double> data_value(const json& d, const std::string& key) {
+  if (!d.is_object()) return std::nullopt;
+  for (auto it = d.begin(); it != d.end(); ++it) {
+    std::string k = it.key();
+    for (auto& ch : k) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (k != key) continue;
+    if (it.value().is_number()) return it.value().get<double>();
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+std::optional<double> text_value(const std::string& norm, const std::string& key) {
+  std::size_t pos = 0;
+  while ((pos = norm.find(key, pos)) != std::string::npos) {
+    const bool left_ok = pos == 0 || !key_char(norm[pos - 1]);
+    std::size_t j = pos + key.size();
+    const bool right_ok = j >= norm.size() || !key_char(norm[j]);
+    if (left_ok && right_ok) {
+      while (j < norm.size() && (norm[j] == ' ' || norm[j] == '=' || norm[j] == ':')) ++j;
+      if (j < norm.size() && (std::isdigit(static_cast<unsigned char>(norm[j])) || norm[j] == '-')) {
+        const std::size_t num0 = j;
+        ++j;
+        while (j < norm.size() &&
+               (std::isdigit(static_cast<unsigned char>(norm[j])) || norm[j] == '.')) {
+          ++j;
+        }
+        try {
+          return std::stod(norm.substr(num0, j - num0));
+        } catch (const std::exception&) {
+          return std::nullopt;
+        }
+      }
+    }
+    pos += key.size();
+  }
+  return std::nullopt;
+}
+
+// 一条观测能否解释这条证据：
+//  1) 归一化后互为子串（最强，等价于逐字引用）
+//  2) 证据里的 key=value 引用全部能在该观测里找到，且数值在 ±2% 内；
+//     至少 2 个引用，或者证据本身就是短小的单条片段
+//  3) 兜底：证据只有裸数字，且这些数字都在观测原文里
+bool matches_observation(const std::string& raw_ev, const std::string& ev_norm,
+                         const std::vector<Citation>& cites, const Observation& o) {
+  const std::string text = normalize(o.text);
+  if (!ev_norm.empty() && text.find(ev_norm) != std::string::npos) return true;
+  if (ev_norm.size() >= 8 && ev_norm.find(text) != std::string::npos) return true;
+
+  if (!cites.empty()) {
+    int checked = 0;
+    for (const auto& c : cites) {
+      auto actual = data_value(o.data, c.key);
+      if (!actual) actual = text_value(text, c.key);
+      if (!actual) continue;  // 该观测里没有这个 key（比如工具名/窗口参数）→ 不参与判定
+      ++checked;
+      if (!value_close(*actual, c.value)) return false;
+    }
+    if (checked >= 2) return true;
+    if (checked == 1 && raw_ev.size() <= 40) return true;
+    return false;
+  }
+
+  const auto nums = extract_numbers(ev_norm);
+  if (nums.empty()) return false;
+  for (const auto& n : nums) {
+    if (text.find(n) == std::string::npos) return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 bool evidence_matches(const std::string& evidence, const std::vector<Observation>& obs) {
-  const std::string ev = lower_trim(evidence);
-  if (ev.empty()) return false;
+  const std::string ev_norm = normalize(evidence);
+  if (ev_norm.empty()) return false;
+  const auto cites = citations(evidence);
   for (const auto& o : obs) {
-    const std::string text = lower_trim(o.text);
-    if (text.empty()) continue;
-    // 1) 直接子串关系（证据引用了观测原文，或观测包含了证据的核心片段）
-    if (text.find(ev) != std::string::npos) return true;
-    if (ev.find(text) != std::string::npos && text.size() >= 8) return true;
-    // 2) 数值命中：证据里出现的每个数字都必须能在该观测里找到（且至少一个 >=2 位）
-    const auto nums = extract_numbers(ev);
-    if (!nums.empty()) {
-      bool all_found = true;
-      for (const auto& n : nums) {
-        if (text.find(n) == std::string::npos) {
-          all_found = false;
-          break;
-        }
-      }
-      if (all_found) return true;
-    }
+    if (o.text.empty() && !o.data.is_object()) continue;
+    if (matches_observation(evidence, ev_norm, cites, o)) return true;
   }
   return false;
 }
@@ -211,6 +334,12 @@ std::string classify_run_error(const agent::RunResult& res) {
 }
 
 namespace {
+
+// 报告里的错误串要能放进表格（完整错误留在 state.jsonl 里可查）
+std::string short_text(const std::string& s, std::size_t n = 90) {
+  if (s.size() <= n) return s;
+  return s.substr(0, n) + "…";
+}
 
 // agent 结束后等一条新采样：cued 每秒打印一次统计，agent 期间的采样可能早于修复生效
 constexpr int kFreshSampleWaitMs = 6000;
@@ -348,6 +477,7 @@ CaseOutcome Engine::run_real_case(const Case& c) const {
   o.cost_yuan = res.cost_yuan;
   o.diagnosis = res.diagnosis;
   o.final_stage = agent::stage_name(res.final_stage);
+  o.observations = obs;  // 留档：证据是否成立可离线复核
 
   const std::string ek = classify_run_error(res);
   if (!ek.empty()) {
@@ -440,7 +570,7 @@ RunReport Engine::run(const std::vector<Case>& cases) {
   for (const auto& o : r.cases) {
     if (!o.scored) {
       ++r.run_errors;
-      r.failure_modes.push_back("run_error[" + o.id + "]: " + o.error_kind);
+      r.failure_modes.push_back("run_error[" + o.id + "]: " + short_text(o.error_kind));
       continue;
     }
     ++r.scored;
@@ -500,7 +630,7 @@ std::string Engine::render_markdown(const RunReport& r) const {
   for (const auto& c : r.cases) {
     if (!c.scored) {
       o << "| " << c.id << " | — | — | — | — | " << c.turns << " | " << c.cost_yuan
-        << " | run_error: " << c.error_kind << " | — | — |\n";
+        << " | run_error: " << short_text(c.error_kind) << " | — | — |\n";
       continue;
     }
     o << "| " << c.id << " | " << (c.score.root ? "✓" : "✗") << " | "

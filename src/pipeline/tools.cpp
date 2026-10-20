@@ -21,7 +21,10 @@ const char* real_ops_system_prompt() {
          "每轮只能调用工具；结论必须引用真实观测作为证据；每个阶段结束调用 stage_complete。"
          "根因必须使用枚举值：network_loss / network_delay / bandwidth_insufficient / "
          "encoder_too_slow / resolution_too_high / queue_backlog / keyframe_storm / clock_drift。"
-         "若要取消已有的丢包注入，用 inject_fault 且 value=0。";
+         "若要取消已有的丢包注入，用 inject_fault 且 value=0。"
+         "diagnose 阶段提交 evidence 时，每条只从某次工具返回里逐字摘抄 key=value 片段"
+         "（例如 injected=59、fps=30.3、decode_p99_ms=3.199），最多 4 条；"
+         "不要写解释性句子，也不要把多次观测合并成一条——判分会逐条校验。";
 }
 
 void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::vector<ToolTrace>* trace) {

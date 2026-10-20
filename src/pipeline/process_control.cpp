@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -228,6 +229,11 @@ bool ProcessPipelineControl::set_param(const std::string& key, const std::string
     err = "gop out of range [1, 300]";
     return false;
   }
+  // 幂等：配置没变就不重启（重启会断流，agent 反复 set 同值会空转）
+  if (next.bitrate_kbps == cfg_.bitrate_kbps && next.gop == cfg_.gop && next.preset == cfg_.preset &&
+      next.transcode == cfg_.transcode && next.width == cfg_.width && next.height == cfg_.height) {
+    return true;
+  }
   cfg_ = next;
   stop();
   return spawn(err);
@@ -242,6 +248,7 @@ bool ProcessPipelineControl::inject_fault(const std::string& kind, double value,
     err = "drop percent out of range [0, 100]";
     return false;
   }
+  if (std::fabs(cfg_.inject_drop - value) < 1e-9) return true;  // 幂等：注入值没变不重启
   cfg_.inject_drop = value;
   stop();
   return spawn(err);

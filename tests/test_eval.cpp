@@ -118,14 +118,27 @@ int main() {
     check(!eval::evidence_matches("", obs), "case8e empty rejected");
   }
 
+  // 8f–8i) 归一化匹配：模型把观测写成 "k": v 与 k=v 都要认，但数值必须真的对得上
+  {
+    const auto obs = make_obs();
+    check(eval::evidence_matches("query_metrics(5000ms): injected=59, fps=30.3, dropped=0", obs),
+          "case8f 带前缀与 key=value 的引用");
+    check(eval::evidence_matches("fps=30.31", obs), "case8g 连续量 ±2% 容差");
+    check(!eval::evidence_matches("injected=59, fps=12.0", obs), "case8h 同一引用里数值冲突被拒");
+    check(!eval::evidence_matches("query_metrics: injected=60", obs), "case8i 计数值不容差");
+    check(!eval::evidence_matches("jitter_buffer_depth=9999", obs), "case8j 编造字段被拒");
+  }
+
   // 9) suite 解析
   {
     std::string err;
     const auto cases = eval::load_suite("suites/m2-constraints.json", err);
     check(err.empty(), "case9 suite loads");
     check(cases.size() == 2, "case9 two cases");
-    check(cases[0].expect_root_cause == "resolution_too_high", "case9 first root cause");
-    check(cases[1].expect_root_cause == "fec_ghost_frame", "case9 second root cause");
+    if (cases.size() == 2) {  // 缺 suite 时不要越界（曾在 build/ 目录下跑崩过）
+      check(cases[0].expect_root_cause == "resolution_too_high", "case9 first root cause");
+      check(cases[1].expect_root_cause == "fec_ghost_frame", "case9 second root cause");
+    }
   }
 
   if (failures == 0) {

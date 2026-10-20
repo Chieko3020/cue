@@ -40,6 +40,16 @@ std::string fingerprint_for(const std::string& suite_path, const Case& c) {
   return cue::sha256_hex(base_fingerprint(suite_path) + "|" + c.id + "|" + std::to_string(c.seed));
 }
 
+namespace {
+
+json observations_to_json(const std::vector<Observation>& obs) {
+  json arr = json::array();
+  for (const auto& x : obs) arr.push_back(json{{"tool", x.tool}, {"text", x.text}, {"data", x.data}});
+  return arr;
+}
+
+}  // namespace
+
 json outcome_to_json(const CaseOutcome& o) {
   return json{{"id", o.id},
               {"scored", o.scored},
@@ -54,7 +64,8 @@ json outcome_to_json(const CaseOutcome& o) {
               {"final_stage", o.final_stage},
               {"final_fps", o.final_fps},
               {"final_dropped", o.final_dropped},
-              {"final_samples", o.final_samples}};
+              {"final_samples", o.final_samples},
+              {"observations", observations_to_json(o.observations)}};
 }
 
 std::expected<CaseOutcome, std::string> outcome_from_json(const json& j) {
@@ -86,6 +97,16 @@ std::expected<CaseOutcome, std::string> outcome_from_json(const json& j) {
   o.final_fps = j.value("final_fps", 0.0);
   o.final_dropped = j.value("final_dropped", uint64_t{0});
   o.final_samples = j.value("final_samples", uint64_t{0});
+  if (j.contains("observations") && j["observations"].is_array()) {
+    for (const auto& x : j["observations"]) {
+      if (!x.is_object()) continue;
+      Observation ob;
+      ob.tool = x.value("tool", std::string());
+      ob.text = x.value("text", std::string());
+      ob.data = x.value("data", json::object());
+      o.observations.push_back(std::move(ob));
+    }
+  }
   return o;
 }
 

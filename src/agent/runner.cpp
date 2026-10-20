@@ -266,7 +266,9 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
 
       emit("tool.result", {{"tool", tc.name}, {"ok", res->ok}, {"data", res->data}});
       if (tc.name == "query_metrics" || tc.name == "fetch_observation") used_observe = true;
-      if (risk == tool::Risk::Mutating && res->ok) used_mutating = true;
+      // 「修复动作」= 任何非只读工具成功：dangerous（如 inject_fault）同样是改状态，
+      // 只算 Mutating 会让「靠取消注入完成修复」的合理轨迹被守卫永远卡在 repair。
+      if (risk != tool::Risk::ReadOnly && res->ok) used_mutating = true;
 
       msgs.push_back(tool_msg(res->content, tc.id, tc.name));
     }

@@ -15,7 +15,7 @@
         "allowed_actions": ["inject_fault", "pipeline_set_param", "query_metrics", "fetch_observation"],
         "sla": { "fps_min": 25, "dropped_max": 30 }
       },
-      "budget": { "max_turns": 12, "max_yuan": 0.3, "max_wall_s": 180 }
+      "budget": { "max_turns": 16, "max_yuan": 0.3, "max_wall_s": 180 }
     },
     {
       "id": "netloss-10pct-gop30",
@@ -29,7 +29,7 @@
         "allowed_actions": ["inject_fault", "pipeline_set_param", "query_metrics", "fetch_observation"],
         "sla": { "fps_min": 20, "dropped_max": 60 }
       },
-      "budget": { "max_turns": 12, "max_yuan": 0.3, "max_wall_s": 180 }
+      "budget": { "max_turns": 16, "max_yuan": 0.3, "max_wall_s": 180 }
     }
   ]
 }
