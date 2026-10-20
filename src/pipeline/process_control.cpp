@@ -459,6 +459,18 @@ void ProcessPipelineControl::record_event(PipelineEvent ev) {
   std::function<void(const PipelineEvent&)> cb;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    // codec_config 的 SPS/PPS 单独缓存：它是"媒体元信息"，不属于每秒指标
+    if (ev.type == "codec.config" && ev.data.is_object()) {
+      auto str = [&ev](const char* key, std::string& out) {
+        const auto it = ev.data.find(key);
+        if (it == ev.data.end() || !it->is_string()) return;
+        out = it->get<std::string>();
+      };
+      str("codec", codec_name_);
+      str("sps", sps_hex_);
+      str("pps", pps_hex_);
+      str("raw", codec_raw_hex_);
+    }
     events_.push_back(ev);
     while (events_.size() > kEventMax) events_.pop_front();
     cb = on_event_;
@@ -606,6 +618,14 @@ std::string ProcessPipelineControl::observation(const std::string& source, int t
     oss << "frames_in=" << metrics_.frames_in << " frames_out=" << metrics_.frames_out
         << " dropped=" << metrics_.dropped << " injected=" << metrics_.injected
         << " decoded=" << metrics_.decoded << " decode_errors=" << metrics_.decode_errors;
+    // media 元信息：来自 cued 缓存的 codec_config（0x03）。没有收到过 0x03 时整段不出现，
+    // 而不是编一个空 SPS。
+    if (!sps_hex_.empty() || !pps_hex_.empty() || !codec_raw_hex_.empty()) {
+      oss << " codec=" << codec_name_;
+      if (!sps_hex_.empty()) oss << " sps=" << sps_hex_;
+      if (!pps_hex_.empty()) oss << " pps=" << pps_hex_;
+      if (!codec_raw_hex_.empty()) oss << " codec_raw=" << codec_raw_hex_;
+    }
     return oss.str();
   }
   if (log_tail_.empty()) return {};

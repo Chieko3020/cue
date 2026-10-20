@@ -138,6 +138,13 @@ class ProcessPipelineControl {
   std::deque<std::string> log_tail_;  // #28：deque 头删 O(1)
   std::deque<PipelineEvent> events_;   // 最近 kEventMax 条事件（observation/SSE 用）
   std::function<void(const PipelineEvent&)> on_event_;  // 受 mu_ 保护
+  // codec_config（0x03）缓存：来自 cued 的 codec.config 事件，observation(frames) 作为
+  // 媒体元信息回给 agent。不在 spawn 时清空——浏览器用 annexb，配置在 IDR 里重复出现，
+  // 而 agent 恰恰在"重启修复后"最需要知道当前 SPS/PPS。受 mu_ 保护。
+  std::string codec_name_ = "h264";
+  std::string sps_hex_;
+  std::string pps_hex_;
+  std::string codec_raw_hex_;
   int log_fd_ = -1;                   // 受 spawn_mu_ 保护；reader 线程只读
   std::atomic<pid_t> pid_{0};         // #26：所有访问都走原子量，不再无锁读写
   std::atomic<bool> stop_reader_{false};

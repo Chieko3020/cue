@@ -122,9 +122,10 @@ inline const char* media_reject_reason(MediaReject r) {
   return "unknown";
 }
 
-// 上行媒体包的协议边界校验，集中在这里（下游两个进程不再各自"补"）。
-// 成功时 out 为解出的头；失败时返回具体原因，out 不可用。
-inline MediaReject validate_media(std::span<const uint8_t> b, MediaHeader& out) {
+// 上行包头的公共解包 + 尺寸类边界校验（分片语义由调用方决定，见下面两个入口）。
+namespace detail {
+
+inline MediaReject decode_media_header(std::span<const uint8_t> b, MediaHeader& out) {
   if (b.size() < kMediaHeaderSize) return MediaReject::Truncated;
   if (b[0] != kMagicUp) return MediaReject::BadMagic;
   MediaHeader h;
@@ -132,19 +133,36 @@ inline MediaReject validate_media(std::span<const uint8_t> b, MediaHeader& out) 
   h.type = b[1];
   h.codec = b[2];
   h.flags = b[3];
-  h.stream_id = detail::get_u32(&b[4]);
-  h.frame_id = detail::get_u32(&b[8]);
-  h.frag_index = detail::get_u32(&b[12]);
-  h.frag_count = detail::get_u32(&b[16]);
-  h.pts_us = detail::get_u64(&b[20]);
-  h.payload_len = detail::get_u32(&b[28]);
+  h.stream_id = get_u32(&b[4]);
+  h.frame_id = get_u32(&b[8]);
+  h.frag_index = get_u32(&b[12]);
+  h.frag_count = get_u32(&b[16]);
+  h.pts_us = get_u64(&b[20]);
+  h.payload_len = get_u32(&b[28]);
   if (h.payload_len > b.size() - kMediaHeaderSize) return MediaReject::PayloadOverflow;
   if (h.payload_len > kMaxWsFrag) return MediaReject::FragmentTooLarge;
-  if (h.frag_count == 0) return MediaReject::FragCountZero;
-  if (h.frag_count > kMaxFragPerFrame) return MediaReject::FragCountTooLarge;
-  if (h.frag_index >= h.frag_count) return MediaReject::FragIndexOutOfRange;
   out = h;
   return MediaReject::None;
+}
+
+}  // namespace detail
+
+// 上行媒体包的协议边界校验，集中在这里（下游两个进程不再各自"补"）。
+// 成功时 out 为解出的头；失败时返回具体原因，out 不可用。
+inline MediaReject validate_media(std::span<const uint8_t> b, MediaHeader& out) {
+  const MediaReject r = detail::decode_media_header(b, out);
+  if (r != MediaReject::None) return r;
+  if (out.frag_count == 0) return MediaReject::FragCountZero;
+  if (out.frag_count > kMaxFragPerFrame) return MediaReject::FragCountTooLarge;
+  if (out.frag_index >= out.frag_count) return MediaReject::FragIndexOutOfRange;
+  return MediaReject::None;
+}
+
+// 控制类上行包（codec_config 0x03 / keyframe_req 0x04）不使用分片语义：
+// 发送端常把 frag_count/frag_index 留 0，按媒体包规则会被 FragCountZero 直接拒掉。
+// 这里只放宽分片三项，尺寸/magic/越界仍然严格（超大 payload 照样拒，不额外分配内存）。
+inline MediaReject validate_control(std::span<const uint8_t> b, MediaHeader& out) {
+  return detail::decode_media_header(b, out);
 }
 
 inline std::optional<MediaHeader> decode_media(std::span<const uint8_t> b) {

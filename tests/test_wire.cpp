@@ -87,6 +87,35 @@ int main() {
   lying[31] = 0x00;
   check(!decode_media({lying.data(), lying.size()}).has_value(), "media payload_len overflow rejected");
 
+  // ---- 控制包（codec_config 0x03 / keyframe_req 0x04）：frag_count=0 合法 ----
+  // 发送端常把控制包的 frag_count 留 0；按媒体包规则会被 FragCountZero 拒掉（M5 前置的坑）
+  auto ctl = up;
+  ctl[1] = static_cast<uint8_t>(MediaType::CodecConfig);
+  detail::put_u32(&ctl[16], 0);  // frag_count
+  detail::put_u32(&ctl[12], 0);  // frag_index
+  MediaHeader cm;
+  check(validate_media({ctl.data(), ctl.size()}, cm) == MediaReject::FragCountZero,
+        "media 规则：frag_count=0 仍被拒");
+  check(validate_control({ctl.data(), ctl.size()}, cm) == MediaReject::None,
+        "control 规则：frag_count=0 放行");
+  check(cm.type == static_cast<uint8_t>(MediaType::CodecConfig), "control 包类型正确");
+  check(cm.payload_len == 16, "control payload_len 正确");
+  // 放宽的只有分片三项：尺寸/magic/越界仍然严格
+  check(validate_control({ctl.data(), kMediaHeaderSize - 1}, cm) == MediaReject::Truncated,
+        "control truncated rejected");
+  auto ctl_bad_magic = ctl;
+  ctl_bad_magic[0] = 0xD1;
+  check(validate_control({ctl_bad_magic.data(), ctl_bad_magic.size()}, cm) == MediaReject::BadMagic,
+        "control wrong magic rejected");
+  auto ctl_over = ctl;
+  detail::put_u32(&ctl_over[28], static_cast<uint32_t>(kMaxWsFrag + 1));
+  check(validate_control({ctl_over.data(), ctl_over.size()}, cm) == MediaReject::PayloadOverflow,
+        "control 声明超大 payload 被拒（不给伪造长度分配内存）");
+  auto ctl_big_frag = ctl;
+  detail::put_u32(&ctl_big_frag[16], kMaxFragPerFrame + 1);  // 控制包不看 frag_count
+  check(validate_control({ctl_big_frag.data(), ctl_big_frag.size()}, cm) == MediaReject::None,
+        "control 不受 frag_count 上界约束");
+
   // ---- 分片：一帧切成多包，头字段自洽 ----
   std::vector<uint8_t> frame(kMaxUdpPayload * 2 + 10, 0xAB);
   auto pkts = split_into_datagrams(frame, /*session*/ 3, /*frame*/ 77, /*pts*/ 555, /*key*/ true);

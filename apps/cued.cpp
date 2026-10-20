@@ -71,6 +71,86 @@ void emit_event(std::string_view ev, const json& data) {
   cue::proto::emit_event_line(body.dump());
 }
 
+// ---------------------------------------------------------------- codec_config(0x03)
+// 前端用 annexb 编码（web/app.js: avc.format='annexb'），所以按 Annex-B 起始码切 NAL，
+// 取 SPS(nal_unit_type=7) / PPS(8)。载荷不是 Annex-B 时整段按 raw hex 留底，不静默丢。
+constexpr std::size_t kMaxConfigNalBytes = 1024;   // SPS/PPS 实际只有几十字节，超了就是异常
+constexpr std::size_t kMaxConfigRawBytes = 2048;   // raw 兜底的十六进制长度上限（2×字节数）
+
+struct CodecConfig {
+  bool have = false;
+  std::string codec = "h264";
+  std::string sps_hex;
+  std::string pps_hex;
+  std::string raw_hex;  // 非 Annex-B 载荷（例如 avcC 描述）时的兜底
+  std::size_t sps_bytes = 0;
+  std::size_t pps_bytes = 0;
+  uint32_t stream_id = 0;
+
+  json as_json(bool replayed) const {
+    return json{{"codec", codec},
+                {"sps", sps_hex.empty() ? json(nullptr) : json(sps_hex)},
+                {"pps", pps_hex.empty() ? json(nullptr) : json(pps_hex)},
+                {"sps_bytes", sps_bytes},
+                {"pps_bytes", pps_bytes},
+                {"raw", raw_hex.empty() ? json(nullptr) : json(raw_hex)},
+                {"stream_id", stream_id},
+                {"replayed", replayed}};
+  }
+};
+
+std::string to_hex(const uint8_t* p, std::size_t n) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out(n * 2, '0');
+  for (std::size_t i = 0; i < n; ++i) {
+    out[2 * i] = kHex[p[i] >> 4];
+    out[2 * i + 1] = kHex[p[i] & 0x0F];
+  }
+  return out;
+}
+
+// 返回是否找到 SPS/PPS（两者之一即可）。找不到时 out 保持不变，由调用方走 raw 兜底。
+bool parse_annexb_sps_pps(std::span<const uint8_t> in, CodecConfig& out) {
+  // 先定位起始码（4 字节优先，避免 00 00 00 01 被当成 00 00 01 + 一个多余 0）
+  struct Nal {
+    std::size_t sc_pos;  // 起始码首字节
+    std::size_t begin;   // NAL 首字节
+  };
+  std::vector<Nal> nals;
+  for (std::size_t i = 0; i + 3 <= in.size();) {
+    if (i + 4 <= in.size() && in[i] == 0 && in[i + 1] == 0 && in[i + 2] == 0 && in[i + 3] == 1) {
+      nals.push_back(Nal{i, i + 4});
+      i += 4;
+      continue;
+    }
+    if (in[i] == 0 && in[i + 1] == 0 && in[i + 2] == 1) {
+      nals.push_back(Nal{i, i + 3});
+      i += 3;
+      continue;
+    }
+    ++i;
+  }
+  bool found = false;
+  for (std::size_t k = 0; k < nals.size(); ++k) {
+    const std::size_t begin = nals[k].begin;
+    const std::size_t end = (k + 1 < nals.size()) ? nals[k + 1].sc_pos : in.size();
+    if (end <= begin) continue;
+    const std::size_t len = end - begin;
+    if (len > kMaxConfigNalBytes) continue;
+    const uint8_t nal_type = static_cast<uint8_t>(in[begin] & 0x1F);
+    if (nal_type == 7 && out.sps_hex.empty()) {
+      out.sps_hex = to_hex(in.data() + begin, len);
+      out.sps_bytes = len;
+      found = true;
+    } else if (nal_type == 8 && out.pps_hex.empty()) {
+      out.pps_hex = to_hex(in.data() + begin, len);
+      out.pps_bytes = len;
+      found = true;
+    }
+  }
+  return found;
+}
+
 class Ring {
  public:
   void push(int64_t v) {
@@ -615,6 +695,9 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[cued] ws %s:%u  udp -> %s:%u (M2a: decode + 6-stage profile)\n",
                bind_addr.c_str(), ws_port, probe_host.c_str(), probe_port);
 
+  // codec 配置跨连接保留：cued 重启后缓存为空，直到浏览器再发一包 0x03。
+  CodecConfig codec_cfg;
+
   // pipeline.started：一次 cued 生命周期的起点（重启会再出现一条，带新的 pid）
   emit_event("pipeline.started",
              json{{"pid", ::getpid()},
@@ -651,6 +734,11 @@ int main(int argc, char** argv) {
       continue;
     }
     std::fprintf(stderr, "[cued] client connected\n");
+    if (codec_cfg.have) {
+      // 新连接（含断线重连）：把缓存的 SPS/PPS 原样回放，agent 的 observation 立刻
+      // 能看到媒体元信息，不必等浏览器再发一包 0x03。
+      emit_event("codec.config", codec_cfg.as_json(true));
+    }
     // 新连接必须先丢参考帧：否则旧 SPS/PPS 与参考帧残留到下一个 IDR，表现为持续花屏（#30）
     decoder.flush();
 
@@ -703,9 +791,43 @@ int main(int argc, char** argv) {
         continue;
       }
 
-      auto h = cue::proto::decode_media({p, n});
+      // 控制类上行包（0x03 codec_config / 0x04 keyframe_req）不带分片语义：
+      // 发送端常把 frag_count 留 0，用放宽了分片校验的入口解（其余边界仍然严格）。
+      std::optional<cue::proto::MediaHeader> h;
+      if (n >= 2 && p[0] == cue::proto::kMagicUp &&
+          (p[1] == static_cast<uint8_t>(cue::proto::MediaType::CodecConfig) ||
+           p[1] == static_cast<uint8_t>(cue::proto::MediaType::KeyframeReq))) {
+        cue::proto::MediaHeader hc;
+        if (cue::proto::validate_control({p, n}, hc) == cue::proto::MediaReject::None) h = hc;
+      } else {
+        h = cue::proto::decode_media({p, n});
+      }
       if (!h) {
-        ++c.rejected;  // 协议边界拒绝（wire.h 的 validate_media 决定具体原因）
+        ++c.rejected;  // 协议边界拒绝（wire.h 的 validate_media/validate_control 给出原因）
+        continue;
+      }
+
+      if (h->type == static_cast<uint8_t>(cue::proto::MediaType::CodecConfig)) {
+        // 缓存 SPS/PPS：新连接建立时原样回放给 agent 的 observation（见 accept 循环）
+        const std::span<const uint8_t> body{p + cue::proto::kMediaHeaderSize, h->payload_len};
+        codec_cfg.stream_id = h->stream_id;
+        if (!parse_annexb_sps_pps(body, codec_cfg)) {
+          const std::size_t cn = std::min<std::size_t>(body.size(), kMaxConfigRawBytes);
+          codec_cfg.raw_hex = to_hex(body.data(), cn);
+        } else {
+          codec_cfg.raw_hex.clear();
+        }
+        codec_cfg.have = !codec_cfg.sps_hex.empty() || !codec_cfg.pps_hex.empty() ||
+                         !codec_cfg.raw_hex.empty();
+        emit_event("codec.config", codec_cfg.as_json(false));
+        continue;
+      }
+      if (h->type == static_cast<uint8_t>(cue::proto::MediaType::KeyframeReq)) {
+        // 只落事件流（M5 控制台可见"谁在请求关键帧"），暂不强制下发：
+        // 强制 IDR 是编码侧（浏览器）的职责，cued 没有编码控制权。
+        emit_event("keyframe.request", json{{"stream_id", h->stream_id},
+                                            {"frame_id", h->frame_id},
+                                            {"pts_us", h->pts_us}});
         continue;
       }
       if (h->type != static_cast<uint8_t>(cue::proto::MediaType::Video)) continue;
