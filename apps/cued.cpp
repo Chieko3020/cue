@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -27,7 +29,9 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include <map>
 #include <string>
 #include <string_view>
@@ -50,6 +54,22 @@ using udp = net::ip::udp;
 using json = nlohmann::json;
 
 namespace {
+
+// 事件里的 t 是 unix 微秒（SSE/报告按墙钟展示）；延迟测量仍然只准用 cue::now_us()
+// 的单调时钟（common/clock.h）。两者不可混用，这里只用于「事件发生时刻」。
+int64_t unix_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// 单行结构化事件： [cue-event] {"ev":"<type>","t":<unix_us>,"data":{...}}
+// 与 [cued]/[probe] 人读行共存：现有解析器只认整行前缀，互不干扰。
+// 外层用 ordered_json：键序固定为 ev/t/data（SPEC §5 的格式），不随字段名排序漂移。
+void emit_event(std::string_view ev, const json& data) {
+  nlohmann::ordered_json body{{"ev", std::string(ev)}, {"t", unix_us()}, {"data", data}};
+  cue::proto::emit_event_line(body.dump());
+}
 
 class Ring {
  public:
@@ -212,12 +232,20 @@ void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counte
 
 const char* kStageNames[6] = {"recv", "buffer", "decode", "op", "encode", "send"};
 
+// 某一段的 p 分位（ms）。没有样本时返回 JSON null：事件里不能拿 0 冒充
+// 「这一段真的花了 0 ms」（transcode 关闭时 encode 段本来就没被采样）。
+json stage_ms(const Ring& r, double p) {
+  if (r.size() == 0) return nullptr;
+  return double(r.pct(p)) / 1000.0;
+}
+
 void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, uint64_t& frames_prev) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
+  const double fps = double(df) / dt;
   std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu bkt=%llu serr=%llu enc_err=%llu "
               "dec=%llu dec_err=%llu dec_drop=%llu rej=%llu MB=%.2f",
-              double(df) / dt, static_cast<unsigned long long>(c.frames_in),
+              fps, static_cast<unsigned long long>(c.frames_in),
               static_cast<unsigned long long>(c.frames_out), static_cast<unsigned long long>(c.frames_dropped),
               static_cast<unsigned long long>(c.injected_drops),
               static_cast<unsigned long long>(c.budget_drops),
@@ -267,6 +295,20 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
   std::fwrite(line.data(), 1, line.size(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
+  // 事件流里的同一份数字（SSE / 前端 / agent 事件缓存用）。未采样的段必须是 null。
+  json sample{{"fps", fps},
+              {"frames_in", c.frames_in},
+              {"frames_out", c.frames_out},
+              {"dropped", c.frames_dropped},
+              {"injected", c.injected_drops},
+              {"rejected", c.rejected},
+              {"serr", c.send_errors},
+              {"decode_p50", stage_ms(rings[2], 0.50)},
+              {"decode_p99", stage_ms(rings[2], 0.99)},
+              {"op_p50", stage_ms(rings[3], 0.50)},
+              {"encode_p50", stage_ms(rings[4], 0.50)},
+              {"send_p50", stage_ms(rings[5], 0.50)}};
+  emit_event("metric.sample", sample);
   frames_prev = c.frames_out;
   t_last = now_us;
 }
@@ -402,6 +444,27 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- 退出路径：SIGTERM/SIGINT 交给 sigwait 线程 ----
+  // 不装信号处理函数：main 线程这时可能正阻塞在 ws.read()/accept()，而处理函数里也
+  // 做不了 stdio（异步信号不安全）。改为在创建任何线程之前先把这两个信号屏蔽掉，
+  // 由专门的线程同步取走，正常写一条 pipeline.stopped 事件再退出。
+  sigset_t term_set;
+  sigemptyset(&term_set);
+  sigaddset(&term_set, SIGTERM);
+  sigaddset(&term_set, SIGINT);
+  if (pthread_sigmask(SIG_BLOCK, &term_set, nullptr) != 0) {
+    std::fprintf(stderr, "[cued] pthread_sigmask failed\n");
+    return 1;
+  }
+  std::thread([term_set] {
+    int sig = 0;
+    if (sigwait(&term_set, &sig) != 0) return;
+    emit_event("pipeline.stopped",
+               json{{"reason", "signal"}, {"signal", sig}, {"pid", ::getpid()}});
+    std::fflush(nullptr);
+    _exit(sig == SIGINT ? 130 : 143);
+  }).detach();
+
   cue::media::TranscodeChain chain;
   bool chain_ready = false;
   // 10 Mbps / 64 包突发（SPEC §7.2）：包速率按 1224 B/包折算，头开销一并计入
@@ -527,6 +590,27 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr, "[cued] ws :%u  udp -> %s:%u (M2a: decode + 6-stage profile)\n", ws_port,
                probe_host.c_str(), probe_port);
+
+  // pipeline.started：一次 cued 生命周期的起点（重启会再出现一条，带新的 pid）
+  emit_event("pipeline.started",
+             json{{"pid", ::getpid()},
+                  {"ws_port", ws_port},
+                  {"probe_host", probe_host},
+                  {"probe_port", probe_port},
+                  {"fps", out_fps},
+                  {"bitrate_kbps", out_kbps},
+                  {"gop", out_gop},
+                  {"transcode", transcode_enabled ? "on" : "off"},
+                  {"fec", fec_enabled ? "on" : "off"},
+                  {"inject_drop", inject_drop},
+                  {"inject_seed", inject_seed}});
+  // 带 --inject-drop 启动 = 这条管线上电时故障已经生效（agent 会看到 applied 而不是 cleared）
+  if (inject_drop > 0.0) {
+    emit_event("fault.applied", json{{"kind", "drop"},
+                                     {"value", inject_drop},
+                                     {"seed", inject_seed},
+                                     {"scope", "cued_start"}});
+  }
 
   for (;;) {
     tcp::socket sock(ioc);

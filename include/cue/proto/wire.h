@@ -5,9 +5,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace cue::proto {
@@ -295,6 +298,26 @@ inline std::vector<std::vector<uint8_t>> split_into_datagrams(
     out.push_back(std::move(pkt));
   }
   return out;
+}
+
+// ---------------------------------------------------------------- 结构化事件行（stdout）
+// cued / cue-probe 在关键节点往 stdout 写一行事件，供 harness 的 reader 线程逐行解析
+// （`ProcessPipelineControl` 只认整行的 kEventTag 前缀，与 `[cued]` / `[probe]` 人读行共存）。
+// 格式固定，且**必须**是合法 JSON 单行：
+//   [cue-event] {"ev":"<type>","t":<unix_us>,"data":{...}}
+// 这里只收敛「标签 + 落盘方式」，JSON 体由调用方序列化——wire.h 不引 JSON 依赖。
+inline constexpr std::string_view kEventTag = "[cue-event] ";
+
+// 整行一次 fwrite + fflush：行不会被 stdio 的分块写入或别的线程截成两半。
+// body 必须是已序列化的 JSON 对象（调用方负责合法性与单行性）。
+inline void emit_event_line(std::string_view body) {
+  std::string line;
+  line.reserve(kEventTag.size() + body.size() + 1);
+  line.append(kEventTag);
+  line.append(body);
+  line.push_back('\n');
+  (void)std::fwrite(line.data(), 1, line.size(), stdout);
+  (void)std::fflush(stdout);
 }
 
 }  // namespace cue::proto

@@ -8,10 +8,12 @@
 //   从未拿到样本时不输出延迟分位（lat=unsynced）。同机部署时 offset ≈ 0，口径与旧实现一致。
 #include <boost/asio/ip/udp.hpp>
 #include <boost/system/error_code.hpp>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +23,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 #include <vector>
 
 #include "cue/common/clock.h"
@@ -28,8 +31,24 @@
 
 namespace net = boost::asio;
 using udp = net::ip::udp;
+using json = nlohmann::json;
 
 namespace {
+
+// 事件的 t 是 unix 微秒（墙钟，给 SSE/报告展示）；延迟测量仍用 cue::now_us() 的
+// 单调时钟，两者不混用。
+int64_t unix_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// 单行结构化事件： [cue-event] {"ev":"<type>","t":<unix_us>,"data":{...}}
+// 外层用 ordered_json：键序固定为 ev/t/data，不随字段名排序漂移。
+void emit_event(std::string_view ev, const json& data) {
+  nlohmann::ordered_json body{{"ev", std::string(ev)}, {"t", unix_us()}, {"data", data}};
+  cue::proto::emit_event_line(body.dump());
+}
 
 // ---------------------------------------------------------------- CLI 解析
 // 不用 std::stoi/std::stod：非法值抛出的异常会穿透 main（SPEC §9 禁止异常穿透模块边界），
@@ -82,25 +101,32 @@ struct ClockAlign {
 
   void begin_batch() { best_rtt_us = -1; }
 
-  // echo：我方发戳（probe 时钟）；cued_now：对端回包时的 cued 时钟
-  void observe(int64_t echo, int64_t cued_now, int64_t recv_now) {
+  // echo：我方发戳（probe 时钟）；cued_now：对端回包时的 cued 时钟。
+  // 返回 true 表示这次样本触发了重锚（漂移 > 5 ms），调用方据此写 probe.reanchor 事件。
+  bool observe(int64_t echo, int64_t cued_now, int64_t recv_now) {
     const int64_t rtt = recv_now - echo;
-    if (rtt < 0 || rtt > 1'000'000) return;  // 异常往返（排队/重放）当噪声丢掉
+    if (rtt < 0 || rtt > 1'000'000) return false;  // 异常往返（排队/重放）当噪声丢掉
     const int64_t off = cued_now - (echo + rtt / 2);
     if (!have) {
       offset_us = off;
       best_rtt_us = rtt;
       have = true;
       ++samples;
-      return;
+      return false;
     }
     if (best_rtt_us < 0 || rtt < best_rtt_us) {  // 只认本批 RTT 最小的样本
       last_drift_us = off - offset_us;
-      if (std::llabs(last_drift_us) > 5'000) ++reanchors;  // 漂移 > 5 ms：重锚并记事件
+      bool reanchored = false;
+      if (std::llabs(last_drift_us) > 5'000) {  // 漂移 > 5 ms：重锚并记事件
+        ++reanchors;
+        reanchored = true;
+      }
       offset_us = off;
       best_rtt_us = rtt;
       ++samples;
+      return reanchored;
     }
+    return false;
   }
 };
 
@@ -222,6 +248,8 @@ int main(int argc, char** argv) {
   sock.set_option(udp::socket::receive_buffer_size(4 * 1024 * 1024), ec);
 
   std::fprintf(stderr, "[probe] listening udp :%u\n", port);
+  emit_event("probe.started",
+             json{{"pid", ::getpid()}, {"port", port}, {"nack", nack_enabled ? "on" : "off"}});
 
   std::map<uint32_t, FrameAcc> pending;
   LatencyRing lat;
@@ -347,6 +375,21 @@ int main(int argc, char** argv) {
             static_cast<unsigned long long>(clk.reanchors));
       }
       std::fflush(stdout);
+      // 同一份数字进事件流（M5 控制台 / agent 事件缓存用）。
+      // 没有时钟样本时 offset_us 与延迟分位是 null：synced=false 时它们本来就不存在。
+      const bool have_lat = clk.have && lat.size() > 0;
+      emit_event("probe.metric",
+                 json{{"fps", double(df) / dt},
+                      {"frames", frames},
+                      {"lost", lost_frames},
+                      {"nack", nack_sent},
+                      {"fec_rec", fec_recovered},
+                      {"synced", clk.have},
+                      {"lat_p50", have_lat ? json(double(lat.percentile(0.50)) / 1000.0)
+                                           : json(nullptr)},
+                      {"lat_p99", have_lat ? json(double(lat.percentile(0.99)) / 1000.0)
+                                           : json(nullptr)},
+                      {"offset_us", clk.have ? json(clk.offset_us) : json(nullptr)}});
       frames_prev = frames;
       t_last_report = now_tick;
     }
@@ -395,7 +438,13 @@ int main(int argc, char** argv) {
       const uint8_t* pl = buf.data() + cue::proto::kDatagramHeaderSize;
       const int64_t echo = static_cast<int64_t>(cue::proto::detail::get_u64(pl));
       const int64_t cued_now = static_cast<int64_t>(cue::proto::detail::get_u64(pl + 8));
-      clk.observe(echo, cued_now, cue::now_us());
+      if (clk.observe(echo, cued_now, cue::now_us())) {
+        // SPEC §7.1：漂移 > 5 ms 重锚并记事件——这个"记事件"现在真的落到事件流里
+        emit_event("probe.reanchor", json{{"drift_us", clk.last_drift_us},
+                                          {"offset_us", clk.offset_us},
+                                          {"rtt_us", clk.best_rtt_us},
+                                          {"samples", clk.samples}});
+      }
       continue;
     }
 
