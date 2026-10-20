@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cue/agent/agent.h"
@@ -55,6 +56,23 @@ std::string stage_hint(Stage s) {
   }
 }
 
+// 消息构造：Default-init 后按需赋值，避免聚合初始化漏成员（-Wmissing-field-initializers）
+llm::ChatMessage msg(const char* role, std::string content) {
+  llm::ChatMessage m;
+  m.role = role;
+  m.content = std::move(content);
+  return m;
+}
+
+llm::ChatMessage tool_msg(std::string content, const std::string& call_id, const std::string& name) {
+  llm::ChatMessage m;
+  m.role = "tool";
+  m.content = std::move(content);
+  m.tool_call_id = call_id;
+  m.name = name;
+  return m;
+}
+
 json stage_complete_schema() {
   json props = {
       {"next", {{"type", "string"}, {"enum", {"diagnose", "repair", "verify", "done", "give_up"}}}},
@@ -89,8 +107,8 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
   };
 
   std::vector<llm::ChatMessage> msgs;
-  msgs.push_back(llm::ChatMessage{.role = "system", .content = cfg_.system_prompt});
-  msgs.push_back(llm::ChatMessage{.role = "user", .content = goal});
+  msgs.push_back(msg("system", cfg_.system_prompt));
+  msgs.push_back(msg("user", goal));
   emit("run.start", {{"goal", goal}, {"budget", {{"max_turns", budget.max_turns}}}});
 
   while (r.turns < budget.max_turns) {
@@ -105,7 +123,7 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
     req.tools = tools_.schema();
     req.tools.push_back(stage_complete_schema());
     // 阶段提示作为最后一条 user 消息里追加（不污染历史）
-    req.messages.push_back(llm::ChatMessage{.role = "user", .content = stage_hint(stage)});
+    req.messages.push_back(msg("user", stage_hint(stage)));
     // 上下文预算：超限丢最旧观测，保留 system 与最近若干条
     {
       ContextBudget cb;
@@ -137,14 +155,17 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
         stage = Stage::Done;
         break;
       }
-      msgs.push_back(llm::ChatMessage{.role = "assistant", .content = resp->content});
-      msgs.push_back(llm::ChatMessage{.role = "user", .content = "请继续当前阶段：" + stage_hint(stage)});
+      msgs.push_back(msg("assistant", resp->content));
+      msgs.push_back(msg("user", "请继续当前阶段：" + stage_hint(stage)));
       continue;
     }
 
     // 把 assistant 的 tool_calls 一次性写回历史，再逐个回填 tool 结果
-    msgs.push_back(llm::ChatMessage{.role = "assistant", .content = resp->content,
-                                    .tool_calls = resp->tool_calls});
+    {
+      llm::ChatMessage m = msg("assistant", resp->content);
+      m.tool_calls = resp->tool_calls;
+      msgs.push_back(std::move(m));
+    }
 
     for (const auto& tc : resp->tool_calls) {
       // ---- 控制工具：阶段推进 ----
@@ -186,7 +207,7 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
         if (!reject.empty()) {
           ++guard_rejects;
           emit("guard.reject", {{"next", next}, {"reason", reject}});
-          msgs.push_back(llm::ChatMessage{.role = "tool", .content = "拒绝：" + reject, .tool_call_id = tc.id, .name = "stage_complete"});
+          msgs.push_back(tool_msg("拒绝：" + reject, tc.id, "stage_complete"));
           if (guard_rejects >= 3) {
             r.error = "too many guard rejects";
             stage = Stage::GiveUp;
@@ -196,7 +217,7 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
         }
 
         emit("stage.enter", {{"stage", stage_name(stage)}});
-        msgs.push_back(llm::ChatMessage{.role = "tool", .content = "ok, now in stage " + std::string(stage_name(stage)), .tool_call_id = tc.id, .name = "stage_complete"});
+        msgs.push_back(tool_msg("ok, now in stage " + std::string(stage_name(stage)), tc.id, "stage_complete"));
         if (stage == Stage::Done || stage == Stage::GiveUp) break;
         continue;
       }
@@ -204,7 +225,7 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
       // ---- 普通工具：审批 + 校验 + 执行 ----
       json args = json::parse(tc.arguments, nullptr, false);
       if (args.is_discarded()) {
-        msgs.push_back(llm::ChatMessage{.role = "tool", .content = "参数不是合法 JSON", .tool_call_id = tc.id, .name = tc.name});
+        msgs.push_back(tool_msg("参数不是合法 JSON", tc.id, tc.name));
         continue;
       }
 
@@ -231,7 +252,7 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
 
       if (!approved) {
         emit("approval.denied", {{"tool", tc.name}, {"risk", tool::risk_name(risk)}});
-        msgs.push_back(llm::ChatMessage{.role = "tool", .content = std::string("被拒绝（") + tool::risk_name(risk) + "）", .tool_call_id = tc.id, .name = tc.name});
+        msgs.push_back(tool_msg(std::string("被拒绝（") + tool::risk_name(risk) + "）", tc.id, tc.name));
         continue;
       }
 
@@ -239,7 +260,7 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
       auto res = tools_.call(tc.name, args);
       if (!res) {
         emit("tool.error", {{"tool", tc.name}, {"error", res.error()}});
-        msgs.push_back(llm::ChatMessage{.role = "tool", .content = "错误：" + res.error(), .tool_call_id = tc.id, .name = tc.name});
+        msgs.push_back(tool_msg("错误：" + res.error(), tc.id, tc.name));
         continue;
       }
 
@@ -247,7 +268,7 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
       if (tc.name == "query_metrics" || tc.name == "fetch_observation") used_observe = true;
       if (risk == tool::Risk::Mutating && res->ok) used_mutating = true;
 
-      msgs.push_back(llm::ChatMessage{.role = "tool", .content = res->content, .tool_call_id = tc.id, .name = tc.name});
+      msgs.push_back(tool_msg(res->content, tc.id, tc.name));
     }
 
     if (stage == Stage::Done || stage == Stage::GiveUp) break;

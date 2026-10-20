@@ -23,7 +23,7 @@ void check(bool cond, const char* what) {
   }
 }
 
-llm::ChatResponse text(const std::string& content) {
+[[maybe_unused]] llm::ChatResponse text(const std::string& content) {
   llm::ChatResponse r;
   r.content = content;
   r.usage = {100, 20};
@@ -71,7 +71,14 @@ struct MockTools {
                                    .desc = "参数名",
                                    .required = true,
                                    .enum_values = {"bitrate_kbps", "gop", "preset", "transcode"}},
-                                  {.name = "value", .type = "string", .desc = "目标值"}}},
+                                  {.name = "value",
+                                   .type = "string",
+                                   .desc = "目标值",
+                                   .required = true,
+                                   .enum_values = {},
+                                   .has_range = false,
+                                   .min = 0,
+                                   .max = 0}}},
         [this](const json& a) {
           ++set_param_calls;
           last_set = a;
@@ -87,7 +94,14 @@ struct MockTools {
                                    .desc = "类型",
                                    .required = true,
                                    .enum_values = {"drop", "delay", "jitter", "rate"}},
-                                  {.name = "value", .type = "number", .desc = "数值"}}},
+                                  {.name = "value",
+                                   .type = "number",
+                                   .desc = "数值",
+                                   .required = true,
+                                   .enum_values = {},
+                                   .has_range = false,
+                                   .min = 0,
+                                   .max = 0}}},
         [this](const json& a) {
           ++inject_calls;
           return tool::ToolResult{true, "injected", a};

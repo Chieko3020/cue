@@ -84,6 +84,10 @@ struct CaseOutcome {
   double cost_yuan = 0.0;
   agent::Diagnosis diagnosis;
   std::string final_stage;
+  // harness 重测到的最终指标（SLA 判分的依据，留档便于复核）
+  double final_fps = 0.0;
+  uint64_t final_dropped = 0;
+  uint64_t final_samples = 0;
 };
 
 struct RunConfig {
@@ -94,6 +98,10 @@ struct RunConfig {
   std::string out_dir = "runs";
   int warmup_s = 6;                     // 管线起来后等推流的时间
   bool keep_pipeline = false;
+  // M4b：real 模式
+  std::string cued_bin = "./build/cued";
+  std::string model = "deepseek-chat";  // real 模式模型名
+  double yuan_per_mtok = 2.0;           // 成本核算单价
 };
 
 struct RunReport {
@@ -112,6 +120,12 @@ struct RunReport {
   std::vector<std::string> failure_modes;  // "root=network_loss: 3 次未命中" 之类的聚合
 };
 
+// real 模式：case → 管线配置（inject_drop 取自 case.fault_value，其余档位照抄 case）
+pipeline::ProcessPipelineControl::Config pipeline_config_for(const Case& c, const RunConfig& cfg);
+
+// real 模式错误分类：空串 = 计分；否则是 run_error 的 error_kind（不计入成功率分母）
+std::string classify_run_error(const agent::RunResult& res);
+
 class Engine {
  public:
   explicit Engine(RunConfig cfg) : cfg_(std::move(cfg)) {}
@@ -119,6 +133,8 @@ class Engine {
   std::string render_markdown(const RunReport& r) const;
 
  private:
+  CaseOutcome run_scripted_case(const Case& c) const;
+  CaseOutcome run_real_case(const Case& c) const;
   RunConfig cfg_;
 };
 

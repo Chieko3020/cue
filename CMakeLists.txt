@@ -41,6 +41,7 @@ add_library(cue_core STATIC
   src/tool/registry.cpp
   src/agent/runner.cpp
   src/pipeline/process_control.cpp
+  src/pipeline/tools.cpp
   src/eval/eval.cpp)
 target_link_libraries(cue_core PUBLIC cue_proto PkgConfig::CURL)
 target_include_directories(cue_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
