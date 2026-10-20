@@ -15,6 +15,7 @@ find_package(Threads REQUIRED)
 find_package(Boost 1.83 REQUIRED COMPONENTS system)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavutil libswscale x264)
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
 # ---- proto：纯头文件，编解码规则集中在一处 ----
 add_library(cue_proto INTERFACE)
@@ -34,8 +35,23 @@ target_include_directories(cue-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
 # ---- 静态资源目录（供本地 http server 使用）----
 add_custom_target(web ALL SOURCES web/index.html web/app.js)
 
+# ---- agent 内核（M3）----
+add_library(cue_core STATIC
+  src/llm/client.cpp
+  src/tool/registry.cpp
+  src/agent/runner.cpp)
+target_link_libraries(cue_core PUBLIC cue_proto PkgConfig::CURL)
+target_include_directories(cue_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(cue apps/cue.cpp)
+target_link_libraries(cue PRIVATE cue_core)
+
 # ---- 测试 ----
 enable_testing()
 add_executable(test_wire tests/test_wire.cpp)
 target_link_libraries(test_wire PRIVATE cue_proto)
 add_test(NAME wire COMMAND test_wire)
+
+add_executable(test_agent tests/test_agent.cpp)
+target_link_libraries(test_agent PRIVATE cue_core)
+add_test(NAME agent COMMAND test_agent)
