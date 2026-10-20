@@ -53,8 +53,12 @@ class Runner {
     std::string model;
     std::string system_prompt;
     tool::CallContext ctx;
-    // 每 1M prompt+completion token 的价格（元），用于成本预算；0 表示不计量
+    // 成本估算单价（元 / 1M token）。报告里的 cost 是**估算，不是账单**：
+    // output 单价通常显著高于 input，cache hit 又更低。
+    // 兼容字段：prompt/completion 未单独配置（=0）时用它统一计价。
     double yuan_per_mtok = 2.0;
+    double prompt_yuan_per_mtok = 0.0;      // 0 = 回落到 yuan_per_mtok
+    double completion_yuan_per_mtok = 0.0;  // 0 = 回落到 yuan_per_mtok
     // 上下文预算：超出后丢最旧观测（system 与最近若干条必须保留）
     std::size_t max_context_tokens = 24000;
     // 单轮输出上限。1024 会在多工具/长证据时被截断（SPEC §7.9）。

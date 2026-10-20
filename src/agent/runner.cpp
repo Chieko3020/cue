@@ -186,6 +186,11 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   // "没跑完"当成"答错"计入成功率分母，审查实测过这个污染路径）。
   std::string stop_reason;
   const int64_t t_start = now_us();
+  const int64_t wall_limit_us = int64_t(budget.max_wall_s) * 1'000'000LL;
+  // 成本单价：input/output 分开计价（未配置时回落到统一单价）。估算，非账单。
+  const double price_in = cfg_.prompt_yuan_per_mtok > 0 ? cfg_.prompt_yuan_per_mtok : cfg_.yuan_per_mtok;
+  const double price_out =
+      cfg_.completion_yuan_per_mtok > 0 ? cfg_.completion_yuan_per_mtok : cfg_.yuan_per_mtok;
 
   auto emit = [&](const char* type, json data) {
     if (on_event) on_event(Event{type, std::move(data)});
@@ -197,10 +202,14 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   emit("run.start", {{"goal", goal}, {"budget", {{"max_turns", budget.max_turns}}}});
 
   while (r.turns < budget.max_turns) {
-    if (now_us() - t_start > int64_t(budget.max_wall_s) * 1'000'000LL) {
+    // 墙钟预算：每轮开头查，并把"剩余预算"作为本次 LLM 调用的硬超时，
+    // 否则一次 60 s 的调用就能把 max_wall_s 顶穿（审查 P2）。
+    const int64_t elapsed_us = now_us() - t_start;
+    if (elapsed_us > wall_limit_us) {
       stop_reason = "wall clock budget exhausted";
       break;
     }
+    const int remaining_s = static_cast<int>((wall_limit_us - elapsed_us + 999'999) / 1'000'000LL);
 
     llm::ChatRequest req;
     req.model = cfg_.model;
@@ -208,6 +217,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     req.tools = tools_.schema();
     req.tools.push_back(stage_complete_schema());
     req.max_tokens = cfg_.max_tokens;
+    req.timeout_s = remaining_s > 0 ? remaining_s : 1;
     // 阶段提示作为最后一条 user 消息里追加（不污染历史）
     req.messages.push_back(msg("user", stage_hint(stage)));
     // 上下文预算：超限丢最旧观测，保留 system 与最近若干条
@@ -226,12 +236,18 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       break;
     }
     ++r.turns;
-    r.cost_yuan += double(resp->usage.prompt_tokens + resp->usage.completion_tokens) / 1e6 * cfg_.yuan_per_mtok;
+    r.cost_yuan +=
+        (double(resp->usage.prompt_tokens) * price_in + double(resp->usage.completion_tokens) * price_out) / 1e6;
     emit("llm.response",
          {{"turn", r.turns}, {"content", resp->content}, {"tool_calls", resp->tool_calls.size()}});
 
     if (r.cost_yuan > budget.max_yuan) {
       stop_reason = "cost budget exhausted";
+      break;
+    }
+    // 单轮内工具 + LLM 耗时同样可能超出墙钟，出循环前再查一次
+    if (now_us() - t_start > wall_limit_us) {
+      stop_reason = "wall clock budget exhausted";
       break;
     }
 
@@ -359,50 +375,30 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
         continue;
       }
 
-      const tool::Risk risk = tools_.risk_of(tc.name);
-      bool approved = true;
-      if (risk != tool::Risk::ReadOnly) {
-        if (cfg_.ctx.mode == tool::ApprovalMode::Deny) {
-          approved = false;
-        } else if (cfg_.ctx.mode == tool::ApprovalMode::Auto) {
-          if (risk == tool::Risk::Dangerous) {
-            bool allowed = false;
-            for (const auto& a : cfg_.ctx.allowed_dangerous) {
-              if (a == tc.name) {
-                allowed = true;
-                break;
-              }
-            }
-            approved = allowed;
-          }
-        } else {  // Ask
-          const tool::ToolSpec* spec = tools_.find_spec(tc.name);
-          approved = (spec != nullptr && cfg_.ctx.approve) ? cfg_.ctx.approve(*spec, args) : false;
-        }
-      }
+      // 风险/审批策略只在 Registry::call_guarded 里实现一处——任何新调用点都不会绕过审批
+      const auto g = tools_.call_guarded(tc.name, args, cfg_.ctx, [&](tool::Risk risk) {
+        emit("tool.call", {{"tool", tc.name}, {"risk", tool::risk_name(risk)}, {"args", args}});
+      });
 
-      if (!approved) {
-        emit("approval.denied", {{"tool", tc.name}, {"risk", tool::risk_name(risk)}});
-        msgs.push_back(tool_msg(std::string("被拒绝（") + tool::risk_name(risk) + "）", tc.id, tc.name));
+      if (g.status == tool::GuardedCall::Status::ApprovalDenied) {
+        emit("approval.denied", {{"tool", tc.name}, {"risk", tool::risk_name(g.risk)}});
+        msgs.push_back(tool_msg(g.error, tc.id, tc.name));
+        continue;
+      }
+      if (g.status == tool::GuardedCall::Status::Failed) {
+        emit("tool.error", {{"tool", tc.name}, {"error", g.error}});
+        msgs.push_back(tool_msg("错误：" + g.error, tc.id, tc.name));
         continue;
       }
 
-      emit("tool.call", {{"tool", tc.name}, {"risk", tool::risk_name(risk)}, {"args", args}});
-      auto res = tools_.call(tc.name, args);
-      if (!res) {
-        emit("tool.error", {{"tool", tc.name}, {"error", res.error()}});
-        msgs.push_back(tool_msg("错误：" + res.error(), tc.id, tc.name));
-        continue;
-      }
-
-      emit("tool.result", {{"tool", tc.name}, {"ok", res->ok}, {"data", res->data}});
+      emit("tool.result", {{"tool", tc.name}, {"ok", g.result.ok}, {"data", g.result.data}});
       // 失败的观测不算观测（cued 未收到流时 query_metrics 返回 ok=false）
-      if (tools_.is_observation_tool(tc.name) && res->ok) used_observe = true;
+      if (tools_.is_observation_tool(tc.name) && g.result.ok) used_observe = true;
       // 「修复动作」= 任何非只读工具成功：dangerous（如 inject_fault）同样是改状态，
       // 只算 Mutating 会让「靠取消注入完成修复」的合理轨迹被守卫永远卡在 repair。
-      if (risk != tool::Risk::ReadOnly && res->ok) used_mutating = true;
+      if (g.risk != tool::Risk::ReadOnly && g.result.ok) used_mutating = true;
 
-      msgs.push_back(tool_msg(res->content, tc.id, tc.name));
+      msgs.push_back(tool_msg(g.result.content, tc.id, tc.name));
     }
 
     // 状态已终结时，同批剩余 tool_call 不再执行，但每条都必须回填 tool 消息，

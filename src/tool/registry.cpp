@@ -14,8 +14,35 @@ const char* risk_name(Risk r) {
   return "unknown";
 }
 
+namespace {
+
+// integer 的宽松判定：模型常把 5000 写成 5000.0（JSON 浮点写法），
+// 只要数值可无损转成 int64 就接受；1.5 / NaN / 越界仍然拒绝。
+bool is_integral_value(const json& v) {
+  if (!v.is_number()) return false;
+  if (v.is_number_integer() || v.is_number_unsigned()) return true;
+  const double d = v.get<double>();
+  if (!std::isfinite(d) || d != std::trunc(d)) return false;
+  return d >= -9.2e18 && d <= 9.2e18;
+}
+
+}  // namespace
+
 std::expected<void, std::string> validate_args(const ToolSpec& spec, const json& args) {
   if (!args.is_object()) return std::unexpected("args must be a JSON object");
+
+  // schema 声明了 additionalProperties=false，校验必须跟着拒未知字段：
+  // 否则模型发明一个参数名会被静默忽略，模型以为生效、实际没生效。
+  for (const auto& [key, _] : args.items()) {
+    bool declared = false;
+    for (const auto& p : spec.params) {
+      if (p.name == key) {
+        declared = true;
+        break;
+      }
+    }
+    if (!declared) return std::unexpected("unknown param: " + key);
+  }
 
   for (const auto& p : spec.params) {
     if (!args.contains(p.name)) {
@@ -24,7 +51,7 @@ std::expected<void, std::string> validate_args(const ToolSpec& spec, const json&
     }
     const auto& v = args[p.name];
     if (p.type == "string" && !v.is_string()) return std::unexpected(p.name + " must be string");
-    if (p.type == "integer" && !v.is_number_integer()) return std::unexpected(p.name + " must be integer");
+    if (p.type == "integer" && !is_integral_value(v)) return std::unexpected(p.name + " must be integer");
     if (p.type == "number" && !v.is_number()) return std::unexpected(p.name + " must be number");
     if (p.type == "boolean" && !v.is_boolean()) return std::unexpected(p.name + " must be boolean");
 
@@ -96,6 +123,52 @@ std::expected<ToolResult, std::string> Registry::call(const std::string& name, c
   } catch (const std::exception& e) {
     return std::unexpected(std::string("tool threw: ") + e.what());
   }
+}
+
+GuardedCall Registry::call_guarded(const std::string& name, const json& args, const CallContext& ctx,
+                                   const std::function<void(Risk)>& on_approved) const {
+  GuardedCall out;
+  out.risk = risk_of(name);
+  const ToolSpec* spec = find_spec(name);
+
+  bool approved = true;
+  if (out.risk != Risk::ReadOnly) {
+    if (spec == nullptr) {
+      approved = false;  // 未知工具按最危险处理：无 spec 就没有可审批的对象
+    } else if (ctx.mode == ApprovalMode::Deny) {
+      approved = false;
+    } else if (ctx.mode == ApprovalMode::Auto) {
+      if (out.risk == Risk::Dangerous) {
+        bool allowed = false;
+        for (const auto& a : ctx.allowed_dangerous) {
+          if (a == name) {
+            allowed = true;
+            break;
+          }
+        }
+        approved = allowed;
+      }
+    } else {  // Ask：没有回调就等于没人批准
+      approved = ctx.approve ? ctx.approve(*spec, out.risk, args) : false;
+    }
+  }
+
+  if (!approved) {
+    out.status = GuardedCall::Status::ApprovalDenied;
+    out.error = std::string("被拒绝（") + risk_name(out.risk) + "）";
+    return out;
+  }
+
+  if (on_approved) on_approved(out.risk);
+  auto res = call(name, args);
+  if (!res) {
+    out.status = GuardedCall::Status::Failed;
+    out.error = res.error();
+    return out;
+  }
+  out.status = GuardedCall::Status::Executed;
+  out.result = std::move(*res);
+  return out;
 }
 
 Risk Registry::risk_of(const std::string& name) const {

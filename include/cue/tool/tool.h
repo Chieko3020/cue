@@ -25,7 +25,9 @@ struct CallContext {
   ApprovalMode mode = ApprovalMode::Auto;
   // 评测模式下 case 允许的危险动作白名单（空 = 不允许 dangerous）
   std::vector<std::string> allowed_dangerous;
-  std::function<bool(const ToolSpec&, const json& args)> approve;  // Ask 模式的回调，返回是否批准
+  // Ask 模式的回调，返回是否批准。参数带 Risk 是为了让审批 UI 能按风险分级呈现；
+  // 阶段（agent::Stage）不在这里传——tool 层不得 include agent 层（SPEC §7.3）。
+  std::function<bool(const ToolSpec&, Risk, const json& args)> approve;
 };
 
 const char* risk_name(Risk r);
@@ -56,6 +58,16 @@ struct ToolResult {
 
 using ToolHandler = std::function<ToolResult(const json& args)>;
 
+// 受策略保护的一次调用结果：必须能区分「审批拒绝」「参数/执行失败」「成功」，
+// 否则调用方只能把拒绝当错误回灌，模型看不到"去申请审批"这个信息。
+struct GuardedCall {
+  enum class Status { Executed, ApprovalDenied, Failed };
+  Status status = Status::Failed;
+  Risk risk = Risk::Dangerous;
+  ToolResult result;
+  std::string error;
+};
+
 class Registry {
  public:
   void add(ToolSpec spec, ToolHandler handler);
@@ -63,8 +75,17 @@ class Registry {
   // OpenAI function calling 格式的 tools 数组
   json schema() const;
 
-  // 三层校验：JSON 类型 → 枚举/范围 → 语义（由 handler 自行检查）
+  // 三层校验：JSON 类型 → 枚举/范围 → 语义（由 handler 自行检查）。
+  // 注意：本方法不做风险/审批判断，仅供已知安全的调用点（内部/单测）使用；
+  // 面向模型或外部入口一律用 call_guarded。
   std::expected<ToolResult, std::string> call(const std::string& name, const json& args) const;
+
+  // 风险策略的唯一实现处（SPEC §7.4：dangerous 必须显式授权）：
+  //   Deny → 拒一切非只读；Auto → 只放行 allowed_dangerous 内的 dangerous；
+  //   Ask  → 交给 ctx.approve，未提供回调按拒绝处理；未知工具按 Dangerous + 拒绝。
+  // on_approved 在"已批准、尚未执行"时调用（审计事件需要记录意图先于结果）。
+  GuardedCall call_guarded(const std::string& name, const json& args, const CallContext& ctx,
+                           const std::function<void(Risk)>& on_approved = nullptr) const;
 
   Risk risk_of(const std::string& name) const;
   bool has(const std::string& name) const;
