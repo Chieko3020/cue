@@ -1,5 +1,6 @@
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -224,7 +225,10 @@ std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const Chat
   if (!url.empty() && url.back() == '/') url.pop_back();
   url += "/v1/chat/completions";
 
-  const int timeout_s = req.timeout_s > 0 ? req.timeout_s : cfg_.timeout_s;
+  // 请求级超时只能收紧：剩余预算比客户端超时大时，仍用客户端超时
+  int timeout_s = cfg_.timeout_s;
+  if (req.timeout_s > 0) timeout_s = (timeout_s > 0 ? std::min(req.timeout_s, timeout_s) : req.timeout_s);
+  if (timeout_s <= 0) timeout_s = 60;
   const int max_retries = cfg_.max_retries < 0 ? 0 : cfg_.max_retries;
 
   HttpOutcome outcome;
@@ -236,8 +240,7 @@ std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const Chat
       std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     }
     ++attempts;
-    outcome = perform(impl_->curl, impl_->headers, url, payload, timeout_s > 0 ? timeout_s : 1,
-                      cfg_.max_response_bytes);
+    outcome = perform(impl_->curl, impl_->headers, url, payload, timeout_s, cfg_.max_response_bytes);
     if (!retryable(outcome.rc, outcome.http_code, outcome.overflow)) break;
   }
 

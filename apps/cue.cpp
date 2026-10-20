@@ -128,8 +128,8 @@ bool parse_run_args(int argc, char** argv, RunOptions& o) {
       if (o.allow_dangerous == "none") o.allow_dangerous.clear();
     } else if (a == "--max-turns") {
       if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_int(v, o.budget.max_turns)) {
-        std::fprintf(stderr, "--max-turns 取值非法：%s\n", v.c_str());
+      if (!parse_int(v, o.budget.max_turns) || o.budget.max_turns < 1) {
+        std::fprintf(stderr, "--max-turns 取值非法（需 >= 1）：%s\n", v.c_str());
         return false;
       }
     } else if (a == "--max-yuan") {

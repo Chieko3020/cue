@@ -42,8 +42,8 @@ struct ChatRequest {
   double temperature = 0.0;
   // 1024 会在多工具/长证据时被截断（SPEC §7.9）。默认 2048，由 Runner::Config 覆盖。
   int max_tokens = 2048;
-  // 本次请求的硬超时（秒）；0 表示用客户端配置。Runner 用它把"剩余墙钟预算"传给 client，
-  // 避免单次 60 s 的 LLM 调用把整轮预算顶穿（SPEC §7.5 预算）。
+  // 本次请求的超时（秒）；0 表示用客户端配置。Runner 用它把"剩余墙钟预算"传给 client，
+  // 避免单次调用把整轮预算顶穿（SPEC §7.5）。只允许**收紧**，不能放宽客户端配置。
   int timeout_s = 0;
 };
 
