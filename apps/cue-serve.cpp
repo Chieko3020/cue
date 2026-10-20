@@ -1026,7 +1026,9 @@ int main(int argc, char** argv) {
               opt.approval_timeout_s);
   std::printf("[cue-serve] SSE: /events  API: /api/state /api/action /api/approve /api/runs\n");
 
-  if (!app.start_pipeline(err)) {
+  if (opt.no_pipeline) {
+    std::printf("[cue-serve] --no-pipeline：不启动 cued（只读状态/评测）\n");
+  } else if (!app.start_pipeline(err)) {
     std::fprintf(stderr, "[cue-serve] 管线启动失败：%s（控制台仍可用，可稍后点\"启动\"）\n", err.c_str());
   } else {
     std::printf("[cue-serve] cued 已启动（ws=%d，udp=%d，cued=%s）\n", opt.ws_port, opt.probe_port,

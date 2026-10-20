@@ -408,6 +408,7 @@ async function shutdown() {
   }
   await page.screenshot({ path: path.join(SHOT_DIR, 'runs.png'), fullPage: true });
   await page.click('[data-testid="tab-device"]');
+  await page.waitForTimeout(800); // 等采集端能力探测（isConfigSupported / enumerateDevices）落定
   await page.screenshot({ path: path.join(SHOT_DIR, 'device.png'), fullPage: true });
 
   // ---------------------------------------------------------------- 8. 刷新后事件从快照恢复
