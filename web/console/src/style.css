@@ -1,0 +1,206 @@
+/* Cue 控制台样式：手写、零外部资源（无 CDN、无 web font、无图标包）。
+   配色沿用项目里已有的深色终端风：#0d1117 底 / #161b22 卡片 / #30363d 边。 */
+:root {
+  color-scheme: dark;
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-2: #1c232c;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+#root { min-height: 100vh; }
+
+header.app {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 14px 20px 10px;
+  border-bottom: 1px solid var(--border);
+}
+header.app h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .5px; }
+header.app .meta { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+header.app .meta b { color: var(--text); font-weight: 500; }
+
+nav.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 20px 0;
+  border-bottom: 1px solid var(--border);
+}
+nav.tabs button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  color: var(--muted);
+  padding: 7px 16px;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+  font: inherit;
+}
+nav.tabs button:hover { color: var(--text); background: var(--panel); }
+nav.tabs button.active {
+  color: var(--text);
+  background: var(--panel);
+  border-color: var(--border);
+  margin-bottom: -1px;
+  border-bottom: 1px solid var(--panel);
+}
+nav.tabs .pill { margin-left: auto; align-self: center; font-size: 12px; color: var(--muted); padding-bottom: 8px; }
+
+main { padding: 16px 20px 40px; max-width: 1200px; }
+
+.page { display: flex; flex-direction: column; gap: 14px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.card > h2 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.card > h2 .sub { color: var(--muted); font-weight: 400; font-size: 12px; }
+.card > h2 .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+
+.metric {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.metric .k { color: var(--muted); font-size: 11px; }
+.metric .v { font-size: 18px; font-variant-numeric: tabular-nums; }
+.metric .v.small { font-size: 14px; }
+
+button {
+  background: #21262d;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { background: #2d333b; }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+button.primary:hover { background: #388bfd; }
+button.danger { background: #4d1f1f; border-color: #6e2a2a; color: #ffb3b3; }
+button.ok { background: #1b3b23; border-color: #2a5a34; color: #9be9a8; }
+button.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+button.chip { padding: 2px 9px; border-radius: 20px; font-size: 11px; }
+
+input, select {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 4px 8px;
+  font: inherit;
+}
+input:focus, select:focus { outline: 1px solid var(--accent); }
+label.f { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+label.f input, label.f select { width: 130px; }
+
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #232a33; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr:hover td { background: #1a2029; }
+
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 20px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+}
+.badge.ok { color: var(--ok); border-color: #2a5a34; background: #12261a; }
+.badge.warn { color: var(--warn); border-color: #5a4a1a; background: #2a2412; }
+.badge.bad { color: var(--bad); border-color: #6e2a2a; background: #2a1414; }
+.badge.mut { color: #d2a8ff; border-color: #4a3a6a; background: #221a2e; }
+.badge.muted { color: var(--muted); }
+
+.mono { font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.small { font-size: 11px; }
+.wrap { white-space: pre-wrap; word-break: break-all; }
+.empty { color: var(--muted); padding: 10px 0; }
+
+/* 事件流 */
+ol.events { list-style: none; margin: 0; padding: 0; max-height: 62vh; overflow: auto; }
+ol.events li {
+  display: grid;
+  grid-template-columns: 92px 170px 1fr;
+  gap: 10px;
+  padding: 5px 4px;
+  border-bottom: 1px solid #1b222b;
+  font-size: 12px;
+}
+ol.events li .t { color: var(--muted); }
+ol.events li .ev { color: var(--accent); }
+ol.events li .d { color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+ol.events li .raw { grid-column: 1 / -1; color: #6e7681; font-size: 11px; padding-left: 6px; }
+
+/* 审批 */
+.approve-item {
+  border: 1px solid #6e2a2a;
+  background: #1e1516;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.approve-item .head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.approve-item .args {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: #a5d6ff;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.countdown { font-variant-numeric: tabular-nums; color: var(--warn); }
+.countdown.low { color: var(--bad); }
+
+/* 动作结果 */
+.action-result {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.action-result.ok { border-color: #2a5a34; }
+.action-result.bad { border-color: #6e2a2a; }
+.action-log { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow: auto; }
