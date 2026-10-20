@@ -287,8 +287,262 @@ int main() {
     check(mocks.inject_calls == 1, "case7 inject executed once");
   }
 
+  // ---------- 用例 8：Ask 模式审批回调拿到「当前被调用工具」的 spec + Risk ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm.push(call("h1", "pipeline_set_param", json{{"key", "gop"}, {"value", "30"}}));
+    llm.push(call("h2", "query_metrics", json::object()));
+
+    std::string seen_name;
+    tool::Risk seen_risk = tool::Risk::ReadOnly;
+    int approvals = 0;
+    auto cfg = make_cfg(tool::ApprovalMode::Ask);
+    cfg.ctx.approve = [&](const tool::ToolSpec& spec, tool::Risk risk, const json&) {
+      seen_name = spec.name;
+      seen_risk = risk;
+      ++approvals;
+      return true;
+    };
+    agent::Runner runner(llm, reg, cfg);
+    runner.run("x", agent::Budget{}, nullptr);
+    check(approvals == 1, "case8 approve called once for non-readonly tool");
+    check(seen_name == "pipeline_set_param", "case8 approve sees the actual tool spec");
+    check(seen_risk == tool::Risk::Mutating, "case8 approve sees the actual risk");
+    check(mocks.set_param_calls == 1, "case8 approved tool executed");
+
+    // 未提供回调时 Ask 等同于拒绝（不能默认放行）
+    auto cfg2 = make_cfg(tool::ApprovalMode::Ask);
+    llm::ScriptedClient llm2;
+    llm2.push(call("h3", "pipeline_set_param", json{{"key", "gop"}, {"value", "30"}}));
+    int denied = 0;
+    agent::Runner runner2(llm2, reg, cfg2);
+    runner2.run("x", agent::Budget{}, [&](const agent::Event& e) {
+      if (e.type == "approval.denied") ++denied;
+    });
+    check(denied == 1, "case8 ask without callback denies");
+  }
+
+  // ---------- 用例 9：stage_complete 参数类型异常 → 拒绝而不是崩进程 ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm.push(call("i1", "stage_complete", json{{"next", 7}}));  // next 不是字符串
+    llm.push(call("i2", "query_metrics", json::object()));
+    llm.push(call("i3", "stage_complete", json{{"next", "diagnose"}}));
+    llm.push(call("i4", "stage_complete", json{{"next", "repair"},
+                                               {"root_cause", "network_loss"},
+                                               {"evidence", "injected=59"},  // 应为数组
+                                               {"confidence", 0.8}}));
+    llm.push(call("i5", "stage_complete", json{{"next", "repair"},
+                                               {"root_cause", "network_loss"},
+                                               {"evidence", {"injected=59"}},
+                                               {"confidence", "high"}}));  // 应为数字
+
+    agent::Runner runner(llm, reg, make_cfg(tool::ApprovalMode::Auto));
+    int rejects = 0;
+    std::vector<std::string> reasons;
+    const auto res = runner.run("x", agent::Budget{}, [&](const agent::Event& e) {
+      if (e.type == "guard.reject") {
+        ++rejects;
+        reasons.push_back(e.data.value("reason", ""));
+      }
+    });
+    check(rejects == 3, "case9 each malformed stage_complete rejected");
+    check(res.final_stage == agent::Stage::GiveUp, "case9 malformed args do not crash");
+    check(!res.error.empty(), "case9 give_up has an error");
+    check(res.diagnosis.root_cause.empty(), "case9 invalid args never write diagnosis");
+  }
+
+  // ---------- 用例 10：轮次耗尽必须 GiveUp + 非空 error（不能静默停在中间态） ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm.push(text("我先观察一下"));
+    llm.push(text("再看看"));
+    agent::Budget b;
+    b.max_turns = 1;
+    agent::Runner runner(llm, reg, make_cfg(tool::ApprovalMode::Auto));
+    const auto res = runner.run("x", b, nullptr);
+    check(res.turns == 1, "case10 respects max_turns");
+    check(res.final_stage == agent::Stage::GiveUp, "case10 turn exhaustion -> give_up");
+    check(res.error == "turn budget exhausted", "case10 turn exhaustion names the reason");
+    check(!res.ok(), "case10 exhausted run is not ok");
+  }
+
+  // ---------- 用例 11：verify 阶段不调工具不能直接 done（不再绕过守卫） ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm.push(call("j1", "query_metrics", json::object()));
+    llm.push(call("j2", "stage_complete", json{{"next", "diagnose"}}));
+    llm.push(call("j3", "stage_complete", json{{"next", "repair"},
+                                               {"root_cause", "network_loss"},
+                                               {"evidence", {"injected=59"}},
+                                               {"confidence", 0.8}}));
+    llm.push(call("j4", "pipeline_set_param", json{{"key", "gop"}, {"value", "30"}}));
+    llm.push(call("j5", "stage_complete", json{{"next", "verify"}}));
+    llm.push(text("我觉得已经好了，不用再查了"));
+    llm.push(text("真的好了"));
+
+    agent::Budget b;
+    b.max_turns = 7;
+    agent::Runner runner(llm, reg, make_cfg(tool::ApprovalMode::Auto));
+    int no_tool_turns = 0;
+    const auto res = runner.run("x", b, [&](const agent::Event& e) {
+      if (e.type == "turn.no_tool_call") ++no_tool_turns;
+    });
+    check(no_tool_turns == 2, "case11 no-tool-call turns are reported");
+    check(res.final_stage != agent::Stage::Done, "case11 cannot reach done without tools");
+    check(!res.ok(), "case11 claims nothing");
+  }
+
+  // ---------- 用例 12：迁移图跳步被拒（collect → verify） ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm.push(call("k1", "query_metrics", json::object()));
+    llm.push(call("k2", "pipeline_set_param", json{{"key", "gop"}, {"value", "30"}}));
+    llm.push(call("k3", "stage_complete", json{{"next", "verify"}}));  // 跳过 diagnose/repair
+    agent::Budget b;
+    b.max_turns = 3;
+    agent::Runner runner(llm, reg, make_cfg(tool::ApprovalMode::Auto));
+    bool bad_transition = false;
+    const auto res = runner.run("x", b, [&](const agent::Event& e) {
+      if (e.type == "stage.enter" && e.data.value("stage", "") == "verify") bad_transition = true;
+    });
+    check(!bad_transition, "case12 collect -> verify rejected");
+    check(res.final_stage == agent::Stage::GiveUp, "case12 stays out of verify");
+  }
+
+  // ---------- 用例 13：verify → done 走 harness 重测（不达标就拒绝） ----------
+  {
+    auto script_to_done = [](llm::ScriptedClient& s) {
+      s.push(call("m1", "query_metrics", json::object()));
+      s.push(call("m2", "stage_complete", json{{"next", "diagnose"}}));
+      s.push(call("m3", "stage_complete", json{{"next", "repair"},
+                                              {"root_cause", "network_loss"},
+                                              {"evidence", {"injected=59"}},
+                                              {"confidence", 0.8}}));
+      s.push(call("m4", "pipeline_set_param", json{{"key", "gop"}, {"value", "30"}}));
+      s.push(call("m5", "stage_complete", json{{"next", "verify"}}));
+      s.push(call("m6", "stage_complete", json{{"next", "done"}}));
+    };
+
+    {
+      MockTools mocks;
+      tool::Registry reg;
+      mocks.build(reg);
+      llm::ScriptedClient llm;
+      script_to_done(llm);
+      int measured = 0;
+      auto cfg = make_cfg(tool::ApprovalMode::Auto);
+      cfg.verify_sla = [&](const agent::Diagnosis&) {
+        ++measured;
+        return false;  // harness 实测未达标
+      };
+      agent::Runner runner(llm, reg, cfg);
+      std::string reason;
+      const auto res = runner.run("x", agent::Budget{}, [&](const agent::Event& e) {
+        if (e.type == "guard.reject") reason = e.data.value("reason", "");
+      });
+      check(measured == 1, "case13 verify_sla called before done");
+      check(res.final_stage != agent::Stage::Done, "case13 failed measurement blocks done");
+      check(reason.find("实测未达标") != std::string::npos, "case13 rejection says measured failure");
+    }
+    {
+      MockTools mocks;
+      tool::Registry reg;
+      mocks.build(reg);
+      llm::ScriptedClient llm;
+      script_to_done(llm);
+      auto cfg = make_cfg(tool::ApprovalMode::Auto);
+      cfg.verify_sla = [](const agent::Diagnosis&) { return true; };
+      agent::Runner runner(llm, reg, cfg);
+      std::string verify_kind;
+      const auto res = runner.run("x", agent::Budget{}, [&](const agent::Event& e) {
+        if (e.type == "stage.enter" && e.data.value("stage", "") == "done") {
+          verify_kind = e.data.value("verify", "");
+        }
+      });
+      check(res.final_stage == agent::Stage::Done, "case13 measured ok reaches done");
+      check(verify_kind == "measured", "case13 done event marks verify=measured");
+    }
+  }
+
+  // ---------- 用例 14：参数校验收紧 + 审批策略下沉（call_guarded） ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    const auto r1 = reg.call("pipeline_set_param", json{{"key", "gop"}, {"value", "30"}, {"bogus", 1}});
+    check(!r1.has_value() && r1.error().find("unknown param") != std::string::npos,
+          "case14 unknown param rejected");
+    check(reg.call("query_metrics", json{{"window_ms", 5000.0}}).has_value(),
+          "case14 integer accepts 5000.0");
+    check(!reg.call("query_metrics", json{{"window_ms", 1.5}}).has_value(),
+          "case14 non-integral rejected");
+
+    tool::CallContext deny;
+    deny.mode = tool::ApprovalMode::Deny;
+    check(reg.call_guarded("pipeline_set_param", json{{"key", "gop"}, {"value", "30"}}, deny).status ==
+              tool::GuardedCall::Status::ApprovalDenied,
+          "case14 deny blocks mutating");
+    check(reg.call_guarded("no_such_tool", json::object(), deny).status ==
+              tool::GuardedCall::Status::ApprovalDenied,
+          "case14 unknown tool denied");
+    check(reg.call_guarded("query_metrics", json::object(), deny).status ==
+              tool::GuardedCall::Status::Executed,
+          "case14 deny still allows read-only");
+  }
+
+  // ---------- 用例 15：finish_reason=length 的截断轮不执行、只回灌 ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm::ChatResponse cut;
+    cut.truncated = true;
+    cut.finish_reason = "length";
+    cut.content = "我先查一下";
+    llm::ToolCall half;
+    half.id = "t1";
+    half.name = "query_metrics";
+    half.arguments = "{\"window_ms\":";  // 半截 JSON
+    cut.tool_calls.push_back(half);
+    cut.usage = {100, 20};
+    llm.push(cut);
+    llm.push(call("t2", "query_metrics", json::object()));
+
+    agent::Runner runner(llm, reg, make_cfg(tool::ApprovalMode::Auto));
+    int truncations = 0;
+    runner.run("x", agent::Budget{}, [&](const agent::Event& e) {
+      if (e.type == "llm.truncated") ++truncations;
+    });
+    check(truncations == 1, "case15 truncated turn reported");
+    check(mocks.metrics_calls == 1, "case15 truncated tool call not executed");
+  }
+
   if (failures == 0) {
-    std::printf("test_agent: OK (7 cases)\n");
+    std::printf("test_agent: OK (15 cases)\n");
     return 0;
   }
   std::printf("test_agent: %d failure(s)\n", failures);
