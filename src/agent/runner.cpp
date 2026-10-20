@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstdio>
+#include <expected>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,20 +37,80 @@ bool valid_root_cause(const std::string& s) {
   return false;
 }
 
+// 迁移图白名单（SPEC §7.5）：collect→diagnose→repair→verify→done，
+// verify 未达标可回 repair；任意阶段可显式 give_up。其余一律拒绝。
+// 只做单步守卫会让 collect→verify→done 这种跳步轨迹通过（审查实测）。
+bool allowed_transition(Stage from, Stage to) {
+  if (to == Stage::GiveUp) return true;
+  switch (from) {
+    case Stage::Collect: return to == Stage::Diagnose;
+    case Stage::Diagnose: return to == Stage::Repair;
+    case Stage::Repair: return to == Stage::Verify;
+    case Stage::Verify: return to == Stage::Done || to == Stage::Repair;
+    case Stage::Done:
+    case Stage::GiveUp: return false;
+  }
+  return false;
+}
+
+// 严格解析 next：所有输入来自模型（未受信），类型不符只能当拒绝，不能抛异常。
+std::expected<Stage, std::string> parse_next(const json& args) {
+  if (!args.is_object()) return std::unexpected("stage_complete 的参数必须是 JSON object");
+  if (!args.contains("next") || !args["next"].is_string()) {
+    return std::unexpected("缺少 next 或 next 不是字符串");
+  }
+  const std::string next = args["next"].get<std::string>();
+  if (next == "diagnose") return Stage::Diagnose;
+  if (next == "repair") return Stage::Repair;
+  if (next == "verify") return Stage::Verify;
+  if (next == "done") return Stage::Done;
+  if (next == "give_up") return Stage::GiveUp;
+  return std::unexpected("next 取值非法: " + next);
+}
+
+// 解析 diagnose→repair 的诊断三件套：类型不符/枚举非法/证据为空都只当拒绝。
+std::expected<Diagnosis, std::string> parse_diagnosis(const json& args) {
+  if (!args.contains("root_cause") || !args["root_cause"].is_string()) {
+    return std::unexpected("root_cause 缺失或不是字符串");
+  }
+  const std::string rc = args["root_cause"].get<std::string>();
+  if (!valid_root_cause(rc)) return std::unexpected("root_cause 不是合法枚举值");
+
+  if (!args.contains("evidence") || !args["evidence"].is_array()) {
+    return std::unexpected("evidence 必须是字符串数组");
+  }
+  std::vector<std::string> ev;
+  for (const auto& e : args["evidence"]) {
+    if (!e.is_string()) return std::unexpected("evidence 必须是字符串数组");
+    ev.push_back(e.get<std::string>());
+  }
+  if (ev.empty()) return std::unexpected("evidence 为空，修复前必须给出证据");
+
+  Diagnosis d;
+  d.root_cause = rc;
+  d.evidence = std::move(ev);
+  if (args.contains("confidence")) {
+    if (!args["confidence"].is_number()) return std::unexpected("confidence 必须是数字");
+    d.confidence = args["confidence"].get<double>();
+  }
+  return d;
+}
+
 std::string stage_hint(Stage s) {
   switch (s) {
     case Stage::Collect:
-      return "当前阶段 collect：先用 query_metrics / fetch_observation 了解现状（至少一次），"
+      return "当前阶段 collect：先用 query_metrics / fetch_observation 了解现状（至少一次成功），"
              "然后调用 stage_complete，参数 {\"next\":\"diagnose\"}。";
     case Stage::Diagnose:
       return "当前阶段 diagnose：根据观测给出根因（枚举值）与证据（引用真实观测片段）。"
-             "完成后调用 stage_complete，参数 {\"next\":\"repair\",\"root_cause\":\"...\",\"evidence\":[\"...\"],\"confidence\":0.8}。";
+             "完成后调用 stage_complete，参数 {\"next\":\"repair\",\"root_cause\":\"...\","
+             "\"evidence\":[\"...\"],\"confidence\":0.8}。";
     case Stage::Repair:
       return "当前阶段 repair：执行 mutating 工具调整参数（至少一次成功后），"
              "然后调用 stage_complete，参数 {\"next\":\"verify\"}。";
     case Stage::Verify:
       return "当前阶段 verify：查一次指标并与目标对比。若已满足目标（例如 p99 正常、dropped 为 0），"
-             "**立即**调用 stage_complete 参数 {\"next\":\"done\"}，不要继续查询；"
+             "调用 stage_complete 参数 {\"next\":\"done\"}（harness 会重新实测，不达标会被拒绝）；"
              "若仍未满足，调用 stage_complete {\"next\":\"repair\"}。";
     default:
       return "";
@@ -117,7 +178,13 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   bool used_observe = false;
   bool used_mutating = false;
   bool verified_ok = false;
-  int guard_rejects = 0;
+  // verify→done 时 harness 是否真的重测过（事件里要能区分"实测"与"自称"）
+  std::string verify_kind = "model_claimed";
+  // SPEC §7.5 是"连续 2 次守卫拒绝"，成功迁移即清零
+  int consecutive_rejects = 0;
+  // 退出原因：预算耗尽/异常都必须体现为 GiveUp + 非空 error（否则评测会把
+  // "没跑完"当成"答错"计入成功率分母，审查实测过这个污染路径）。
+  std::string stop_reason;
   const int64_t t_start = now_us();
 
   auto emit = [&](const char* type, json data) {
@@ -131,7 +198,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
 
   while (r.turns < budget.max_turns) {
     if (now_us() - t_start > int64_t(budget.max_wall_s) * 1'000'000LL) {
-      r.error = "wall clock budget exhausted";
+      stop_reason = "wall clock budget exhausted";
       break;
     }
 
@@ -140,6 +207,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     req.messages = msgs;
     req.tools = tools_.schema();
     req.tools.push_back(stage_complete_schema());
+    req.max_tokens = cfg_.max_tokens;
     // 阶段提示作为最后一条 user 消息里追加（不污染历史）
     req.messages.push_back(msg("user", stage_hint(stage)));
     // 上下文预算：超限丢最旧观测，保留 system 与最近若干条
@@ -154,7 +222,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
 
     auto resp = llm_.chat(req);
     if (!resp) {
-      r.error = resp.error();
+      stop_reason = resp.error();
       break;
     }
     ++r.turns;
@@ -163,18 +231,16 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
          {{"turn", r.turns}, {"content", resp->content}, {"tool_calls", resp->tool_calls.size()}});
 
     if (r.cost_yuan > budget.max_yuan) {
-      r.error = "cost budget exhausted";
+      stop_reason = "cost budget exhausted";
       break;
     }
 
     if (resp->tool_calls.empty()) {
-      // 无工具调用：视为模型想直接结束
-      if (stage == Stage::Verify) {
-        stage = Stage::Done;
-        break;
-      }
-      msgs.push_back(msg("assistant", resp->content));
-      msgs.push_back(msg("user", "请继续当前阶段：" + stage_hint(stage)));
+      // 无工具调用不能推进状态（审查实测：verify 阶段模型说句"好了"就直接 done）。
+      // 只算一轮无效轮次并把要求回灌，由模型自己决定下一步。
+      if (!resp->content.empty()) msgs.push_back(msg("assistant", resp->content));
+      msgs.push_back(msg("user", "本轮没有调用任何工具，状态不会推进。请调用工具；" + stage_hint(stage)));
+      emit("turn.no_tool_call", {{"turn", r.turns}, {"stage", stage_name(stage)}});
       continue;
     }
 
@@ -185,58 +251,93 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       msgs.push_back(std::move(m));
     }
 
-    for (const auto& tc : resp->tool_calls) {
+    std::size_t i = 0;
+    for (; i < resp->tool_calls.size(); ++i) {
+      const auto& tc = resp->tool_calls[i];
       // ---- 控制工具：阶段推进 ----
       if (tc.name == "stage_complete") {
         json args = json::parse(tc.arguments, nullptr, false);
         if (args.is_discarded()) args = json::object();
-        const std::string next = args.value("next", "");
         std::string reject;
 
-        if (next == "diagnose") {
-          if (!used_observe) reject = "尚未采集任何观测，不能进入 diagnose";
-          else stage = Stage::Diagnose;
-        } else if (next == "repair") {
-          const std::string rc = args.value("root_cause", "");
-          const auto ev = args.value("evidence", std::vector<std::string>{});
-          if (!valid_root_cause(rc)) reject = "root_cause 不是合法枚举值";
-          else if (ev.empty()) reject = "evidence 为空，修复前必须给出证据";
-          else {
-            r.diagnosis.root_cause = rc;
-            r.diagnosis.evidence = ev;
-            r.diagnosis.confidence = args.value("confidence", 0.0);
-            stage = Stage::Repair;
+        const auto target = parse_next(args);
+        if (!target) {
+          reject = target.error();
+        } else if (!allowed_transition(stage, *target)) {
+          reject = std::string("非法阶段迁移 ") + stage_name(stage) + " → " + stage_name(*target) +
+                   "（只允许 collect→diagnose→repair→verify→done，verify 可回 repair）";
+        }
+
+        // 各目标阶段自己的守卫
+        if (reject.empty()) {
+          switch (*target) {
+            case Stage::Diagnose:
+              if (!used_observe) reject = "尚未采集到任何成功的观测，不能进入 diagnose";
+              break;
+            case Stage::Repair: {
+              // verify→repair 不带诊断；只有 diagnose→repair 才写入诊断
+              if (stage == Stage::Diagnose) {
+                const auto d = parse_diagnosis(args);
+                if (!d) {
+                  reject = d.error();
+                } else {
+                  r.diagnosis = *d;  // 只写一次：后续 verify→repair 不会覆盖已确认的诊断
+                }
+              }
+              break;
+            }
+            case Stage::Verify:
+              if (!used_mutating) reject = "尚未成功执行任何非只读工具，不能进入 verify";
+              break;
+            case Stage::Done:
+              // SPEC §7.5：harness 重新测量并满足 SLA，不信模型自称
+              if (cfg_.verify_sla) {
+                verify_kind = "measured";
+                const bool ok = cfg_.verify_sla(r.diagnosis);
+                emit("verify.measured", {{"pass", ok}});
+                if (ok) {
+                  verified_ok = true;
+                } else {
+                  reject = "harness 实测未达标（SLA 未满足），不能进入 done：请继续 verify→repair 修复";
+                }
+              } else {
+                // 未配置重测回调：保留旧行为，但事件里明确标注"自称"
+                verified_ok = true;
+              }
+              break;
+            case Stage::GiveUp:
+            case Stage::Collect:
+              break;
           }
-        } else if (next == "verify") {
-          if (!used_mutating) reject = "尚未执行任何 mutating 工具，不能进入 verify";
-          else stage = Stage::Verify;
-        } else if (next == "done") {
-          if (stage != Stage::Verify) reject = "只有 verify 阶段可以进入 done";
-          else {
-            verified_ok = true;
-            stage = Stage::Done;
-          }
-        } else if (next == "give_up") {
-          stage = Stage::GiveUp;
-        } else {
-          reject = "next 取值非法";
         }
 
         if (!reject.empty()) {
-          ++guard_rejects;
-          emit("guard.reject", {{"next", next}, {"reason", reject}});
+          ++consecutive_rejects;
+          const json next_j = args.contains("next") ? args["next"] : json(nullptr);
+          emit("guard.reject", {{"next", next_j}, {"reason", reject}});
           msgs.push_back(tool_msg("拒绝：" + reject, tc.id, "stage_complete"));
-          if (guard_rejects >= 3) {
-            r.error = "too many guard rejects";
+          if (consecutive_rejects >= 2) {  // SPEC §7.5：连续 2 次守卫拒绝 → give_up
+            stop_reason = "consecutive guard rejects";
             stage = Stage::GiveUp;
+            emit("stage.enter", {{"stage", stage_name(stage)}, {"reason", stop_reason}});
+            ++i;
             break;
           }
           continue;
         }
 
-        emit("stage.enter", {{"stage", stage_name(stage)}});
+        stage = *target;
+        consecutive_rejects = 0;
+        {
+          json data{{"stage", stage_name(stage)}};
+          if (stage == Stage::Done) data["verify"] = verify_kind;
+          emit("stage.enter", data);
+        }
         msgs.push_back(tool_msg("ok, now in stage " + std::string(stage_name(stage)), tc.id, "stage_complete"));
-        if (stage == Stage::Done || stage == Stage::GiveUp) break;
+        if (stage == Stage::Done || stage == Stage::GiveUp) {
+          ++i;
+          break;
+        }
         continue;
       }
 
@@ -284,7 +385,8 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       }
 
       emit("tool.result", {{"tool", tc.name}, {"ok", res->ok}, {"data", res->data}});
-      if (tc.name == "query_metrics" || tc.name == "fetch_observation") used_observe = true;
+      // 失败的观测不算观测（cued 未收到流时 query_metrics 返回 ok=false）
+      if (tools_.is_observation_tool(tc.name) && res->ok) used_observe = true;
       // 「修复动作」= 任何非只读工具成功：dangerous（如 inject_fault）同样是改状态，
       // 只算 Mutating 会让「靠取消注入完成修复」的合理轨迹被守卫永远卡在 repair。
       if (risk != tool::Risk::ReadOnly && res->ok) used_mutating = true;
@@ -292,12 +394,38 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       msgs.push_back(tool_msg(res->content, tc.id, tc.name));
     }
 
-    if (stage == Stage::Done || stage == Stage::GiveUp) break;
+    // 状态已终结时，同批剩余 tool_call 不再执行，但每条都必须回填 tool 消息，
+    // 否则 assistant(tool_calls) 后面缺 tool 结果，事件流/历史都是坏的配对。
+    if (stage == Stage::Done || stage == Stage::GiveUp) {
+      for (; i < resp->tool_calls.size(); ++i) {
+        msgs.push_back(
+            tool_msg("未执行：本阶段已结束", resp->tool_calls[i].id, resp->tool_calls[i].name));
+      }
+      break;
+    }
+  }
+
+  if (r.turns >= budget.max_turns && stop_reason.empty() && stage != Stage::Done &&
+      stage != Stage::GiveUp) {
+    stop_reason = "turn budget exhausted";
   }
 
   r.final_stage = stage;
-  if (stage == Stage::Done && !verified_ok) r.error = "done without verify";
-  emit("run.end", {{"stage", stage_name(stage)}, {"turns", r.turns}, {"cost_yuan", r.cost_yuan}});
+  if (r.final_stage != Stage::Done && r.final_stage != Stage::GiveUp) {
+    // 没跑完必须显式失败：静默停在中间态会让评测把预算耗尽当成"答错"
+    r.final_stage = Stage::GiveUp;
+    if (stop_reason.empty()) stop_reason = "run ended without reaching done";
+  }
+  // done 必须真的过守卫（无 verify 的 done 是自相矛盾的成功）
+  if (r.final_stage == Stage::Done && !verified_ok) {
+    r.final_stage = Stage::GiveUp;
+    stop_reason = "done without verify";
+  }
+  r.error = stop_reason;
+  emit("run.end", {{"stage", stage_name(r.final_stage)},
+                   {"turns", r.turns},
+                   {"cost_yuan", r.cost_yuan},
+                   {"error", r.error}});
   return r;
 }
 

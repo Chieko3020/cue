@@ -179,12 +179,18 @@ int main() {
 
     agent::Runner runner(llm, reg, make_cfg(tool::ApprovalMode::Auto));
     int rejects = 0;
+    bool entered_diagnose = false;
     const auto res = runner.run("x", agent::Budget{},
                                 [&](const agent::Event& e) {
                                   if (e.type == "guard.reject") ++rejects;
+                                  if (e.type == "stage.enter" && e.data.value("stage", "") == "diagnose") {
+                                    entered_diagnose = true;
+                                  }
                                 });
     check(rejects == 1, "case2 guard rejected once before observe");
-    check(res.final_stage == agent::Stage::Diagnose, "case2 advanced after observe");
+    check(entered_diagnose, "case2 advanced to diagnose after observe");
+    // 脚本耗尽后必须显式失败（不能静默停在中间态）
+    check(!res.error.empty() && res.final_stage == agent::Stage::GiveUp, "case2 exhausted -> give_up");
   }
 
   // ---------- 用例 3：危险工具在 Auto 下未授权被拒 ----------
