@@ -40,12 +40,16 @@ add_library(cue_core STATIC
   src/llm/client.cpp
   src/tool/registry.cpp
   src/agent/runner.cpp
-  src/pipeline/process_control.cpp)
+  src/pipeline/process_control.cpp
+  src/eval/eval.cpp)
 target_link_libraries(cue_core PUBLIC cue_proto PkgConfig::CURL)
 target_include_directories(cue_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_executable(cue apps/cue.cpp)
 target_link_libraries(cue PRIVATE cue_core)
+
+add_executable(cue-eval apps/cue-eval.cpp)
+target_link_libraries(cue-eval PRIVATE cue_core)
 
 # ---- 测试 ----
 enable_testing()
@@ -60,3 +64,8 @@ add_test(NAME agent COMMAND test_agent)
 add_executable(test_context tests/test_context.cpp)
 target_link_libraries(test_context PRIVATE cue_core)
 add_test(NAME context COMMAND test_context)
+
+add_executable(test_eval tests/test_eval.cpp)
+target_link_libraries(test_eval PRIVATE cue_core)
+add_test(NAME eval COMMAND test_eval)
+set_tests_properties(eval PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
