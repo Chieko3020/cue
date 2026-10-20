@@ -220,6 +220,10 @@ async function connectWs() {
     sock.onerror = () => fail(new Error('WS 连接失败'));
   });
   ws = sock;
+  // 重连后必须重新来一个 IDR：onclose 里置的 needKeyframe 会被断线期间那 400ms
+  // 的帧消耗掉，而那时 ws 还是 null，IDR 直接丢进 droppedNoWs；等连上再置一次，
+  // 才能保证新 cued 的解码器拿到的第一帧带 SPS/PPS。
+  needKeyframe = true;
   ws.onclose = () => {
     if (ws !== sock) return;  // 旧连接的迟到事件不能把新连接打掉
     if (manualStop) return;
