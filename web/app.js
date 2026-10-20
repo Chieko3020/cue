@@ -151,8 +151,10 @@ async function start() {
     stop();
     return;
   }
+  // 码率随像素率自适应：854x480@30 ≈ 1.2 Mbps，1080p60 ≈ 12 Mbps（M1 透传模式，带宽是主要约束）
+  const bitrate = Math.min(12_000_000, Math.max(800_000, Math.round(w * h * fps * 0.1)));
   const support = await VideoEncoder.isConfigSupported({
-    codec, width: w, height: h, bitrate: 1500000, framerate: fps, latencyMode: 'realtime',
+    codec, width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime',
   });
   if (!support.supported) {
     log(`codec ${codec} 不被支持`, 'bad');
@@ -164,10 +166,12 @@ async function start() {
     output: (chunk) => sendChunk(chunk),
     error: (e) => { encodeErrors++; log(`编码错误: ${e.message}`, 'bad'); },
   });
+  // annexb：让服务端 libavcodec 直接吃（默认的 AVCC 需要额外做 h264_mp4toannexb）
   encoder.configure({
-    codec, width: w, height: h, bitrate: 1500000, framerate: fps, latencyMode: 'realtime',
+    codec, width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime',
+    avc: { format: 'annexb' },
   });
-  log(`编码器就绪: ${codec} ${w}x${h}@${fps}`, 'k');
+  log(`编码器就绪: ${codec} ${w}x${h}@${fps} ${(bitrate / 1e6).toFixed(1)} Mbps`, 'k');
 
   let i = 0;
   const periodMs = 1000 / fps;
