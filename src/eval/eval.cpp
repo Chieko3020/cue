@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -20,6 +21,7 @@
 #include "cue/common/clock.h"
 #include "cue/common/sha256.h"
 #include "cue/eval/state.h"
+#include "cue/llm/cassette.h"
 #include "cue/llm/client.h"
 #include "cue/pipeline/tools.h"
 
@@ -638,14 +640,45 @@ std::expected<std::vector<Case>, std::string> load_suite(const std::string& path
 
 // ---------------------------------------------------------------- Engine
 
+namespace {
+
+// cassette 目录内容指纹（SPEC §7.7）：文件名 + 文件内容都进哈希。
+// 只取 *.jsonl，避免临时文件/README 让缓存无谓失效。
+std::string cassette_dir_hash(const std::string& dir) {
+  std::vector<std::string> files;
+  std::error_code ec;
+  if (!dir.empty()) {
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+      if (!it->is_regular_file(ec)) continue;
+      if (it->path().extension() != ".jsonl") continue;
+      files.push_back(it->path().string());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  std::string acc;
+  for (const auto& f : files) acc += f + "\n" + cue::sha256_file(f) + "\n";
+  return cue::sha256_hex(acc);
+}
+
+}  // namespace
+
 std::string Engine::config_hash() const {
   std::string cued_hash;
   if (!cfg_.cued_bin.empty()) cued_hash = cue::sha256_file(cfg_.cued_bin);
   // max_yuan（成本闸门）不进指纹：它只是"跑多少"的护栏，不是被测配置。
   // 进指纹会让"闸门触发后续跑"因为换了闸门值而全量作废，与断点续跑语义冲突。
+  //
+  // cassette（SPEC §7.7）：replay 的结果取决于 cassette 内容，内容变了缓存必须失效。
+  // live/record 不把 cassette 哈希放进指纹——录制会改变目录内容，不该让本次 run 漂移。
+  std::string llm_hash;
+  if (cfg_.agent_mode == "real") {
+    llm_hash = "|llm=" + cfg_.llm_mode;
+    if (cfg_.llm_mode == "replay") llm_hash += "|cassette=" + cassette_dir_hash(cfg_.cassette_dir);
+  }
   return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
                          "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
-                         fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s));
+                         fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s) +
+                         llm_hash);
 }
 
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
@@ -665,6 +698,9 @@ PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
 std::string classify_run_error(const agent::RunResult& res) {
   if (res.error.empty()) return {};  // 显式 give_up 仍计分（算失败，不算 run_error）
   const std::string& e = res.error;
+  // replay 缺 cassette 是环境/素材问题，不是模型答错：必须先于「零轮次」判定，
+  // 否则会被归成 llm_unavailable，报告读不出「该补录制」这一动作。
+  if (e.find("cassette miss") != std::string::npos) return "cassette_miss";
   if (res.turns == 0) return "llm_unavailable";
   if (e.find("wall clock") != std::string::npos) return "agent_timeout";
   if (e.find("cost budget") != std::string::npos) return "agent_cost_budget";
@@ -843,7 +879,9 @@ CaseOutcome Engine::run_real_case(const Case& c) const {
 
 void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   const char* key = std::getenv("CUE_API_KEY");
-  if (!key || !*key) {
+  // replay 不需要 key（这正是评测零成本的原因）；只有 live 才要求凭证。
+  const bool live = cfg_.llm_mode == "live";
+  if (live && (!key || !*key)) {
     o.error_kind = "missing_api_key";
     return;
   }
@@ -907,8 +945,26 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   tool::Registry reg;
   pipeline::build_real_tools(reg, pipe, &trace);
 
-  // 4) 真实 LLM + agent 循环
-  llm::OpenAiCompatibleClient client({base_url, key, cfg_.model, 60});
+  // 4) LLM 客户端：replay 读 cassette（默认，零成本、可回归），live 才走网络。
+  //    live + record 时把每次成功调用追加进 cassette（SPEC §7.9）。
+  std::unique_ptr<llm::ILlmClient> client;
+  llm::CassetteClient* cassette = nullptr;
+  if (live) {
+    llm::OpenAiCompatibleClient::Config cc;
+    cc.base_url = base_url;
+    cc.api_key = key ? key : "";
+    cc.model = cfg_.model;
+    cc.timeout_s = 60;
+    if (cfg_.record) cc.record_dir = cfg_.cassette_dir;
+    client = std::make_unique<llm::OpenAiCompatibleClient>(std::move(cc));
+  } else {
+    llm::CassetteClient::Config cc;
+    cc.dir = cfg_.cassette_dir;
+    cc.default_model = cfg_.model;
+    auto replay = std::make_unique<llm::CassetteClient>(std::move(cc));
+    cassette = replay.get();
+    client = std::move(replay);
+  }
   agent::Runner::Config ac;
   ac.model = cfg_.model;
   ac.system_prompt = pipeline::real_ops_system_prompt();
@@ -925,7 +981,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     return true;
   };
 
-  agent::Runner runner(client, reg, ac);
+  agent::Runner runner(*client, reg, ac);
   agent::Budget budget;
   budget.max_turns = c.max_turns;
   budget.max_yuan = c.max_yuan;
@@ -936,6 +992,11 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     if (e.type == "llm.response" || e.type == "run.start") return;
     std::fprintf(stderr, "%s%s %s\n", tag.c_str(), e.type.c_str(), e.data.dump().c_str());
   });
+  if (cassette) {
+    const auto st = cassette->stats();
+    o.cassette_hits = st.hits;
+    o.cassette_misses = st.misses;
+  }
   const int64_t t_agent_end_us = now_us();
 
   std::vector<Observation> obs;
@@ -1090,6 +1151,7 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
                 {"run_id", r.run_id},
                 {"suite", cfg_.suite_path},
                 {"mode", cfg_.agent_mode},
+                {"llm", cfg_.llm_mode},
                 {"repeat", cfg_.repeat},
                 {"fingerprint", r.fingerprint},
                 {"created_us", now_us()}};
@@ -1148,6 +1210,8 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
       ++r.executed;
 
       r.cost_yuan += o.cost_yuan;
+      r.cassette_hits += o.cassette_hits;
+      r.cassette_misses += o.cassette_misses;
       ++attempt_count[c.id];
       if (o.scored && o.score.all()) ++pass_count[c.id];
       r.cases.push_back(std::move(o));
@@ -1256,6 +1320,15 @@ std::string Engine::render_markdown(const RunReport& r) const {
   o << "- 指纹: `" << r.fingerprint << "`（二进制 ⊕ git describe ⊕ 生效配置 ⊕ suite，SPEC §7.7）\n";
   o << "- 生效配置: cued=`" << cfg_.cued_bin << "`，model=`" << cfg_.model
     << "`，成本闸门 ¥" << cfg_.max_yuan << "，单价 ¥" << cfg_.yuan_per_mtok << "/Mtok（估算，非账单）\n";
+  if (cfg_.agent_mode == "real") {
+    o << "- LLM: `" << cfg_.llm_mode << "`，cassette=`" << cfg_.cassette_dir << "`";
+    if (cfg_.llm_mode == "replay") {
+      o << "，命中 " << r.cassette_hits << " 次，miss " << r.cassette_misses << " 次";
+    } else if (cfg_.record) {
+      o << "（录制到该目录）";
+    }
+    o << "\n";
+  }
   o << "- 用例: 计划 " << r.planned << "，执行 " << r.executed << "，计分 " << r.scored
     << "，运行失败 " << r.run_errors << "\n";
   o << "- 成本: ¥" << r.cost_yuan << "\n\n";
@@ -1263,6 +1336,10 @@ std::string Engine::render_markdown(const RunReport& r) const {
   if (cfg_.agent_mode == "scripted") {
     o << "> **scripted 模式 = 引擎自检，不判模型**：结论与观测由 case 的 expect 构造，"
          "100% 通过只证明「判分器 + 引擎」链路通。要评模型能力请用 `--mode real`。\n\n";
+  }
+  if (cfg_.agent_mode == "real" && cfg_.llm_mode == "replay") {
+    o << "> **replay 模式**：LLM 响应来自 cassette（usage 照抄录制值），零网络、零成本；"
+         "缺录制时记 `run_error=cassette_miss`，不进成功率分母。要跑真实模型用 `--live`。\n\n";
   }
 
   o << "## 分层成功率\n\n";

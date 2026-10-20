@@ -148,6 +148,9 @@ struct CaseOutcome {
   double mttr_s = kNoValue;
   // agent 实际看到的观测（落进 state.jsonl，出争议时可离线复核证据是否成立）
   std::vector<Observation> observations;
+  // replay 模式的 cassette 命中/未命中次数（miss 会变成 run_error=cassette_miss）
+  std::size_t cassette_hits = 0;
+  std::size_t cassette_misses = 0;
 };
 
 struct RunConfig {
@@ -162,6 +165,11 @@ struct RunConfig {
   std::string cued_bin = "./build/cued";
   std::string model = "deepseek-chat";  // real 模式模型名
   double yuan_per_mtok = 2.0;           // 成本核算单价（估算，不是账单）
+  // LLM 传输（SPEC §7.9）：replay = 只读 cassette（默认，零成本）；live = 真实网络。
+  // real 模式下 replay 缺 cassette 直接报错，绝不静默走网络。
+  std::string llm_mode = "replay";
+  std::string cassette_dir = "cassettes";
+  bool record = false;  // live 时把每次成功调用追加进 cassette_dir
   // SIGINT/SIGTERM：非空时每个 case 边界与等待循环检查，置位后尽快停管线退出
   const std::atomic<bool>* cancel = nullptr;
 };
@@ -187,6 +195,9 @@ struct RunReport {
   int repeat = 1;
   // pass^k：对每个 case，k 次里全部成功的比例；整体取均值
   double pass_k = 0;
+  // replay 模式 cassette 命中/未命中合计（miss 计入 run_error，不进成功率分母）
+  std::size_t cassette_hits = 0;
+  std::size_t cassette_misses = 0;
   // 平均 MTTR（秒）：只统计「有 SLA 阈值且测到达标」的 case；取不到为 NaN
   double mttr_avg_s = kNoValue;
   std::vector<std::string> failure_modes;  // "root: 期望 X 实际 Y" 之类的聚合

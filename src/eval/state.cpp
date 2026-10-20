@@ -184,6 +184,8 @@ json outcome_to_json(const CaseOutcome& o) {
               {"final_samples", o.final_samples},
               {"metrics", metrics_to_json(o.metrics)},
               {"mttr_s", num_or_null(o.mttr_s)},
+              {"cassette_hits", o.cassette_hits},
+              {"cassette_misses", o.cassette_misses},
               {"observations", observations_to_json(o.observations)}};
 }
 
@@ -242,6 +244,8 @@ std::expected<CaseOutcome, std::string> outcome_from_json(const json& j) {
     };
     read_u64("final_dropped", o.final_dropped);
     read_u64("final_samples", o.final_samples);
+    read_u64("cassette_hits", o.cassette_hits);
+    read_u64("cassette_misses", o.cassette_misses);
     if (j.contains("metrics")) {
       std::string merr;
       o.metrics = metrics_from_json(j["metrics"], merr);

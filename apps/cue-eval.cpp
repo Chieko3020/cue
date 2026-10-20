@@ -40,11 +40,16 @@ int usage() {
       "\n"
       "  cue-eval --suite <path> [--mode scripted|real] [--repeat k] [--max-yuan N]\n"
       "           [--out dir] [--warmup s] [--model name] [--cued path]\n"
+      "           [--replay|--live] [--record] [--cassette-dir dir]\n"
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
       "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
       "\n"
       "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
-      "  real 模式需环境变量 CUE_API_KEY / CUE_BASE_URL，且需外部推流。\n"
+      "  real 模式的 LLM 传输默认 replay：只读 cassette，零成本；缺录制直接报错\n"
+      "  （run_error=cassette_miss，不静默走网络）。--live 才用真实网络（需 CUE_API_KEY /\n"
+      "  CUE_BASE_URL），配 --record 把每次成功调用录进 --cassette-dir（默认 cassettes/）。\n"
+      "  --replay / --live 隐含 --mode real，除非显式 --mode scripted。\n"
+      "  CUE_RECORD=1 / CUE_CASSETTE_DIR 可替代对应开关。\n"
       "  单价可用 CUE_YUAN_PER_MTOK 覆盖（估算，不是账单）。\n"
       "\n"
       "  退出码：0 全过 / 1 有未通过 / 2 用法或无法产出 / 3 diff 不可比 /\n"
@@ -133,6 +138,10 @@ int main(int argc, char** argv) {
   bool suite_set = false;
   bool mode_set = false;
   bool repeat_set = false;
+  bool replay_flag = false;
+  bool live_flag = false;
+  bool record_flag = false;
+  bool record_cli = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -143,6 +152,19 @@ int main(int argc, char** argv) {
     } else if (a == "--mode") {
       cfg.agent_mode = next();
       mode_set = true;
+    } else if (a == "--replay") {
+      replay_flag = true;
+    } else if (a == "--live") {
+      live_flag = true;
+    } else if (a == "--record") {
+      record_flag = true;
+      record_cli = true;
+    } else if (a == "--cassette-dir") {
+      cfg.cassette_dir = next();
+      if (cfg.cassette_dir.empty()) {
+        std::fprintf(stderr, "--cassette-dir 需要目录名\n");
+        return 2;
+      }
     } else if (a == "--repeat") {
       cfg.repeat = std::max(1, std::atoi(next().c_str()));
       repeat_set = true;
@@ -183,6 +205,44 @@ int main(int argc, char** argv) {
     if (v > 0) cfg.yuan_per_mtok = v;
   }
 
+  // ---- LLM 传输（SPEC §7.9）：real 默认 replay，--live 才联网 ----
+  if (replay_flag && live_flag) {
+    std::fprintf(stderr, "--replay 与 --live 互斥\n");
+    return 2;
+  }
+  if (replay_flag && record_cli) {
+    std::fprintf(stderr, "--replay 与 --record 不能同时使用（replay 只读 cassette）\n");
+    return 2;
+  }
+  if (const char* dir = std::getenv("CUE_CASSETTE_DIR"); dir && *dir) cfg.cassette_dir = dir;
+  if (const char* rec = std::getenv("CUE_RECORD"); rec && *rec && std::string(rec) != "0") {
+    record_flag = true;
+  }
+  cfg.llm_mode = live_flag ? "live" : "replay";
+  cfg.record = record_flag && !replay_flag;
+  if (replay_flag && record_flag) {
+    std::fprintf(stderr, "[eval] --replay 忽略 CUE_RECORD（回放不写 cassette）\n");
+  }
+  // 两个传输开关都隐含「跑 real agent」；显式 --mode scripted 时只有 replay 可降级为无操作。
+  if (!mode_set && (live_flag || replay_flag)) cfg.agent_mode = "real";
+  if (live_flag && cfg.agent_mode == "scripted") {
+    std::fprintf(stderr, "--live 只能配 --mode real（scripted 不调模型）\n");
+    return 2;
+  }
+  if (replay_flag && cfg.agent_mode == "scripted") {
+    std::fprintf(stderr, "[eval] --replay 对 scripted 模式无影响（ScriptedClient 本就不联网）\n");
+  }
+  if (cfg.record && cfg.llm_mode != "live") {
+    if (cfg.agent_mode == "real") {
+      std::fprintf(stderr, "录制需要 --live：replay 只读 cassette，不会产生新录制\n");
+      return 2;
+    }
+    // 环境变量 CUE_RECORD=1 可能是全局设置的：scripted 下静默降级并说明，不打乱自检
+    std::fprintf(stderr, "[eval] %s 模式下不录制（ScriptedClient 不录）；要录制请用 --live --record\n",
+                 cfg.agent_mode.c_str());
+    cfg.record = false;
+  }
+
   if (cfg.agent_mode != "scripted" && cfg.agent_mode != "real") {
     std::fprintf(stderr, "--mode 只能是 scripted 或 real（收到 %s）\n", cfg.agent_mode.c_str());
     return 2;
@@ -218,6 +278,15 @@ int main(int argc, char** argv) {
       return 2;
     }
     cfg.agent_mode = h_mode.empty() ? cfg.agent_mode : h_mode;
+    // 原 run 的 LLM 传输必须一致：replay 续进 live run 会混入联网调用（重新计费），
+    // live 续进 replay run 则会因为 cassette 不存在而整轮 miss。
+    const std::string h_llm = header_str(*hdr, "llm");
+    if (!h_llm.empty() && h_llm != cfg.llm_mode) {
+      std::fprintf(stderr,
+                   "续跑失败：原 run 的 LLM 模式为 %s，当前 %s（要联网请显式 --live，会计费）\n",
+                   h_llm.c_str(), cfg.llm_mode.c_str());
+      return 2;
+    }
     if (repeat_set && cfg.repeat != h_repeat) {
       std::fprintf(stderr, "续跑失败：--repeat=%d 与原 run 的 %d 不一致\n", cfg.repeat, h_repeat);
       return 2;
@@ -242,6 +311,10 @@ int main(int argc, char** argv) {
   }
   std::printf("[eval] suite=%s cases=%zu mode=%s repeat=%d\n", cfg.suite_path.c_str(), cases->size(),
               cfg.agent_mode.c_str(), cfg.repeat);
+  if (cfg.agent_mode == "real") {
+    std::printf("[eval] LLM=%s cassette=%s%s\n", cfg.llm_mode.c_str(), cfg.cassette_dir.c_str(),
+                cfg.record ? "（录制中）" : "");
+  }
 
   cfg.cancel = &g_cancel;
   eval::Engine engine(cfg);
