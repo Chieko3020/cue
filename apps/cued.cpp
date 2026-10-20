@@ -215,6 +215,7 @@ int main(int argc, char** argv) {
   double send_mbps = 10.0;
   double inject_drop = 0.0;
   uint64_t inject_seed = 42;
+  std::string inject_trace;
   bool fec_enabled = true;
 
   for (int i = 1; i < argc; ++i) {
@@ -235,6 +236,7 @@ int main(int argc, char** argv) {
     else if (a == "--send-mbps") send_mbps = std::stod(next());
     else if (a == "--inject-drop") inject_drop = std::stod(next());
     else if (a == "--inject-seed") inject_seed = std::stoull(next());
+    else if (a == "--inject-trace") inject_trace = next();
     else if (a == "--fec") fec_enabled = (next() == "on");
     else if (a == "--help") {
       std::printf("cued --ws-port 9000 --probe-host 127.0.0.1 --probe-port 9001\n");
@@ -277,6 +279,15 @@ int main(int argc, char** argv) {
   probe_addr.sin_port = htons(probe_port);
   ::inet_pton(AF_INET, probe_host.c_str(), &probe_addr.sin_addr);
   const Injector injector(inject_seed, inject_drop);
+  FILE* trace_fp = nullptr;
+  if (!inject_trace.empty()) {
+    trace_fp = std::fopen(inject_trace.c_str(), "w");
+    if (trace_fp) {
+      std::setvbuf(trace_fp, nullptr, _IONBF, 0);  // 进程被 kill 时也要保证 trace 已落盘
+    } else {
+      std::fprintf(stderr, "[cued] cannot open trace %s\n", inject_trace.c_str());
+    }
+  }
   RetransmitCache xmit_cache;
 
   std::atomic<bool> stop_nack{false};
@@ -452,8 +463,10 @@ int main(int argc, char** argv) {
           // （实测踩过：seed=42 时 seq 0..9 恰好全不丢，导致注入率恒为 0）
           std::size_t pk = 0;
           for (auto& d : datagrams) {
-            if (injector.drop(uint64_t(h->frame_id) * 64ULL + pk++)) {
+            const std::size_t cur_pk = pk++;
+            if (injector.drop(uint64_t(h->frame_id) * 64ULL + cur_pk)) {
               ++c.injected_drops;
+              if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", h->frame_id, cur_pk);
               continue;
             }
             ::sendto(usock, d.data(), d.size(), 0,

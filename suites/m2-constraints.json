@@ -1,0 +1,46 @@
+{
+  "suite": "m2-constraints",
+  "version": 1,
+  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。M2 阶段先以声明形式存在，用于人工复现与 M4 的接入契约。",
+  "cases": [
+    {
+      "id": "avc-level-mismatch",
+      "seed": 1,
+      "fault": {
+        "kind": "config",
+        "params": {
+          "codec": "avc1.42001E",
+          "width": 1920,
+          "height": 1080,
+          "expected_error": "coded area 2088960 exceeds maximum 414720"
+        }
+      },
+      "pipeline": { "profile": "p1080p30", "transcode": false },
+      "prompt": "上行 VideoEncoder.configure() 直接抛错：coded area 2088960 exceeds maximum 414720 (AVC level 3.0)。定位原因并修复，使 1080p 能正常编码。",
+      "expect": {
+        "root_cause": "resolution_too_high",
+        "evidence_candidates": ["avc1.42001E", "coded area", "414720", "configure"],
+        "allowed_actions": ["pipeline_set_param"],
+        "sla": { "usable_fps_min": 25 }
+      },
+      "budget": { "max_turns": 6, "max_yuan": 0.1, "max_wall_s": 120 }
+    },
+    {
+      "id": "fec-ghost-frame",
+      "seed": 1,
+      "fault": {
+        "kind": "fec",
+        "params": { "inject_drop_pct": 5, "fec": true, "nack": true }
+      },
+      "pipeline": { "profile": "p480p30", "transcode": false },
+      "prompt": "下行注入 5% 丢包并启用 XOR-FEC。检查 probe 侧是否出现『完成帧数超过发送帧数』或 frames_no_data 异常增长（幽灵帧），并给出根因。",
+      "expect": {
+        "root_cause": "fec_ghost_frame",
+        "evidence_candidates": ["frames_no_data", "frames_completed", "fec_recovered"],
+        "allowed_actions": ["inject_fault", "pipeline_set_param"],
+        "sla": { "frame_completion_min": 0.95 }
+      },
+      "budget": { "max_turns": 8, "max_yuan": 0.15, "max_wall_s": 180 }
+    }
+  ]
+}
