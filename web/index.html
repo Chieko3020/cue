@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Cue · M1 端到端最小链路</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #0d1117; color: #c9d1d9; font: 14px/1.5 ui-monospace, monospace; }
+    .wrap { max-width: 920px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 18px; font-weight: 600; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; cursor: pointer; }
+    button:hover { background: #30363d; }
+    button:disabled { opacity: .5; cursor: default; }
+    canvas { display: block; width: 100%; max-width: 854px; border: 1px solid #30363d; border-radius: 6px; margin-top: 12px; background: #000; }
+    #log { white-space: pre-wrap; margin-top: 12px; padding: 10px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; min-height: 96px; max-height: 220px; overflow: auto; font-size: 12px; }
+    .k { color: #58a6ff; }
+    .warn { color: #d29922; }
+    .bad { color: #f85149; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Cue · M1 端到端最小链路</h1>
+  <div class="row">
+    <button id="start">开始推流</button>
+    <button id="stop" disabled>停止</button>
+    <span>分辨率 <select id="res">
+      <option value="854x480">854×480 (L3.0)</option>
+      <option value="1280x720">1280×720 (L4.0)</option>
+      <option value="640x480">640×480 (L3.0)</option>
+    </select></span>
+    <span>帧率 <select id="fps">
+      <option>30</option><option>15</option><option>24</option>
+    </select></span>
+  </div>
+  <canvas id="cv" width="854" height="480"></canvas>
+  <div id="log"></div>
+</div>
+<script src="./app.js"></script>
+</body>
+</html>

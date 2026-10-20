@@ -7,7 +7,7 @@
 - **探针客户端** — 跨机 C++ 接收端，分片重组、NACK、FEC、抖动缓冲，输出端到端指标
 - **评测** — 声明式用例、确定性故障注入、三重判分、回归对比
 
-> 状态：设计已冻结，代码从 M0（风险验证）开始。下面的命令随里程碑落地逐步可用。
+> 状态：**M1 端到端最小链路已跑通**——浏览器 Canvas 合成源 → WebCodecs 编码 → WS 上行 → cued 转发 → 自研 UDP → probe 输出帧率与延迟分位（实测 30 fps、p50 6.4 ms）。M2 起做完整媒体管线（解码/转码/六段埋点/FEC/NACK）。
 
 ## 为什么是这个拼法
 
@@ -60,11 +60,13 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-跑一个内置用例并出报告：
+一键起全套（probe + cued + 静态页），然后打开提示的地址点「开始推流」：
 
 ```bash
-./scripts/run.sh demo
+./scripts/run.sh
 ```
+
+跨机演示时用 `BIND=0.0.0.0 ./scripts/run.sh`（注意防火墙）。
 
 ## 目录
 
