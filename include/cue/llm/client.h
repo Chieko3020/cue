@@ -87,6 +87,9 @@ class OpenAiCompatibleClient : public ILlmClient {
     int max_retries = 2;
     // 响应体上限：异常端点不能把进程内存撑爆
     std::size_t max_response_bytes = 8u * 1024u * 1024u;
+    // 非空 = 每次 chat() 成功后把 {key, request, response, usage, ts, model} 追加到
+    // <record_dir>/<key>.jsonl（cassette 录制，SPEC §7.9）。空 = 不录。
+    std::string record_dir;
   };
 
   explicit OpenAiCompatibleClient(Config cfg);

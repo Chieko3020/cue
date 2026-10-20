@@ -66,6 +66,7 @@ target_link_libraries(cue_pipeline PUBLIC cue_proto nlohmann_json::nlohmann_json
 
 add_library(cue_agent STATIC
   src/llm/client.cpp
+  src/llm/cassette.cpp
   src/tool/registry.cpp
   src/agent/runner.cpp
   src/common/sha256.cpp)
@@ -146,3 +147,8 @@ target_include_directories(test_console PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps
 target_link_libraries(test_console PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
 add_test(NAME console COMMAND test_console)
 set_tests_properties(console PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# M6 cassette：key 归一化 / 录制（真实 HTTP 假端点）/ 回放 / miss
+add_executable(test_cassette tests/test_cassette.cpp)
+target_link_libraries(test_cassette PRIVATE cue_agent)
+add_test(NAME cassette COMMAND test_cassette)

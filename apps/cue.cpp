@@ -376,7 +376,12 @@ int run_real(const RunOptions& o) {
   tool::Registry reg;
   cue::pipeline::build_real_tools(reg, pipe, nullptr);
 
-  llm::OpenAiCompatibleClient client({base && *base ? base : "https://api.deepseek.com", key, model, 60});
+  llm::OpenAiCompatibleClient::Config cc;
+  cc.base_url = base && *base ? base : "https://api.deepseek.com";
+  cc.api_key = key;
+  cc.model = model;
+  cc.timeout_s = 60;
+  llm::OpenAiCompatibleClient client(cc);
 
   agent::Runner::Config cfg;
   cfg.model = model;

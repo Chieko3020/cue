@@ -9,6 +9,7 @@
 #include <thread>
 #include <utility>
 
+#include "cue/llm/cassette.h"
 #include "cue/llm/client.h"
 
 namespace cue::llm {
@@ -255,7 +256,18 @@ std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const Chat
     return std::unexpected("http " + std::to_string(outcome.http_code) + suffix + ": " +
                            outcome.body.substr(0, 400));
   }
-  return parse_response(outcome.body);
+  auto parsed = parse_response(outcome.body);
+  if (!parsed) return parsed;
+
+  // 录制发生在「成功返回」之后：失败/重试中的响应不进 cassette，回放只重放确定结论。
+  if (!cfg_.record_dir.empty()) {
+    const std::string model = req.model.empty() ? cfg_.model : req.model;
+    if (auto w = cassette_append(cfg_.record_dir, req, model, *parsed); !w) {
+      // 录制是辅助能力：写盘失败不能把一次成功的 API 调用变成失败（成本已发生）
+      std::fprintf(stderr, "[llm] cassette 录制失败：%s\n", w.error().c_str());
+    }
+  }
+  return parsed;
 }
 
 }  // namespace cue::llm
