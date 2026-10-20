@@ -23,6 +23,10 @@ let streamId = 1;
 let sentFrames = 0;
 let sentBytes = 0;
 let encodeErrors = 0;
+let droppedNoWs = 0;
+let manualStop = false;
+let reconnecting = false;
+let streaming = false;
 
 function log(msg, cls) {
   const time = new Date().toISOString().slice(11, 23);
@@ -63,6 +67,11 @@ function drawFrame(i, w, h) {
 }
 
 function sendChunk(chunk) {
+  // 断线期间编码不停，但包发不出去：计数后丢弃，重连后继续（否则会崩在 ws.send 上）
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    droppedNoWs++;
+    return;
+  }
   const bytes = new Uint8Array(chunk.byteLength);
   chunk.copyTo(bytes);
   const fragCount = Math.max(1, Math.ceil(bytes.length / MAX_FRAG));
@@ -124,6 +133,42 @@ async function syncClock() {
   }
 }
 
+// WS 连接 + 时钟同步；cued 重启（改参数/注入故障都会重启）后靠它续上
+async function connectWs() {
+  const sock = new WebSocket(WS_URL);
+  sock.binaryType = 'arraybuffer';
+  await new Promise((resolve, reject) => {
+    sock.onopen = resolve;
+    sock.onerror = () => reject(new Error('WS 连接失败'));
+    setTimeout(() => reject(new Error('WS 连接超时')), 3000);
+  });
+  ws = sock;
+  ws.onclose = () => {
+    if (ws !== sock) return;  // 旧连接的迟到事件不能把新连接打掉
+    if (manualStop) return;
+    log('WS 关闭（cued 可能重启），准备重连', 'warn');
+    ws = null;
+    scheduleReconnect();
+  };
+  ws.onerror = () => log('WS 错误', 'bad');
+  log(`WS 已连接 ${WS_URL}`, 'k');
+  await syncClock();
+}
+
+function scheduleReconnect() {
+  if (manualStop || reconnecting || !streaming) return;
+  reconnecting = true;
+  setTimeout(async () => {
+    reconnecting = false;
+    if (manualStop || !streaming) return;
+    try {
+      await connectWs();
+    } catch (_) {
+      scheduleReconnect();
+    }
+  }, 400);
+}
+
 async function start() {
   const [w, h] = els.res.value.split('x').map(Number);
   const fps = Number(els.fps.value);
@@ -134,17 +179,8 @@ async function start() {
   els.canvas.height = h;
   els.start.disabled = true;
 
-  ws = new WebSocket(WS_URL);
-  ws.binaryType = 'arraybuffer';
-  ws.onclose = () => { log('WS 关闭', 'warn'); stop(); };
-  ws.onerror = () => log('WS 错误', 'bad');
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    setTimeout(() => reject(new Error('WS 连接超时')), 3000);
-  });
-  log(`WS 已连接 ${WS_URL}`, 'k');
-
-  await syncClock();
+  manualStop = false;
+  await connectWs();
 
   if (typeof VideoEncoder === 'undefined') {
     log('当前浏览器不支持 WebCodecs', 'bad');
@@ -185,13 +221,17 @@ async function start() {
   }, periodMs);
 
   els.stop.disabled = false;
+  streaming = true;
   setInterval(() => {
     if (!timer) return;
-    log(`已发送 ${sentFrames} 帧 / ${(sentBytes / 1024 / 1024).toFixed(2)} MB，编码错误 ${encodeErrors}`);
+    log(`已发送 ${sentFrames} 帧 / ${(sentBytes / 1024 / 1024).toFixed(2)} MB，编码错误 ${encodeErrors}` +
+        (droppedNoWs ? `，断线丢弃 ${droppedNoWs}` : ''));
   }, 2000);
 }
 
 function stop() {
+  manualStop = true;
+  streaming = false;
   if (timer) { clearInterval(timer); timer = null; }
   if (encoder) { try { encoder.close(); } catch (_) {} encoder = null; }
   if (ws) { try { ws.close(); } catch (_) {} ws = null; }
