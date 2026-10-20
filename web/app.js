@@ -1,9 +1,23 @@
-// Cue M1 · 浏览器端：Canvas 合成源 → WebCodecs 编码 → WS 上行
+// Cue · 浏览器端推流页：Canvas 合成源 → WebCodecs 编码 → WS 上行
 // 协议见 SPEC §7.1（32 字节媒体头，小端）；时钟同步见 §7.1 的 offset 估算。
+// WS 地址默认 ws(s)://<本页主机>:9000/，可用 ?ws=ws://host:port/ 覆盖，?ws_port=N 只换端口。
 
-const WS_URL = `ws://${location.hostname}:9000/`;
 const HEADER = 32;
 const MAX_FRAG = 16 * 1024;
+const CLOCK_RESYNC_MS = 30_000;
+const CLOCK_DRIFT_US = 5_000;
+
+function resolveWsUrl() {
+  const q = new URLSearchParams(location.search);
+  const override = q.get('ws');
+  if (override) return override;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const port = q.get('ws_port') || '9000';
+  // file:// 打开时 hostname 为空，退回回环地址
+  const host = location.hostname || '127.0.0.1';
+  return `${proto}//${host}:${port}/`;
+}
+const WS_URL = resolveWsUrl();
 
 const els = {
   start: document.getElementById('start'),
@@ -17,7 +31,10 @@ const els = {
 let ws = null;
 let encoder = null;
 let timer = null;
+let statsTimer = null;
+let clockTimer = null;
 let offsetUs = 0;
+let clockAnchored = false;
 let frameId = 0;
 let streamId = 1;
 let sentFrames = 0;
@@ -30,6 +47,7 @@ let droppedNoWs = 0;
 let manualStop = false;
 let reconnecting = false;
 let streaming = false;
+let encoderBroken = false;
 
 function log(msg, cls) {
   const time = new Date().toISOString().slice(11, 23);
@@ -46,10 +64,10 @@ function pickCodec(w, h) {
   return null;
 }
 
-function drawFrame(i, w, h) {
+function drawFrame(i, w, h, fps) {
   const cv = els.canvas;
   const ctx = cv.getContext('2d', { alpha: false });
-  const t = i / 30;
+  const t = i / fps;
   const g = ctx.createLinearGradient(0, 0, w, h);
   g.addColorStop(0, `hsl(${(t * 40) % 360}, 70%, 45%)`);
   g.addColorStop(1, '#0b1020');
@@ -66,7 +84,7 @@ function drawFrame(i, w, h) {
   ctx.font = `${Math.round(h / 14)}px ui-monospace, monospace`;
   ctx.fillText(`frame ${i}`, 24, h * 0.18);
   ctx.fillText(`t=${t.toFixed(2)}s`, 24, h * 0.28);
-  ctx.fillText(`${w}x${h}`, 24, h * 0.38);
+  ctx.fillText(`${w}x${h}@${fps}`, 24, h * 0.38);
 }
 
 function sendChunk(chunk) {
@@ -95,7 +113,13 @@ function sendChunk(chunk) {
     dv.setBigUint64(20, BigInt(chunk.timestamp), true);
     dv.setUint32(28, len, true);
     pkt.set(bytes.subarray(off, off + len), HEADER);
-    ws.send(pkt);
+    try {
+      ws.send(pkt);
+    } catch (e) {
+      droppedNoWs++;
+      log(`WS 发送失败: ${e.message}`, 'bad');
+      return;
+    }
     sentBytes += pkt.length;
   }
   sentFrames++;
@@ -103,7 +127,9 @@ function sendChunk(chunk) {
 }
 
 // 8 次 ping/pong 取 RTT 最小的一次，offset = server_us - (client_us + rtt/2)
-async function syncClock() {
+// 每 30 s 重估；漂移 > 5 ms 重锚。事件留痕目前只有页面日志——结构化事件流在 C++/M5 侧。
+async function syncClock(reanchor) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   let best = null;
   for (let i = 0; i < 8; i++) {
     const t = Math.round(performance.now() * 1000);
@@ -128,11 +154,21 @@ async function syncClock() {
       if (!best || rtt < best.rtt) best = { rtt, off };
     }
   }
-  if (best) {
+  if (!best) {
+    log('时钟同步失败，沿用上一个 offset（端到端延迟会含基准偏差）', 'warn');
+    return;
+  }
+  if (reanchor || !clockAnchored) {
     offsetUs = best.off;
-    log(`时钟同步: rtt=${(best.rtt / 1000).toFixed(2)}ms offset=${(best.off / 1000).toFixed(2)}ms`, 'k');
-  } else {
-    log('时钟同步失败，offset=0（端到端延迟会含基准偏差）', 'warn');
+    clockAnchored = true;
+    // 服务端单调钟与页面 timeOrigin 原点不同，offset 绝对值大是正常的，它是"时钟域差"而非误差
+    log(`时钟锚定: rtt=${(best.rtt / 1000).toFixed(2)}ms offset=${(best.off / 1000).toFixed(2)}ms`, 'k');
+    return;
+  }
+  const drift = best.off - offsetUs;
+  if (Math.abs(drift) > CLOCK_DRIFT_US) {
+    offsetUs = best.off;
+    log(`时钟漂移 ${(drift / 1000).toFixed(2)}ms 超过 5ms，已重锚`, 'warn');
   }
 }
 
@@ -141,9 +177,14 @@ async function connectWs() {
   const sock = new WebSocket(WS_URL);
   sock.binaryType = 'arraybuffer';
   await new Promise((resolve, reject) => {
-    sock.onopen = resolve;
-    sock.onerror = () => reject(new Error('WS 连接失败'));
-    setTimeout(() => reject(new Error('WS 连接超时')), 3000);
+    const timerId = setTimeout(() => fail(new Error('WS 连接超时')), 3000);
+    function fail(err) {
+      clearTimeout(timerId);
+      try { sock.close(); } catch (_) {}  // 超时/报错的 socket 不能留成半连接
+      reject(err);
+    }
+    sock.onopen = () => { clearTimeout(timerId); resolve(); };
+    sock.onerror = () => fail(new Error('WS 连接失败'));
   });
   ws = sock;
   ws.onclose = () => {
@@ -152,11 +193,12 @@ async function connectWs() {
     log('WS 关闭（cued 可能重启），准备重连', 'warn');
     needKeyframe = true;
     ws = null;
+    clockAnchored = false;
     scheduleReconnect();
   };
   ws.onerror = () => log('WS 错误', 'bad');
   log(`WS 已连接 ${WS_URL}`, 'k');
-  await syncClock();
+  await syncClock(true);
 }
 
 function scheduleReconnect() {
@@ -179,12 +221,23 @@ async function start() {
   const codec = pickCodec(w, h);
   if (!codec) { log('分辨率超出 L4.0 上限', 'bad'); return; }
 
+  manualStop = false;
+  // 先置位：若 connectWs 期间连接掉了，onclose 的 scheduleReconnect 才不会因 !streaming 静默退出
+  streaming = true;
+  encoderBroken = false;
+  clockAnchored = false;
+
   els.canvas.width = w;
   els.canvas.height = h;
   els.start.disabled = true;
 
-  manualStop = false;
-  await connectWs();
+  try {
+    await connectWs();
+  } catch (e) {
+    log(`WS 连接失败: ${e.message}`, 'bad');
+    stop();
+    return;
+  }
 
   if (typeof VideoEncoder === 'undefined') {
     log('当前浏览器不支持 WebCodecs', 'bad');
@@ -204,7 +257,12 @@ async function start() {
 
   encoder = new VideoEncoder({
     output: (chunk) => sendChunk(chunk),
-    error: (e) => { encodeErrors++; log(`编码错误: ${e.message}`, 'bad'); },
+    error: (e) => {
+      encodeErrors++;
+      encoderBroken = true;
+      log(`编码器错误，停止推流: ${e.message}`, 'bad');
+      stop();  // 编码器已 closed，继续 encode 只会每帧抛 InvalidStateError
+    },
   });
   // annexb：让服务端 libavcodec 直接吃（默认的 AVCC 需要额外做 h264_mp4toannexb）
   encoder.configure({
@@ -216,28 +274,45 @@ async function start() {
   let i = 0;
   const periodMs = 1000 / fps;
   timer = setInterval(() => {
-    drawFrame(i, w, h);
-    const tsUs = Math.round(performance.now() * 1000 + offsetUs);
+    if (encoderBroken || !encoder) return;
+    drawFrame(i, w, h, fps);
+    // pts 在服务端时钟域；offset 为负且页面刚加载时可能把时间戳推成负数，
+    // setBigUint64 会按 2^64 回绕成天文数字，先夹到 0。
+    let tsUs = Math.round(performance.now() * 1000 + offsetUs);
+    if (!Number.isFinite(tsUs) || tsUs < 0) tsUs = 0;
     const frame = new VideoFrame(els.canvas, { timestamp: tsUs, duration: Math.round(1e6 / fps) });
-    encoder.encode(frame, { keyFrame: needKeyframe || i % (fps * 2) === 0 });
-    needKeyframe = false;
-    frame.close();
-    i++;
+    try {
+      encoder.encode(frame, { keyFrame: needKeyframe || i % (fps * 2) === 0 });
+      needKeyframe = false;
+      i++;
+    } catch (e) {
+      encodeErrors++;
+      encoderBroken = true;
+      log(`编码失败，停止推流: ${e.message}`, 'bad');
+      stop();
+    } finally {
+      frame.close();  // encode 抛错时也必须释放 VideoFrame，否则 GPU/CPU 缓冲泄漏
+    }
   }, periodMs);
 
-  els.stop.disabled = false;
-  streaming = true;
-  setInterval(() => {
+  statsTimer = setInterval(() => {
     if (!timer) return;
     log(`已发送 ${sentFrames} 帧 / ${(sentBytes / 1024 / 1024).toFixed(2)} MB，编码错误 ${encodeErrors}` +
         (droppedNoWs ? `，断线丢弃 ${droppedNoWs}` : ''));
   }, 2000);
+  clockTimer = setInterval(() => { syncClock(false).catch(() => {}); }, CLOCK_RESYNC_MS);
+
+  els.stop.disabled = false;
+  log('开始推流');
 }
 
 function stop() {
   manualStop = true;
   streaming = false;
+  clockAnchored = false;
   if (timer) { clearInterval(timer); timer = null; }
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
   if (encoder) { try { encoder.close(); } catch (_) {} encoder = null; }
   if (ws) { try { ws.close(); } catch (_) {} ws = null; }
   els.start.disabled = false;
@@ -245,6 +320,13 @@ function stop() {
   log(`停止。本次共 ${sentFrames} 帧 / ${(sentBytes / 1024 / 1024).toFixed(2)} MB`);
 }
 
+// e2e 脚本（scripts/e2e-browser.cjs）用这个快照做断言，不需要读 DOM
+window.__cueStats = () => ({
+  wsUrl: WS_URL,
+  sentFrames, sentBytes, encodeErrors, droppedNoWs, streaming, encoderBroken,
+  offsetUs, clockAnchored,
+});
+
 els.start.addEventListener('click', () => start().catch((e) => { log(`启动失败: ${e.message}`, 'bad'); stop(); }));
 els.stop.addEventListener('click', stop);
-log('就绪。点击「开始推流」——需要 cued 已在 :9000 监听。');
+log(`就绪。点击「开始推流」——WS 目标 ${WS_URL}`);

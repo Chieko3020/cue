@@ -8,6 +8,7 @@
 
 # ── 构建产物 ──
 build/
+build-*/
 /cmake-build-*/
 /compile_commands.json
 *.o
@@ -23,18 +24,30 @@ build/
 /cassettes/
 /logs/
 *.log
-*.jsonl
+# 只忽略运行/录像产物，别把 suites 里将来可能加的 jsonl fixture 一起吞掉
+/runs/**/*.jsonl
+/cassettes/**/*.jsonl
+
+# ── 测试与覆盖率 ──
+/coverage/
+/pwtest/
+*.pcap
+__pycache__/
+
+# ── 本地媒体样本与复现产物 ──
+*.mp4
+*.h264
+*.y4m
 
 # ── 前端 ──
 /web/node_modules/
 /web/dist/
 .vite/
 
-# ── 本地环境 ──
+# ── 本地环境与编辑器 ──
 .env
 .env.local
 *.local
 .DS_Store
-
-# 并行修复线程的独立构建目录
-build-*/
+.vscode/
+.idea/

@@ -1,12 +1,24 @@
-// M1 链路自测：用 Node 模拟浏览器上行（不需要真实浏览器）
+// Cue 链路自测：用 Node 模拟浏览器上行（不需要真实浏览器）
 // 用法：node scripts/test-client.mjs [ws_url] [seconds]
-// 目的：验证 cued → probe 的 C++ 链路（编码器不参与，发送的是合成 payload）
+//   WS 地址默认 ws://127.0.0.1:${WS_PORT:-9000}/，可显式传参。
+//
+// 发送的是内嵌的 64x64 单帧 Annex-B IDR（约 677 B，SPS/PPS 内联），cued 会真实解码，
+// 因此在 cued/probe 侧应看到 dec 增长、dec_err 为 0。
+// 不含编码器、不测 WebCodecs（那部分由 web/app.js + e2e-browser.cjs 覆盖），
+// 也不覆盖多分片重组（该帧 < 16 KiB 分片上限）。
 
-const url = process.argv[2] || 'ws://127.0.0.1:9000/';
+const url = process.argv[2] || `ws://127.0.0.1:${process.env.WS_PORT || 9000}/`;
 const seconds = Number(process.argv[3] || 5);
 const FPS = 30;
-const FRAME_BYTES = 4096;
 const HEADER = 32;
+const MAX_FRAG = 16 * 1024;
+
+// ffmpeg -f lavfi -i color=c=blue:s=64x64:d=0.04 -frames:v 1 -c:v libx264 \
+//   -profile:v baseline -pix_fmt yuv420p -x264-params keyint=1:min-keyint=1:scenecut=0 -f h264
+const IDR_ANNEXB = Buffer.from(
+  'AAAAAWdCwArcQmwEQAAAAwBAAAAMg8SJ4AAAAAFozg8sgAAAAQYF//9Z3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MToweDExMSBtZT1oZXggc3VibWU9NyBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MSA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0tMiB0aHJlYWRzPTIgbG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MSBrZXlpbnRfbWluPTEgc2NlbmVjdXQ9MCBpbnRyYV9yZWZyZXNoPTAgcmM9Y3JmIG1idHJlZT0wIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFxPTE6MS4wMACAAAABZYiEBLxGKAAMxMcAAX1o4AAiQycnJ1111111111114A=',
+  'base64',
+);
 
 const ws = new WebSocket(url);
 ws.binaryType = 'arraybuffer';
@@ -49,34 +61,36 @@ ws.onopen = async () => {
   const t0 = Date.now();
 
   const timer = setInterval(() => {
-    const pts = Math.round(performance.now() * 1000 + offset);
-    const payload = new Uint8Array(FRAME_BYTES);
-    // 填充可辨识内容，方便 probe 侧扩展校验
-    payload.fill(frameId & 0xff);
-    const pkt = new Uint8Array(HEADER + payload.length);
-    const dv = new DataView(pkt.buffer);
-    pkt[0] = 0xc1;
-    pkt[1] = 0x01; // video
-    pkt[2] = 0x01; // h264
-    pkt[3] = 0x01 | 0x04; // keyframe | last_frag
-    u32(dv, 4, 1);        // stream_id
-    u32(dv, 8, frameId);
-    u32(dv, 12, 0);       // frag_index
-    u32(dv, 16, 1);       // frag_count
-    u64(dv, 20, pts);
-    u32(dv, 28, payload.length);
-    pkt.set(payload, HEADER);
-    ws.send(pkt);
-    frameId++;
-    sent++;
-
-    if (Date.now() - t0 >= seconds * 1000) {
-      clearInterval(timer);
-      console.log(`[test-client] sent ${sent} frames, closing`);
-      ws.close();
-      setTimeout(() => process.exit(0), 200);
+    const pts = Math.max(0, Math.round(performance.now() * 1000 + offset));
+    const fragCount = Math.max(1, Math.ceil(IDR_ANNEXB.length / MAX_FRAG));
+    for (let i = 0; i < fragCount; i++) {
+      const off = i * MAX_FRAG;
+      const len = Math.min(MAX_FRAG, IDR_ANNEXB.length - off);
+      const pkt = new Uint8Array(HEADER + len);
+      const dv = new DataView(pkt.buffer);
+      pkt[0] = 0xc1;
+      pkt[1] = 0x01; // video
+      pkt[2] = 0x01; // h264
+      pkt[3] = 0x01 | (i === fragCount - 1 ? 0x04 : 0); // keyframe | last_frag
+      u32(dv, 4, 1);        // stream_id
+      u32(dv, 8, frameId);
+      u32(dv, 12, i);       // frag_index
+      u32(dv, 16, fragCount);
+      u64(dv, 20, pts);
+      u32(dv, 28, len);
+      pkt.set(IDR_ANNEXB.subarray(off, off + len), HEADER);
+      ws.send(pkt);
     }
+    frameId = (frameId + 1) >>> 0;
+    sent++;
   }, 1000 / FPS);
+
+  setTimeout(() => {
+    clearInterval(timer);
+    console.log(`[test-client] sent ${sent} frames (${(sent * IDR_ANNEXB.length / 1024).toFixed(0)} KiB payload), closing`);
+    ws.close();
+    setTimeout(() => process.exit(0), 200);
+  }, seconds * 1000);
 };
 
 ws.onerror = (e) => {

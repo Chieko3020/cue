@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <title>Cue · M1 端到端最小链路</title>
+  <title>Cue · 推流控制台</title>
   <style>
     :root { color-scheme: dark; }
     body { margin: 0; background: #0d1117; color: #c9d1d9; font: 14px/1.5 ui-monospace, monospace; }
@@ -21,14 +21,14 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Cue · M1 端到端最小链路</h1>
+  <h1>Cue · 推流控制台</h1>
   <div class="row">
     <button id="start">开始推流</button>
     <button id="stop" disabled>停止</button>
     <span>分辨率 <select id="res">
-      <option value="854x480">854×480 (L3.0)</option>
+      <option value="854x480">854×480 (L3.0，默认)</option>
       <option value="1280x720">1280×720 (L4.0)</option>
-      <option value="1920x1080">1920×1080 (L4.0)</option>
+      <option value="1920x1080">1920×1080（L4.0，2 vCPU 编不动，故意超预算）</option>
       <option value="640x480">640×480 (L3.0)</option>
     </select></span>
     <span>帧率 <select id="fps">
