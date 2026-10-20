@@ -367,24 +367,42 @@ void ProcessPipelineControl::parse_line(const std::string& line) {
       push_log("[pipeline] METRICS 行不是合法 JSON: " + line);
       return;
     }
-    PipelineMetrics m;
-    m.fps = j.value("fps", 0.0);
-    m.frames_in = j.value("frames_in", static_cast<uint64_t>(0));
-    m.frames_out = j.value("frames_out", static_cast<uint64_t>(0));
-    m.dropped = j.value("dropped", static_cast<uint64_t>(0));
-    m.injected = j.value("injected", static_cast<uint64_t>(0));
-    m.decoded = j.value("decoded", static_cast<uint64_t>(0));
-    m.decode_errors = j.value("decode_errors", static_cast<uint64_t>(0));
-    m.rejected = j.value("rejected", static_cast<uint64_t>(0));
-    auto stage = [&j](const char* key, double& p50, double& p95, double& p99) {
-      if (!j.contains(key)) return;
-      const auto& s = j.at(key);
-      if (!s.is_object()) return;
-      p50 = s.value("p50", 0.0);
-      p95 = s.value("p95", 0.0);
-      p99 = s.value("p99", 0.0);
+    PipelineMetrics m;  // 分位默认 NaN：cued 打 null 的段保持"无样本"
+    // 计数一律按"键存在且是非负整数"解析：value() 遇到 null/类型不符会抛异常，
+    // 而 METRICS 行来自子进程，任何字段形态都可能出现（不让它穿透 reader 线程）。
+    auto count = [&j](const char* key) -> uint64_t {
+      const auto it = j.find(key);
+      if (it == j.end() || !it->is_number_integer()) return 0;
+      const int64_t v = it->get<int64_t>();
+      return v > 0 ? static_cast<uint64_t>(v) : 0;
     };
-    double sink_p95 = 0;
+    const auto fps_it = j.find("fps");
+    m.fps = (fps_it != j.end() && fps_it->is_number()) ? fps_it->get<double>() : 0.0;
+    m.frames_in = count("frames_in");
+    m.frames_out = count("frames_out");
+    m.dropped = count("dropped");
+    m.injected = count("injected");
+    m.decoded = count("decoded");
+    m.decode_errors = count("decode_errors");
+    m.rejected = count("rejected");
+    m.send_errors = count("send_errors");
+    m.encode_errors = count("encode_errors");
+    m.decode_drops = count("decode_drops");
+    m.budget_drops = count("budget_drops");
+    // 段分位：cued 写 null（本秒没有样本）或整段缺失 → 保持 NaN，绝不写成 0
+    auto stage = [&j](const char* key, double& p50, double& p95, double& p99) {
+      const auto it = j.find(key);
+      if (it == j.end() || !it->is_object()) return;
+      auto num = [&it](const char* k, double& out) {
+        const auto f = it->find(k);
+        if (f == it->end() || !f->is_number()) return;
+        out = f->get<double>();
+      };
+      num("p50", p50);
+      num("p95", p95);
+      num("p99", p99);
+    };
+    double sink_p95 = kNoSample;  // p95 目前没有消费者，丢弃但不污染 p99
     stage("recv", m.recv_p50, sink_p95, sink_p95);
     stage("buffer", m.buffer_p50, sink_p95, sink_p95);
     stage("decode", m.decode_p50, sink_p95, m.decode_p99);

@@ -9,8 +9,10 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -21,6 +23,12 @@
 #include <nlohmann/json.hpp>
 
 namespace cue::pipeline {
+
+// 分位缺失的哨兵：NaN 而不是 0（见 PipelineMetrics 的注释）
+inline constexpr double kNoSample = std::numeric_limits<double>::quiet_NaN();
+
+// 该分位是否真的采到了（NaN 表示没有样本）
+inline bool has_sample(double v) { return std::isfinite(v); }
 
 // 一条事件：cued stdout 里的 [cue-event] 行，或 harness 自己合成的控制面事件。
 // data 原样保留（不同 ev 的字段不同，消费者按键取），t_us 是事件时间（unix us），
@@ -41,10 +49,17 @@ struct PipelineMetrics {
   uint64_t decoded = 0;
   uint64_t decode_errors = 0;
   uint64_t rejected = 0;  // 协议边界拒绝数（wire.h 的拒绝原因分类在 cued 侧汇总）
-  // 六段 p50（ms）
-  double recv_p50 = 0, buffer_p50 = 0, decode_p50 = 0, op_p50 = 0, encode_p50 = 0, send_p50 = 0;
-  // 六段 p99（ms，仅 cued 打印了的段有值）
-  double decode_p99 = 0, op_p99 = 0, encode_p99 = 0;
+  // cued METRICS 行里原本就有、但过去没往 agent 侧暴露的计数（0 是真实读数，不是缺省）
+  uint64_t send_errors = 0;    // sendto 失败（ENOBUFS/EMSGSIZE），不是"已发送"
+  uint64_t encode_errors = 0;  // 编码失败（尺寸/格式/编码器错误）
+  uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
+  uint64_t budget_drops = 0;   // 令牌桶不足丢的帧
+  // 六段 p50（ms）。NaN = 这一段没有样本（cued 的 METRICS 对应段是 null）：
+  // "没采到"与"花了 0 ms"是两件事，消费者必须输出 null/n/a，不能用 0 冒充。
+  double recv_p50 = kNoSample, buffer_p50 = kNoSample, decode_p50 = kNoSample,
+         op_p50 = kNoSample, encode_p50 = kNoSample, send_p50 = kNoSample;
+  // 六段 p99（ms，同上：只有 cued 真正打印了 p99 的段才有值）
+  double decode_p99 = kNoSample, op_p99 = kNoSample, encode_p99 = kNoSample;
   int64_t updated_us = 0;
   uint64_t samples = 0;
   // 快照时的存活状态：cued 被 kill 后 latest() 不能继续撒谎（review #11）

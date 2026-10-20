@@ -21,6 +21,9 @@ tool::ToolResult record(std::vector<ToolTrace>* trace, const char* name, tool::T
 // age_ms / samples 让 agent 能判断这条是不是 cued 重启前的旧指标（#27）。
 json metrics_json(const PipelineMetrics& m, int64_t now) {
   const int64_t age_us = m.updated_us == 0 ? -1 : now - m.updated_us;
+  // 分位没有样本时输出 null 而不是 0：agent 引用 0 当证据就是伪证
+  // （transcode 关闭时 encode 段本来就没有样本，写 0 等于宣称"编码 0 ms"）。
+  auto pct = [](double v) { return has_sample(v) ? json(v) : json(nullptr); };
   return json{{"fps", m.fps},
               {"frames_in", m.frames_in},
               {"frames_out", m.frames_out},
@@ -28,13 +31,24 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"injected", m.injected},
               {"decoded", m.decoded},
               {"decode_errors", m.decode_errors},
-              {"recv_p50_ms", m.recv_p50},
-              {"buffer_p50_ms", m.buffer_p50},
-              {"decode_p50_ms", m.decode_p50},
-              {"decode_p99_ms", m.decode_p99},
-              {"op_p50_ms", m.op_p50},
-              {"op_p99_ms", m.op_p99},
-              {"send_p50_ms", m.send_p50},
+              {"recv_p50_ms", pct(m.recv_p50)},
+              {"buffer_p50_ms", pct(m.buffer_p50)},
+              {"decode_p50_ms", pct(m.decode_p50)},
+              {"decode_p99_ms", pct(m.decode_p99)},
+              {"op_p50_ms", pct(m.op_p50)},
+              {"op_p99_ms", pct(m.op_p99)},
+              {"encode_p50_ms", pct(m.encode_p50)},
+              {"encode_p99_ms", pct(m.encode_p99)},
+              {"send_p50_ms", pct(m.send_p50)},
+              // 进程身份/存活：pid=null 表示当前没有 cued（不是 pid 0 的真进程）
+              {"pid", m.pid == 0 ? json(nullptr) : json(static_cast<int64_t>(m.pid))},
+              {"alive", m.alive},
+              // 协议/发送/编码/预算侧计数：过去只在 cued 的 METRICS 行里，agent 看不到
+              {"rejected", m.rejected},
+              {"send_errors", m.send_errors},
+              {"encode_errors", m.encode_errors},
+              {"decode_drops", m.decode_drops},
+              {"budget_drops", m.budget_drops},
               {"samples", m.samples},
               {"age_ms", age_us < 0 ? -1 : age_us / 1000}};
 }
