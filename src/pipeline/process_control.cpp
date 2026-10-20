@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -145,6 +146,9 @@ bool ProcessPipelineControl::spawn_locked(std::string& err) {
   if (pid == 0) {
     // 自己是进程组长：stop() 可以整组回收，probe 之类的孙进程不会成孤儿（AC-8）
     ::setpgid(0, 0);
+    // cue 被 SIGKILL/崩溃时也要带走 cued：否则 ps 里会留下没人管的 cued（AC-8）
+    ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (::getppid() == 1) _exit(127);  // 父进程在 prctl 之前就没了
     ::dup2(fds[1], STDOUT_FILENO);
     ::dup2(fds[1], STDERR_FILENO);
     ::close(fds[0]);
@@ -202,8 +206,11 @@ void ProcessPipelineControl::stop() {
   stopping_.store(true);
   const pid_t pid = pid_.load();
   if (pid != 0) {
-    // cued 是进程组长（forked 后 setpgid(0,0)），kill(-pid) 连它拉起的子进程一起收
+    // cued 是进程组长（forked 后 setpgid(0,0)），kill(-pid) 连它拉起的子进程一起收；
+    // 再补一枪直接 kill(pid)：万一 setpgid 没生效（子进程已换组），只打组会 ESRCH，
+    // 后面的 waitpid 就会永久阻塞。
     ::kill(-pid, SIGTERM);
+    ::kill(pid, SIGTERM);
     bool gone = false;
     for (int i = 0; i < 50; ++i) {  // 最多等 500ms
       if (pid_.load() != pid) {
@@ -214,6 +221,7 @@ void ProcessPipelineControl::stop() {
     }
     if (!gone) {
       ::kill(-pid, SIGKILL);
+      ::kill(pid, SIGKILL);
       for (int i = 0; i < 50; ++i) {
         if (pid_.load() != pid) break;
         ::usleep(10 * 1000);
