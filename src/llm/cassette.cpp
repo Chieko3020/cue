@@ -20,7 +20,9 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::size_t kMaxCassetteLineBytes = 4u * 1024u * 1024u;
+// 与 Config::max_response_bytes（默认 8 MiB）对齐：一行 = 请求 + 响应 + 元数据，
+// 上限必须大于响应上限，否则「能录不能放」。
+constexpr std::size_t kMaxCassetteLineBytes = 32u * 1024u * 1024u;
 
 // ISO-8601（UTC，秒级）。只做留痕，**不进 key**——否则同一 prompts 每次调用都会不同。
 std::string iso8601_utc_now() {

@@ -656,7 +656,10 @@ std::string cassette_dir_hash(const std::string& dir) {
   }
   std::sort(files.begin(), files.end());
   std::string acc;
-  for (const auto& f : files) acc += f + "\n" + cue::sha256_file(f) + "\n";
+  // 只哈希相对文件名与内容：同一份 cassette 换目录/换机器不该让指纹漂移。
+  for (const auto& f : files) {
+    acc += std::filesystem::path(f).filename().string() + "\n" + cue::sha256_file(f) + "\n";
+  }
   return cue::sha256_hex(acc);
 }
 
