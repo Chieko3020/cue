@@ -19,6 +19,66 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LE
     "若 build/ 里已有旧编译器的缓存，先 rm -rf build（CMake 不允许原地更换编译器）")
 endif()
 
+# ---- sanitizer（SPEC §9 / AC-12：ASan/UBSan/TSan 各一个 CI job）----
+# 用法：
+#   cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 -DCUE_SANITIZE=address,undefined
+#   cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 -DCUE_SANITIZE=thread
+# ASan 与 UBSan 可以同时开；TSan 与它们互斥（GCC 不允许 -fsanitize=thread,address 组合，
+# 运行库占位同一份 shadow 内存），所以 thread 必须单独一个构建目录。
+set(CUE_SANITIZE "none" CACHE STRING
+  "sanitizer：none | address | undefined | thread | address,undefined（TSan 只能单独开）")
+set_property(CACHE CUE_SANITIZE PROPERTY STRINGS none address undefined thread address,undefined)
+
+if(NOT CUE_SANITIZE STREQUAL "none")
+  string(REPLACE "," ";" _cue_san_list "${CUE_SANITIZE}")
+  set(_cue_san_flags)
+  foreach(_s IN LISTS _cue_san_list)
+    if(_s STREQUAL "address" OR _s STREQUAL "undefined" OR _s STREQUAL "leak")
+      list(APPEND _cue_san_flags "-fsanitize=${_s}")
+    elseif(_s STREQUAL "thread")
+      list(APPEND _cue_san_flags "-fsanitize=thread")
+    else()
+      message(FATAL_ERROR "CUE_SANITIZE 不认识 '${_s}'（可选：none/address/undefined/thread，"
+                          "ASan+UBSan 写成 address,undefined）")
+    endif()
+  endforeach()
+  if("thread" IN_LIST _cue_san_list AND NOT CUE_SANITIZE STREQUAL "thread")
+    message(FATAL_ERROR "TSan 只能单独开：-DCUE_SANITIZE=thread（不能与 address/undefined 组合）")
+  endif()
+  # 本机 /etc/ld.so.preload 里有 libonion.so（系统级预加载），它会被动态链接器排到
+  # libasan/libtsan 之前，运行时报 "ASan runtime does not come first in initial library list"
+  # 并直接 abort。这不是代码问题也不是 ASan 的检查要关掉的理由：正确的解法是把 sanitizer
+  # 运行时用 LD_PRELOAD 提到最前面（ctest 的 ENVIRONMENT 里做，见文件末尾）。
+  foreach(_s IN LISTS _cue_san_list)
+    if(_s STREQUAL "address")
+      set(_cue_san_runtime_name "libasan.so")
+    elseif(_s STREQUAL "thread")
+      set(_cue_san_runtime_name "libtsan.so")
+    endif()
+  endforeach()
+  if(_cue_san_runtime_name)
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=${_cue_san_runtime_name}
+                    OUTPUT_VARIABLE _cue_san_runtime OUTPUT_STRIP_TRAILING_WHITESPACE)
+  endif()
+
+  # -fno-omit-frame-pointer：sanitizer 的栈回溯依赖帧指针，RelWithDebInfo 默认会省掉。
+  # -g：没有行号时报告只能给地址，定位不到源码行。
+  add_compile_options(${_cue_san_flags} -fno-omit-frame-pointer -g)
+  add_link_options(${_cue_san_flags})
+  # UBSan 默认「报告后继续」，那样 ctest 会绿着漏过 UB；这里让 undefined 直接终止，
+  # AC-12 的「ASan/UBSan 无报告」才有可执行的判据。ASan 本身就是致命信号，无需重复。
+  if("undefined" IN_LIST _cue_san_list)
+    add_compile_options(-fno-sanitize-recover=undefined)
+  endif()
+  # sanitizer 下关闭 -Werror：第三方头（Boost/FFmpeg 宏）的告警不是本次要修的对象，
+  # 让它们把真 bug 的构建挡在门外只会掩盖问题。CUE_WERROR 的常规口径不受影响。
+  if(CUE_WERROR)
+    message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}：强制关闭 CUE_WERROR（避免告警阻塞 sanitizer 验证）")
+  endif()
+  set(CUE_WERROR OFF)
+  message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}：flags=${_cue_san_flags} -fno-omit-frame-pointer -g")
+endif()
+
 add_compile_options(-Wall -Wextra -Wpedantic)
 if(CUE_WERROR)
   add_compile_options(-Werror)
@@ -152,3 +212,20 @@ set_tests_properties(console PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 add_executable(test_cassette tests/test_cassette.cpp)
 target_link_libraries(test_cassette PRIVATE cue_agent)
 add_test(NAME cassette COMMAND test_cassette)
+
+# ---- sanitizer 运行参数（ctest）----
+# 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
+# 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。
+if(NOT CUE_SANITIZE STREQUAL "none")
+  set(CUE_SAN_ENV
+    "ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:print_stacktrace=1"
+    "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
+    "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
+  # 见上文：本机 /etc/ld.so.preload 预加载了 libonion.so，必须把 sanitizer 运行时再提到它前面
+  if(_cue_san_runtime AND EXISTS "${_cue_san_runtime}")
+    list(APPEND CUE_SAN_ENV "LD_PRELOAD=${_cue_san_runtime}")
+  endif()
+  foreach(_t wire agent context eval state compare console cassette)
+    set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
+  endforeach()
+endif()
