@@ -69,6 +69,12 @@ class Registry {
   Risk risk_of(const std::string& name) const;
   bool has(const std::string& name) const;
   const std::vector<ToolSpec>& specs() const { return specs_; }
+  // 按名取 spec（审批回调必须拿到「当前被调用工具」的 spec，不能拿 specs().front()）。
+  // 找不到返回 nullptr —— 调用方按 Deny 处理，不要回退到任何默认 spec。
+  const ToolSpec* find_spec(const std::string& name) const;
+  // 是否观测类工具（SPEC §7.5 collect→diagnose 守卫用）。
+  // 用名字表而不是 risk：两者语义不同，观测工具将来可能新增。
+  static bool is_observation_tool(const std::string& name);
 
  private:
   struct Entry {

@@ -39,13 +39,18 @@ struct ChatRequest {
   std::vector<ChatMessage> messages;
   json tools = json::array();
   double temperature = 0.0;
-  int max_tokens = 1024;
+  // 1024 会在多工具/长证据时被截断（SPEC §7.9）。默认 2048，由 Runner::Config 覆盖。
+  int max_tokens = 2048;
 };
 
 struct ChatResponse {
   std::string content;
   std::vector<ToolCall> tool_calls;
   Usage usage;
+  // 原始 finish_reason（"stop" / "length" / "tool_calls" / ...），缺省为空串
+  std::string finish_reason;
+  // finish_reason == "length"：输出被 max_tokens 截断，工具参数可能是半截 JSON
+  bool truncated = false;
 };
 
 class ILlmClient {

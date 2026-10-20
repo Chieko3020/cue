@@ -18,6 +18,9 @@ inline constexpr std::size_t kMediaHeaderSize = 32;
 inline constexpr std::size_t kDatagramHeaderSize = 24;
 inline constexpr std::size_t kMaxWsFrag = 16 * 1024;   // 上行单分片载荷上限
 inline constexpr std::size_t kMaxUdpPayload = 1200;    // 下行单包载荷上限（避免 IP 分片）
+// 单帧最大分片数：与下行 split_into_datagrams 的 1024 上限保持一致。
+// 这同时是 frag_count 的协议上界（伪造 u32 会被 decode_media 直接拒绝，不再分配内存）。
+inline constexpr uint32_t kMaxFragPerFrame = 1024;
 
 enum class MediaType : uint8_t { Video = 0x01, Audio = 0x02, CodecConfig = 0x03, KeyframeReq = 0x04, Stats = 0x05 };
 enum class Codec : uint8_t { H264 = 0x01, VP8 = 0x02, Opus = 0x03 };
@@ -90,9 +93,37 @@ inline std::array<uint8_t, kMediaHeaderSize> encode(const MediaHeader& h) {
   return b;
 }
 
-inline std::optional<MediaHeader> decode_media(std::span<const uint8_t> b) {
-  if (b.size() < kMediaHeaderSize) return std::nullopt;
-  if (b[0] != kMagicUp) return std::nullopt;
+// decode_media 的拒绝原因：调用方（cued）可以据此打限流日志，而不是静默 continue
+enum class MediaReject : uint8_t {
+  None = 0,
+  Truncated,        // 短于 32 字节头
+  BadMagic,         // b[0] != 0xC1
+  PayloadOverflow,  // payload_len > 实际剩余字节
+  FragmentTooLarge, // payload_len > kMaxWsFrag
+  FragCountZero,    // frag_count == 0（会凭空推一帧）
+  FragCountTooLarge,// frag_count > kMaxFragPerFrame
+  FragIndexOutOfRange,  // frag_index >= frag_count
+};
+
+inline const char* media_reject_reason(MediaReject r) {
+  switch (r) {
+    case MediaReject::None: return "ok";
+    case MediaReject::Truncated: return "truncated";
+    case MediaReject::BadMagic: return "bad_magic";
+    case MediaReject::PayloadOverflow: return "payload_overflow";
+    case MediaReject::FragmentTooLarge: return "fragment_too_large";
+    case MediaReject::FragCountZero: return "frag_count_zero";
+    case MediaReject::FragCountTooLarge: return "frag_count_too_large";
+    case MediaReject::FragIndexOutOfRange: return "frag_index_out_of_range";
+  }
+  return "unknown";
+}
+
+// 上行媒体包的协议边界校验，集中在这里（下游两个进程不再各自"补"）。
+// 成功时 out 为解出的头；失败时返回具体原因，out 不可用。
+inline MediaReject validate_media(std::span<const uint8_t> b, MediaHeader& out) {
+  if (b.size() < kMediaHeaderSize) return MediaReject::Truncated;
+  if (b[0] != kMagicUp) return MediaReject::BadMagic;
   MediaHeader h;
   h.magic = b[0];
   h.type = b[1];
@@ -104,7 +135,18 @@ inline std::optional<MediaHeader> decode_media(std::span<const uint8_t> b) {
   h.frag_count = detail::get_u32(&b[16]);
   h.pts_us = detail::get_u64(&b[20]);
   h.payload_len = detail::get_u32(&b[28]);
-  if (h.payload_len > b.size() - kMediaHeaderSize) return std::nullopt;
+  if (h.payload_len > b.size() - kMediaHeaderSize) return MediaReject::PayloadOverflow;
+  if (h.payload_len > kMaxWsFrag) return MediaReject::FragmentTooLarge;
+  if (h.frag_count == 0) return MediaReject::FragCountZero;
+  if (h.frag_count > kMaxFragPerFrame) return MediaReject::FragCountTooLarge;
+  if (h.frag_index >= h.frag_count) return MediaReject::FragIndexOutOfRange;
+  out = h;
+  return MediaReject::None;
+}
+
+inline std::optional<MediaHeader> decode_media(std::span<const uint8_t> b) {
+  MediaHeader h;
+  if (validate_media(b, h) != MediaReject::None) return std::nullopt;
   return h;
 }
 
@@ -158,7 +200,7 @@ inline std::vector<std::vector<uint8_t>> split_into_datagrams(
   std::vector<std::vector<uint8_t>> out;
   if (frame.empty()) return out;
   const std::size_t total = (frame.size() + kMaxUdpPayload - 1) / kMaxUdpPayload;
-  if (total > 1024) return out;  // 超限帧直接丢弃（M1 不处理）
+  if (total > kMaxFragPerFrame) return out;  // 超限帧直接丢弃（M1 不处理）
   out.reserve(total);
   for (std::size_t i = 0; i < total; ++i) {
     const std::size_t off = i * kMaxUdpPayload;

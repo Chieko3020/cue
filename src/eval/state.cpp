@@ -30,14 +30,14 @@ const std::string& self_binary_hash() {
 
 }  // namespace
 
-std::string base_fingerprint(const std::string& suite_path) {
+std::string base_fingerprint(const std::string& suite_path, const std::string& config_hash) {
   const std::string suite_hash = cue::sha256_file(suite_path);
   const std::string git = git_describe();
-  return cue::sha256_hex(self_binary_hash() + "|" + git + "|" + suite_hash);
+  return cue::sha256_hex(self_binary_hash() + "|" + git + "|" + suite_hash + "|" + config_hash);
 }
 
-std::string fingerprint_for(const std::string& suite_path, const Case& c) {
-  return cue::sha256_hex(base_fingerprint(suite_path) + "|" + c.id + "|" + std::to_string(c.seed));
+std::string fingerprint_for(const std::string& suite_path, const Case& c, const std::string& config_hash) {
+  return cue::sha256_hex(base_fingerprint(suite_path, config_hash) + "|" + c.id + "|" + std::to_string(c.seed));
 }
 
 namespace {

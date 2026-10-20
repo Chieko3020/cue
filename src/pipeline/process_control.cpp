@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <sstream>
 #include <string>
@@ -275,7 +276,8 @@ std::string ProcessPipelineControl::observation(const std::string& source, int t
     return oss.str();
   }
   const int n = std::max(1, std::min<int>(tail <= 0 ? 20 : tail, static_cast<int>(log_tail_.size())));
-  const int start = static_cast<int>(log_tail_.size()) - n;
+  // 空 log_tail_ 时 size-n 会变成 -1（越界读，ASan 实测 SEGV）
+  const int start = std::max(0, static_cast<int>(log_tail_.size()) - n);
   for (int i = start; i < static_cast<int>(log_tail_.size()); ++i) oss << log_tail_[i] << '\n';
   return oss.str();
 }

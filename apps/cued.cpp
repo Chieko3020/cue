@@ -158,6 +158,7 @@ struct Counters {
   uint64_t frames_decoded = 0;
   uint64_t decode_errors = 0;
   uint64_t injected_drops = 0;
+  uint64_t rejected = 0;  // 协议边界拒绝（wire.h 的 validate_media 给出具体原因）
 };
 
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counters& c) {
@@ -176,12 +177,13 @@ const char* kStageNames[6] = {"recv", "buffer", "decode", "op", "encode", "send"
 void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, uint64_t& frames_prev) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
-  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu dec=%llu dec_err=%llu MB=%.2f",
+  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu dec=%llu dec_err=%llu rej=%llu MB=%.2f",
               double(df) / dt, static_cast<unsigned long long>(c.frames_in),
               static_cast<unsigned long long>(c.frames_out), static_cast<unsigned long long>(c.frames_dropped),
               static_cast<unsigned long long>(c.injected_drops),
               static_cast<unsigned long long>(c.frames_decoded),
               static_cast<unsigned long long>(c.decode_errors),
+              static_cast<unsigned long long>(c.rejected),
               double(c.bytes_in) / (1024.0 * 1024.0));
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
@@ -340,7 +342,12 @@ int main(int argc, char** argv) {
     Ring rings[6];
     uint32_t session_id = 1;
     int64_t t_last_report = cue::now_us();
+    int64_t t_last_cleanup = cue::now_us();
     uint64_t frames_prev = 0;
+    // 注入丢包判定用的包序号：每连接一个、跨帧单调递增。
+    // 旧口径 frame_id*64+pk 在 1080p 关键帧（>63 分片）时会与 FEC 包 / 下一帧撞号，
+    // 丢包不再独立同分布；FEC 冗余包与数据包共用这一序号空间。
+    uint64_t pkt_seq = 0;
 
     for (;;) {
       beast::flat_buffer buf;
@@ -363,7 +370,10 @@ int main(int argc, char** argv) {
       }
 
       auto h = cue::proto::decode_media({p, n});
-      if (!h) continue;
+      if (!h) {
+        ++c.rejected;  // 协议边界拒绝（wire.h 的 validate_media 决定具体原因）
+        continue;
+      }
       if (h->type != static_cast<uint8_t>(cue::proto::MediaType::Video)) continue;
 
       session_id = h->stream_id;
@@ -501,7 +511,7 @@ int main(int argc, char** argv) {
             const uint16_t mc = static_cast<uint16_t>(datagrams.size());
             std::memcpy(fpkt.data() + base + 6, &mc, 2);
             std::memcpy(fpkt.data() + base + 8, parity.data(), maxlen);
-            if (!injector.drop(uint64_t(h->frame_id) * 64ULL + 63ULL)) {
+            if (!injector.drop(pkt_seq++)) {
               ::sendto(usock, fpkt.data(), fpkt.size(), 0,
                        reinterpret_cast<const sockaddr*>(&probe_addr), sizeof(probe_addr));
             }
@@ -512,7 +522,11 @@ int main(int argc, char** argv) {
       rings[5].push(cue::now_us() - t_send0);
 
       pending.erase(h->frame_id);
-      if (pending.size() > 256) cleanup_stale(pending, cue::now_us(), c);
+      // 未完成帧必须周期性清理：只挂在"完成路径"上时，丢了尾片的帧永远不会过期
+      if (cue::now_us() - t_last_cleanup >= 1'000'000) {
+        cleanup_stale(pending, cue::now_us(), c);
+        t_last_cleanup = cue::now_us();
+      }
 
       if (cue::now_us() - t_last_report >= 1'000'000) {
         report(rings, c, cue::now_us(), t_last_report, frames_prev);

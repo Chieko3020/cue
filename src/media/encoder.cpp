@@ -10,9 +10,31 @@ extern "C" {
 #include <x264.h>
 }
 
+#include "cue/common/clock.h"
 #include "cue/media/encoder.h"
 
 namespace cue::media {
+
+namespace {
+
+// 用析构写回耗时：所有 return 分支（含无输出/失败）都能带上已发生的编码耗时
+class ElapsedWrite {
+ public:
+  explicit ElapsedWrite(int64_t* out) : out_(out), t0_(cue::now_us()) {
+    if (out_) *out_ = 0;
+  }
+  ~ElapsedWrite() {
+    if (out_) *out_ = cue::now_us() - t0_;
+  }
+  ElapsedWrite(const ElapsedWrite&) = delete;
+  ElapsedWrite& operator=(const ElapsedWrite&) = delete;
+
+ private:
+  int64_t* out_;
+  int64_t t0_;
+};
+
+}  // namespace
 
 // ---------------------------------------------------------------- X264Encoder
 
@@ -92,7 +114,9 @@ void X264Encoder::close() {
   im.pic_in = x264_picture_t{};
 }
 
-std::optional<EncodedResult> X264Encoder::encode(const AVFrame* frame, int64_t pts, std::string& err) {
+std::optional<EncodedResult> X264Encoder::encode(const AVFrame* frame, int64_t pts, std::string& err,
+                                                 int64_t* encode_ns) {
+  ElapsedWrite elapsed(encode_ns);
   if (!is_open() || !frame) return std::nullopt;
   auto& im = *impl_;
   if (frame->width != im.w || frame->height != im.h) {
@@ -203,7 +227,9 @@ void TranscodeChain::close() {
   if (scaler_) scaler_->reset();
 }
 
-std::optional<EncodedResult> TranscodeChain::process(const AVFrame* in, int64_t pts, std::string& err) {
+std::optional<EncodedResult> TranscodeChain::process(const AVFrame* in, int64_t pts, std::string& err,
+                                                     int64_t* encode_ns) {
+  if (encode_ns) *encode_ns = 0;
   if (!enabled_ || !in) return std::nullopt;
   if (!scaler_) scaler_ = std::make_unique<Scaler>();
 
@@ -217,7 +243,7 @@ std::optional<EncodedResult> TranscodeChain::process(const AVFrame* in, int64_t 
     }
     src = scaler_->dst;
   }
-  return encoder_.encode(src, pts, err);
+  return encoder_.encode(src, pts, err, encode_ns);
 }
 
 }  // namespace cue::media

@@ -44,6 +44,11 @@ struct Case {
   // SLA（harness 重测）
   double sla_fps_min = 0.0;
   uint64_t sla_dropped_max = UINT64_MAX;
+  // 帧完成率下限（frames_out / frames_in）；0 表示不检查
+  double sla_frame_completion_min = 0.0;
+  // 该 case 只能人工复现（如 FEC 幽灵帧这类不在 agent 根因枚举内的问题）。
+  // real 模式遇到时跳过并记 skipped，不计入成功率分母。
+  bool manual_only = false;
 
   // 预算
   int max_turns = 12;
@@ -135,6 +140,9 @@ class Engine {
   explicit Engine(RunConfig cfg) : cfg_(std::move(cfg)) {}
   RunReport run(const std::vector<Case>& cases);
   std::string render_markdown(const RunReport& r) const;
+  // 生效配置指纹：模式/repeat/成本闸门/模型/cued 二进制内容。
+  // 不含它时「换 SUT、换 model、换 mode」指纹相同，续跑会跨配置复用缓存（实测）。
+  std::string config_hash() const;
 
  private:
   CaseOutcome run_scripted_case(const Case& c) const;

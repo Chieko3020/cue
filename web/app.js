@@ -23,6 +23,9 @@ let streamId = 1;
 let sentFrames = 0;
 let sentBytes = 0;
 let encodeErrors = 0;
+// cued 重启（任何修复动作都会触发）后，新解码器要等下一个 GOP 才拿到 SPS/PPS，
+// 中间这些帧全部解不出（实测 23 帧 dec_err）。重连后必须强制一次 IDR。
+let needKeyframe = false;
 let droppedNoWs = 0;
 let manualStop = false;
 let reconnecting = false;
@@ -147,6 +150,7 @@ async function connectWs() {
     if (ws !== sock) return;  // 旧连接的迟到事件不能把新连接打掉
     if (manualStop) return;
     log('WS 关闭（cued 可能重启），准备重连', 'warn');
+    needKeyframe = true;
     ws = null;
     scheduleReconnect();
   };
@@ -215,7 +219,8 @@ async function start() {
     drawFrame(i, w, h);
     const tsUs = Math.round(performance.now() * 1000 + offsetUs);
     const frame = new VideoFrame(els.canvas, { timestamp: tsUs, duration: Math.round(1e6 / fps) });
-    encoder.encode(frame, { keyFrame: i % (fps * 2) === 0 });
+    encoder.encode(frame, { keyFrame: needKeyframe || i % (fps * 2) === 0 });
+    needKeyframe = false;
     frame.close();
     i++;
   }, periodMs);

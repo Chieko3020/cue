@@ -20,9 +20,9 @@ namespace cue::eval {
 // ---- 指纹
 
 // 基线指纹：可执行文件（/proc/self/exe）⊕ git describe ⊕ suite 文件内容
-std::string base_fingerprint(const std::string& suite_path);
+std::string base_fingerprint(const std::string& suite_path, const std::string& config_hash);
 // case 级指纹 = 基线 ⊕ case.id ⊕ seed
-std::string fingerprint_for(const std::string& suite_path, const Case& c);
+std::string fingerprint_for(const std::string& suite_path, const Case& c, const std::string& config_hash);
 
 // ---- outcome 序列化
 

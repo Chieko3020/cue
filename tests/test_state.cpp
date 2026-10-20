@@ -152,14 +152,19 @@ int main() {
     write_text(suite_b, R"({"suite":"s","cases":[1]})");
     const auto c1 = make_case("c1");
     const auto c2 = make_case("c2");
-    check(!eval::base_fingerprint(suite_a).empty(), "基线指纹非空");
-    check(eval::base_fingerprint(suite_a) == eval::base_fingerprint(suite_a), "基线指纹稳定");
-    check(eval::base_fingerprint(suite_a) != eval::base_fingerprint(suite_b), "suite 内容变化 → 指纹变化");
-    check(eval::fingerprint_for(suite_a, c1) == eval::fingerprint_for(suite_a, c1), "case 指纹稳定");
-    check(eval::fingerprint_for(suite_a, c1) != eval::fingerprint_for(suite_a, c2), "case id 变化 → 指纹变化");
+    const std::string cfg_a = "cfg-a";
+    const std::string cfg_b = "cfg-b";
+    check(!eval::base_fingerprint(suite_a, cfg_a).empty(), "基线指纹非空");
+    check(eval::base_fingerprint(suite_a, cfg_a) == eval::base_fingerprint(suite_a, cfg_a), "基线指纹稳定");
+    check(eval::base_fingerprint(suite_a, cfg_a) != eval::base_fingerprint(suite_b, cfg_a), "suite 内容变化 → 指纹变化");
+    check(eval::fingerprint_for(suite_a, c1, cfg_a) == eval::fingerprint_for(suite_a, c1, cfg_a), "case 指纹稳定");
+    check(eval::fingerprint_for(suite_a, c1, cfg_a) != eval::fingerprint_for(suite_a, c2, cfg_a), "case id 变化 → 指纹变化");
     auto c3 = c1;
     c3.seed = 43;
-    check(eval::fingerprint_for(suite_a, c1) != eval::fingerprint_for(suite_a, c3), "seed 变化 → 指纹变化");
+    check(eval::fingerprint_for(suite_a, c1, cfg_a) != eval::fingerprint_for(suite_a, c3, cfg_a), "seed 变化 → 指纹变化");
+    // 生效配置变化必须让指纹变化，否则续跑会跨 SUT/跨模型复用缓存（实测踩过）
+    check(eval::fingerprint_for(suite_a, c1, cfg_a) != eval::fingerprint_for(suite_a, c1, cfg_b),
+          "config 变化 → 指纹变化");
   }
 
   // 6) real 模式配置推导：注入档位只来自 case

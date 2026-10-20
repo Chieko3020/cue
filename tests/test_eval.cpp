@@ -113,9 +113,21 @@ int main() {
     const auto obs = make_obs();
     check(eval::evidence_matches("injected=59", obs), "case8a exact substring");
     check(eval::evidence_matches("INJECTED=59", obs), "case8b case insensitive");
-    check(eval::evidence_matches("59", obs), "case8c bare number");
+    check(!eval::evidence_matches("59", obs), "case8c bare number rejected");
     check(!eval::evidence_matches("injected=60", obs), "case8d wrong number rejected");
     check(!eval::evidence_matches("", obs), "case8e empty rejected");
+
+    // 对抗：空观测 / 纯中文观测不能成为万能通行证
+    std::vector<eval::Observation> empty_obs;
+    eval::Observation eo;
+    eo.text = "";
+    empty_obs.push_back(eo);
+    check(!eval::evidence_matches("anything at all here", empty_obs), "case8j empty observation not a pass");
+    std::vector<eval::Observation> cn_obs;
+    eval::Observation co;
+    co.text = "观测为空";
+    cn_obs.push_back(co);
+    check(!eval::evidence_matches("nothing useful here", cn_obs), "case8k short observation not a pass");
   }
 
   // 8f–8i) 归一化匹配：模型把观测写成 "k": v 与 k=v 都要认，但数值必须真的对得上

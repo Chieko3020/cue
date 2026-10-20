@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "cue/common/clock.h"
+#include "cue/common/sha256.h"
 #include "cue/eval/state.h"
 #include "cue/llm/client.h"
 #include "cue/pipeline/tools.h"
@@ -24,20 +25,6 @@ namespace cue::eval {
 namespace {
 
 // 提取裸数字（没有 key 可挂时的兜底：证据只写了数字）
-std::vector<std::string> extract_numbers(const std::string& s) {
-  std::vector<std::string> nums;
-  std::string cur;
-  for (char ch : s) {
-    if (std::isdigit(static_cast<unsigned char>(ch)) || ch == '.' || ch == '-') {
-      cur.push_back(ch);
-    } else {
-      if (cur.size() >= 2) nums.push_back(cur);
-      cur.clear();
-    }
-  }
-  if (cur.size() >= 2) nums.push_back(cur);
-  return nums;
-}
 
 // SPEC §7.6 要求「归一化子串」：把 JSON 的 "k": v 与证据里的 k=v 归一成同一种写法，
 // 否则模型写得再准也会因为多一个引号被判伪造。
@@ -87,9 +74,10 @@ std::vector<Citation> citations(const std::string& raw) {
       key.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(raw[j]))));
     }
     std::size_t j = i;
+    // 只认 key = value / "key": value / key value；不跨 ( [ 提取，
+    // 否则 query_metrics(5000ms) 会被当成 "query_metrics=5000" 的引用（fail-closed 会误杀合法证据）
     while (j < raw.size() && (std::isspace(static_cast<unsigned char>(raw[j])) || raw[j] == '=' ||
-                              raw[j] == ':' || raw[j] == '"' || raw[j] == '\'' ||
-                              raw[j] == '(' || raw[j] == '[')) {
+                              raw[j] == ':' || raw[j] == '"' || raw[j] == '\'')) {
       ++j;
     }
     const std::size_t num0 = j;
@@ -116,6 +104,9 @@ bool value_close(double a, double b) {
   const bool a_int = std::fabs(a - std::round(a)) < 1e-9;
   const bool b_int = std::fabs(b - std::round(b)) < 1e-9;
   if (a_int && b_int) return a == b;
+  // 一方整数一方小数：计数类指标（injected/dropped/frames）不接受小数近似。
+  // 否则 "injected=59.4" 会被 ±2% 容差放过（实测踩过）。
+  if (a_int != b_int) return false;
   return std::fabs(a - b) <= std::max(0.05, 0.02 * std::fabs(b));
 }
 
@@ -166,29 +157,25 @@ std::optional<double> text_value(const std::string& norm, const std::string& key
 bool matches_observation(const std::string& raw_ev, const std::string& ev_norm,
                          const std::vector<Citation>& cites, const Observation& o) {
   const std::string text = normalize(o.text);
-  if (!ev_norm.empty() && text.find(ev_norm) != std::string::npos) return true;
-  if (ev_norm.size() >= 8 && ev_norm.find(text) != std::string::npos) return true;
+  // 1) 逐字引用：证据是观测的子串。至少 8 字符，避免 "fps" 这类短片段误命中。
+  if (ev_norm.size() >= 8 && !text.empty() && text.find(ev_norm) != std::string::npos) return true;
+  // 2) 反向"证据包含整段观测"已删除：复制整段观测不构成分析性引用，
+  //    且 normalize 后为空时 find("")==0 会让空观测变成万能通行证（实测 10 个伪造构造全过）。
 
   if (!cites.empty()) {
-    int checked = 0;
     for (const auto& c : cites) {
       auto actual = data_value(o.data, c.key);
       if (!actual) actual = text_value(text, c.key);
-      if (!actual) continue;  // 该观测里没有这个 key（比如工具名/窗口参数）→ 不参与判定
-      ++checked;
+      // fail-closed：引用了该观测里不存在的 key 就判失配（不能"跳过未知 key"）
+      if (!actual) return false;
       if (!value_close(*actual, c.value)) return false;
     }
-    if (checked >= 2) return true;
-    if (checked == 1 && raw_ev.size() <= 40) return true;
-    return false;
+    return true;  // 所有引用都命中
   }
-
-  const auto nums = extract_numbers(ev_norm);
-  if (nums.empty()) return false;
-  for (const auto& n : nums) {
-    if (text.find(n) == std::string::npos) return false;
-  }
-  return true;
+  // 纯数字 / 无引用的证据不算证据。删掉裸数字兜底：
+  // 无边界子串会让 "24" 命中 "frames_in=247"。
+  (void)raw_ev;
+  return false;
 }
 
 }  // namespace
@@ -216,26 +203,72 @@ Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<O
         s.evidence = false;
         break;
       }
+      // 还必须命中 case 声明的候选指标：否则"引用观测里出现过的无关数字"也算成立
+      if (!c.evidence_candidates.empty()) {
+        const std::string n = normalize(ev);
+        bool hit = false;
+        for (const auto& cand : c.evidence_candidates) {
+          if (n.find(normalize(cand)) != std::string::npos) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) {
+          s.evidence = false;
+          break;
+        }
+      }
     }
   }
 
   s.sla = true;
   if (c.sla_fps_min > 0 && m.fps < c.sla_fps_min) s.sla = false;
+  if (c.sla_frame_completion_min > 0 && m.frames_in > 0) {
+    const double ratio = double(m.frames_out) / double(m.frames_in);
+    if (ratio < c.sla_frame_completion_min) s.sla = false;
+  }
   if (m.dropped > c.sla_dropped_max) s.sla = false;
   // 没有采样 = 无法证明达成，按不达标处理
   if (m.samples == 0) s.sla = false;
   return s;
 }
 
+namespace {
+// fail-closed：未知字段一律报错。静默丢弃字段会让 suite 写错时报出假绿灯（实测踩过：
+// m2-constraints 的 usable_fps_min / frame_completion_min 被丢，SLA 恒真）。
+bool check_keys(const json& obj, std::initializer_list<const char*> allowed, const char* where,
+                std::string& err) {
+  for (auto it = obj.begin(); it != obj.end(); ++it) {
+    bool ok = false;
+    for (const char* a : allowed) {
+      if (it.key() == a) {
+        ok = true;
+        break;
+      }
+    }
+    if (!ok) {
+      err = std::string(where) + " 含未知字段: " + it.key();
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
 Case parse_case(const json& j, const std::string& suite_name, std::string& err) {
   Case c;
   c.suite = suite_name;
+  if (!check_keys(j, {"id", "seed", "fault", "pipeline", "prompt", "expect", "budget", "manual_only"},
+                  "case", err)) {
+    return c;
+  }
   if (!j.contains("id") || !j["id"].is_string()) {
     err = "case 缺少 id";
     return c;
   }
   c.id = j["id"].get<std::string>();
   c.seed = j.value("seed", 42ULL);
+  c.manual_only = j.value("manual_only", false);
 
   if (j.contains("fault") && j["fault"].is_object()) {
     const auto& f = j["fault"];
@@ -248,9 +281,15 @@ Case parse_case(const json& j, const std::string& suite_name, std::string& err) 
   }
   if (j.contains("pipeline") && j["pipeline"].is_object()) {
     const auto& p = j["pipeline"];
+    if (!check_keys(p, {"transcode", "bitrate_kbps", "gop", "width", "height", "profile"}, "pipeline",
+                    err)) {
+      return c;
+    }
     c.transcode = p.value("transcode", false);
     c.bitrate_kbps = p.value("bitrate_kbps", 1500);
     c.gop = p.value("gop", 60);
+    c.width = p.value("width", 0);
+    c.height = p.value("height", 0);
   }
   c.prompt = j.value("prompt", std::string("定位并修复当前管线异常"));
 
@@ -265,8 +304,13 @@ Case parse_case(const json& j, const std::string& suite_name, std::string& err) 
     }
     if (e.contains("sla") && e["sla"].is_object()) {
       const auto& s = e["sla"];
-      c.sla_fps_min = s.value("fps_min", 0.0);
+      if (!check_keys(s, {"fps_min", "usable_fps_min", "dropped_max", "frame_completion_min"}, "expect.sla",
+                      err)) {
+        return c;
+      }
+      c.sla_fps_min = s.value("fps_min", s.value("usable_fps_min", 0.0));
       if (s.contains("dropped_max")) c.sla_dropped_max = s["dropped_max"].get<uint64_t>();
+      c.sla_frame_completion_min = s.value("frame_completion_min", 0.0);
     }
   }
   if (j.contains("budget") && j["budget"].is_object()) {
@@ -305,6 +349,14 @@ std::vector<Case> load_suite(const std::string& path, std::string& err) {
     }
   }
   return cases;
+}
+
+std::string Engine::config_hash() const {
+  std::string cued_hash;
+  if (!cfg_.cued_bin.empty()) cued_hash = cue::sha256_file(cfg_.cued_bin);
+  return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" +
+                         std::to_string(cfg_.max_yuan) + "|" + cfg_.model + "|" + cfg_.cued_bin + "|" +
+                         cued_hash);
 }
 
 // ---------------------------------------------------------------- Engine
@@ -498,7 +550,7 @@ RunReport Engine::run(const std::vector<Case>& cases) {
   r.run_id = resuming ? cfg_.resume_run_id : "run-" + std::to_string(now_us());
   r.repeat = cfg_.repeat;
   r.total = static_cast<int>(cases.size()) * cfg_.repeat;
-  r.fingerprint = base_fingerprint(cfg_.suite_path);
+  r.fingerprint = base_fingerprint(cfg_.suite_path, config_hash());
 
   const std::string run_dir = cfg_.out_dir + "/" + r.run_id;
   const std::string state_path = run_dir + "/state.jsonl";
@@ -531,10 +583,16 @@ RunReport Engine::run(const std::vector<Case>& cases) {
 
   for (std::size_t ci = 0; ci < cases.size() && !gate; ++ci) {
     const auto& c = cases[ci];
-    const std::string fp = fingerprint_for(cfg_.suite_path, c);
+    const std::string fp = fingerprint_for(cfg_.suite_path, c, config_hash());
     for (int k = 0; k < cfg_.repeat; ++k) {
       CaseOutcome o;
       bool reused = false;
+      // manual_only：不在 agent 根因枚举内、只能人工复现的 case，real 模式直接跳过，
+      // 不进入成功率分母（否则会被当成"答错"污染统计）
+      if (c.manual_only && cfg_.agent_mode == "real") {
+        if (k == 0) r.failure_modes.push_back("skipped manual_only: " + c.id);
+        continue;
+      }
       const auto it = cached.find({static_cast<int>(ci), k});
       if (it != cached.end()) {
         if (it->second.fingerprint == fp) {

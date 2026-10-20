@@ -94,6 +94,24 @@ Runner::Runner(llm::ILlmClient& llm, const tool::Registry& tools, Config cfg)
 
 RunResult Runner::run(const std::string& goal, const Budget& budget,
                       const std::function<void(const Event&)>& on_event) {
+  // 所有输入都来自模型（未受信）；任何异常必须在这里收口，不能穿出 Runner（SPEC §9）
+  try {
+    return run_impl(goal, budget, on_event);
+  } catch (const std::exception& e) {
+    RunResult r;
+    r.final_stage = Stage::GiveUp;
+    r.error = std::string("runner exception: ") + e.what();
+    return r;
+  } catch (...) {
+    RunResult r;
+    r.final_stage = Stage::GiveUp;
+    r.error = "runner unknown exception";
+    return r;
+  }
+}
+
+RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
+                           const std::function<void(const Event&)>& on_event) {
   RunResult r;
   Stage stage = Stage::Collect;
   bool used_observe = false;
@@ -246,7 +264,8 @@ RunResult Runner::run(const std::string& goal, const Budget& budget,
             approved = allowed;
           }
         } else {  // Ask
-          approved = cfg_.ctx.approve ? cfg_.ctx.approve(tools_.specs().front(), args) : false;
+          const tool::ToolSpec* spec = tools_.find_spec(tc.name);
+          approved = (spec != nullptr && cfg_.ctx.approve) ? cfg_.ctx.approve(*spec, args) : false;
         }
       }
 

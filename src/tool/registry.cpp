@@ -106,4 +106,14 @@ Risk Registry::risk_of(const std::string& name) const {
 
 bool Registry::has(const std::string& name) const { return tools_.count(name) > 0; }
 
+const ToolSpec* Registry::find_spec(const std::string& name) const {
+  auto it = tools_.find(name);
+  if (it == tools_.end()) return nullptr;
+  return &it->second.spec;
+}
+
+bool Registry::is_observation_tool(const std::string& name) {
+  return name == "query_metrics" || name == "fetch_observation";
+}
+
 }  // namespace cue::tool
