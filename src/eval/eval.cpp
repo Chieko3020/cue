@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "cue/common/clock.h"
+#include "cue/eval/state.h"
 #include "cue/llm/client.h"
 #include "cue/pipeline/tools.h"
 
@@ -363,11 +364,36 @@ CaseOutcome Engine::run_real_case(const Case& c) const {
 
 RunReport Engine::run(const std::vector<Case>& cases) {
   RunReport r;
-  r.run_id = "run-" + std::to_string(now_us());
+  const bool resuming = !cfg_.resume_run_id.empty();
+  r.run_id = resuming ? cfg_.resume_run_id : "run-" + std::to_string(now_us());
   r.repeat = cfg_.repeat;
   r.total = static_cast<int>(cases.size()) * cfg_.repeat;
-  std::printf("[eval] run_id=%s mode=%s repeat=%d\n", r.run_id.c_str(), cfg_.agent_mode.c_str(),
-              cfg_.repeat);
+  r.fingerprint = base_fingerprint(cfg_.suite_path);
+
+  const std::string run_dir = cfg_.out_dir + "/" + r.run_id;
+  const std::string state_path = run_dir + "/state.jsonl";
+
+  StateMap cached;
+  if (resuming) {
+    std::string err;
+    if (!load_state(state_path, cached, err)) {
+      r.failure_modes.push_back("resume 失败：" + err);
+      return r;
+    }
+    std::printf("[eval] 续跑 %s：已缓存 %zu 个 case outcome\n", r.run_id.c_str(), cached.size());
+  } else {
+    json header{{"t", "run"},
+                {"run_id", r.run_id},
+                {"suite", cfg_.suite_path},
+                {"mode", cfg_.agent_mode},
+                {"repeat", cfg_.repeat},
+                {"fingerprint", r.fingerprint},
+                {"created_us", now_us()}};
+    std::string err;
+    if (!append_state_header(state_path, header, err)) r.failure_modes.push_back("state 写入失败：" + err);
+  }
+  std::printf("[eval] run_id=%s state=%s fingerprint=%s\n", r.run_id.c_str(), state_path.c_str(),
+              r.fingerprint.substr(0, 16).c_str());
 
   std::map<std::string, int> pass_count;   // case_id -> 全成功次数
   std::map<std::string, int> attempt_count;
@@ -375,8 +401,27 @@ RunReport Engine::run(const std::vector<Case>& cases) {
 
   for (std::size_t ci = 0; ci < cases.size() && !gate; ++ci) {
     const auto& c = cases[ci];
+    const std::string fp = fingerprint_for(cfg_.suite_path, c);
     for (int k = 0; k < cfg_.repeat; ++k) {
-      CaseOutcome o = (cfg_.agent_mode == "real") ? run_real_case(c) : run_scripted_case(c);
+      CaseOutcome o;
+      bool reused = false;
+      const auto it = cached.find({static_cast<int>(ci), k});
+      if (it != cached.end()) {
+        if (it->second.fingerprint == fp) {
+          o = it->second.outcome;
+          reused = true;
+          std::printf("[eval] case %s #%d 复用缓存（不调 LLM、不计费）\n", c.id.c_str(), k);
+        } else {
+          std::printf("[eval] case %s #%d 指纹变化 → 缓存失效，重跑\n", c.id.c_str(), k);
+        }
+      }
+      if (!reused) {
+        o = (cfg_.agent_mode == "real") ? run_real_case(c) : run_scripted_case(c);
+        std::string serr;
+        if (!append_state(state_path, static_cast<int>(ci), k, o, fp, serr)) {
+          r.failure_modes.push_back("state 写入失败：" + serr);
+        }
+      }
 
       r.cost_yuan += o.cost_yuan;
       ++attempt_count[c.id];
@@ -437,6 +482,7 @@ std::string Engine::render_markdown(const RunReport& r) const {
   o << "- suite: `" << cfg_.suite_path << "`\n";
   o << "- agent: `" << cfg_.agent_mode << "`，repeat=" << r.repeat << "，warmup=" << cfg_.warmup_s
     << "s\n";
+  o << "- 指纹: `" << r.fingerprint.substr(0, 16) << "`（二进制 ⊕ git describe ⊕ suite，SPEC §7.7）\n";
   o << "- 生效配置: cued=`" << cfg_.cued_bin << "`，model=`" << cfg_.model
     << "`，成本闸门 ¥" << cfg_.max_yuan << "，单价 ¥" << cfg_.yuan_per_mtok << "/Mtok\n";
   o << "- 用例: " << r.total << "，计分 " << r.scored << "，运行失败 " << r.run_errors << "\n";

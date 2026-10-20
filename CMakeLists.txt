@@ -42,7 +42,9 @@ add_library(cue_core STATIC
   src/agent/runner.cpp
   src/pipeline/process_control.cpp
   src/pipeline/tools.cpp
-  src/eval/eval.cpp)
+  src/common/sha256.cpp
+  src/eval/eval.cpp
+  src/eval/state.cpp)
 target_link_libraries(cue_core PUBLIC cue_proto PkgConfig::CURL)
 target_include_directories(cue_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -70,3 +72,8 @@ add_executable(test_eval tests/test_eval.cpp)
 target_link_libraries(test_eval PRIVATE cue_core)
 add_test(NAME eval COMMAND test_eval)
 set_tests_properties(eval PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_state tests/test_state.cpp)
+target_link_libraries(test_state PRIVATE cue_core)
+add_test(NAME state COMMAND test_state)
+set_tests_properties(state PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

@@ -98,7 +98,8 @@ struct RunConfig {
   std::string out_dir = "runs";
   int warmup_s = 6;                     // 管线起来后等推流的时间
   bool keep_pipeline = false;
-  // M4b：real 模式
+  // M4b
+  std::string resume_run_id;            // 非空 = 续跑该 run（复用已完成 case）
   std::string cued_bin = "./build/cued";
   std::string model = "deepseek-chat";  // real 模式模型名
   double yuan_per_mtok = 2.0;           // 成本核算单价
@@ -106,6 +107,7 @@ struct RunConfig {
 
 struct RunReport {
   std::string run_id;
+  std::string fingerprint;  // 二进制 ⊕ git ⊕ suite（报告留档，见 SPEC §7.7/AC-9）
   std::vector<CaseOutcome> cases;
   int total = 0;
   int scored = 0;
