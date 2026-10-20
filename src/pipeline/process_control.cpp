@@ -16,11 +16,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cue/common/clock.h"
+#include "cue/proto/wire.h"
 
 namespace cue::pipeline {
 
@@ -38,6 +41,16 @@ constexpr auto kReapPoll = std::chrono::milliseconds(50);
 // cued 的每秒指标行前缀。严格整行前缀匹配（不是子串），cued 哪天多打一个
 // frames_in= 也不会串味（review #29）。
 constexpr std::string_view kMetricsTag = "METRICS ";
+// 事件缓存上限：observation(events) 与将来的 SSE 都吃这一份。5000 条是 cue 侧
+// SSE 环形缓冲的口径（SPEC §5），这里只保留「最近 N 条」够 agent 看即可。
+constexpr std::size_t kEventMax = 256;
+
+// 事件时间戳要 unix 微秒（跨进程/墙钟展示）；延迟测量仍只准用 cue::now_us()。
+int64_t unix_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
 
 std::string describe_status(int status) {
   if (WIFSIGNALED(status)) {
@@ -61,6 +74,9 @@ void mark_inherited_fds_cloexec() {
 }  // namespace
 
 ProcessPipelineControl::ProcessPipelineControl(Config cfg) : cfg_(std::move(cfg)) {
+  // 回调单独存一份：cfg_ 会被 set_param/inject_fault 在别的线程整体赋值，
+  // reader 线程每次读 cfg_ 都会与它竞争。
+  on_event_ = cfg_.on_event;
   supervisor_ = std::thread([this] { supervisor_loop(); });
 }
 
@@ -234,6 +250,8 @@ void ProcessPipelineControl::stop() {
       }
     }
     pid_.store(0);
+    // 控制面主动停：与 cued 自己被 SIGTERM 时的 pipeline.stopped(origin=process) 区分开
+    emit_local_event("pipeline.stopped", json{{"reason", "control"}, {"pid", pid}});
   }
   // 先让读线程醒过来退出，再关 fd：旧顺序 close 在前，读线程可能正阻塞在同一 fd 上，
   // 拿到 EBADF 或（fd 号被复用后）读到别人的数据（review #24）
@@ -265,6 +283,7 @@ void ProcessPipelineControl::supervisor_loop() {
         push_log(msg);
         continue;
       }
+      bool restarted = false;
       {
         std::lock_guard<std::mutex> slk(spawn_mu_);
         if (stopping_.load()) {
@@ -276,11 +295,23 @@ void ProcessPipelineControl::supervisor_loop() {
           std::this_thread::sleep_for(kRestartBackoff);
           std::string rerr;
           if (spawn_locked(rerr)) {
+            restarted = true;
             msg += " → 已自动重启 pid=" + std::to_string(pid_.load());
           } else {
             msg += " → 重启失败: " + rerr;
           }
         }
+      }
+      // 崩溃/被 kill：cued 自己来不及报（SIGKILL 更是没机会），由监督方补事件。
+      // 走到这里 was_stopping 必为 false（true 的分支上面已经 continue）。
+      emit_local_event("pipeline.stopped", json{{"reason", "exit"},
+                                                {"pid", pid},
+                                                {"status", describe_status(status)},
+                                                {"restarting", restarted}});
+      if (restarted) {
+        emit_local_event("pipeline.restart", json{{"reason", "auto_restart"},
+                                                  {"old_pid", pid},
+                                                  {"new_pid", pid_.load()}});
       }
       push_log(msg);
       std::fprintf(stderr, "%s\n", msg.c_str());
@@ -325,6 +356,11 @@ void ProcessPipelineControl::reader_loop() {
 }
 
 void ProcessPipelineControl::parse_line(const std::string& line) {
+  // 结构化事件行：整行标签匹配，与 [cued] 人读行 / METRICS 行互不干扰
+  if (line.rfind(cue::proto::kEventTag, 0) == 0) {
+    parse_event_line(line.substr(cue::proto::kEventTag.size()));
+    return;
+  }
   if (line.rfind(kMetricsTag, 0) == 0) {
     const json j = json::parse(line.substr(kMetricsTag.size()), nullptr, false);
     if (!j.is_object()) {
@@ -366,6 +402,62 @@ void ProcessPipelineControl::parse_line(const std::string& line) {
   // 人的可读行留在 log_tail_，但每秒的 fps 摘要行不再重复堆进去（指标已结构化）
   if (line.rfind("[cued] fps=", 0) == 0) return;
   push_log(line);
+}
+
+void ProcessPipelineControl::parse_event_line(const std::string& body) {
+  const json j = json::parse(body, nullptr, false);
+  if (!j.is_object()) {
+    push_log("[pipeline] 事件行不是合法 JSON: " + body);
+    return;
+  }
+  const auto ev_it = j.find("ev");
+  if (ev_it == j.end() || !ev_it->is_string()) {
+    push_log("[pipeline] 事件行缺 ev 字段: " + body);
+    return;
+  }
+  PipelineEvent ev;
+  ev.type = ev_it->get<std::string>();
+  if (const auto d = j.find("data"); d != j.end() && d->is_object()) ev.data = *d;
+  // t 可能缺失（合成事件/旧版本）或类型不对：不让 value() 抛异常，缺了就记 0
+  if (const auto t = j.find("t"); t != j.end() && t->is_number_integer()) {
+    ev.t_us = t->get<int64_t>();
+  }
+  ev.seen_us = now_us();
+  record_event(std::move(ev));
+}
+
+void ProcessPipelineControl::emit_local_event(std::string type, json data) {
+  // 合成的控制面事件：origin=control 与子进程来的事件区分开（子进程的不带 origin）
+  if (data.is_object()) data["origin"] = "control";
+  PipelineEvent ev;
+  ev.type = std::move(type);
+  ev.data = std::move(data);
+  ev.t_us = unix_us();
+  ev.seen_us = now_us();
+  record_event(std::move(ev));
+}
+
+void ProcessPipelineControl::record_event(PipelineEvent ev) {
+  std::function<void(const PipelineEvent&)> cb;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    events_.push_back(ev);
+    while (events_.size() > kEventMax) events_.pop_front();
+    cb = on_event_;
+  }
+  // 回调在锁外调用：消费者（SSE/前端）可能回头调 latest()/recent_events()
+  if (cb) cb(ev);
+}
+
+void ProcessPipelineControl::set_event_callback(std::function<void(const PipelineEvent&)> cb) {
+  std::lock_guard<std::mutex> lk(mu_);
+  on_event_ = std::move(cb);
+}
+
+std::vector<PipelineEvent> ProcessPipelineControl::recent_events(std::size_t n) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (n == 0 || n >= events_.size()) return {events_.begin(), events_.end()};
+  return {events_.end() - static_cast<std::ptrdiff_t>(n), events_.end()};
 }
 
 void ProcessPipelineControl::push_log(std::string line) {
@@ -434,7 +526,12 @@ bool ProcessPipelineControl::set_param(const std::string& key, const std::string
   }
   cfg_ = next;
   stop();
-  return spawn(err);
+  if (!spawn(err)) return false;
+  emit_local_event("pipeline.restart", json{{"reason", "config_change"},
+                                            {"key", key},
+                                            {"value", value},
+                                            {"pid", pid_.load()}});
+  return true;
 }
 
 bool ProcessPipelineControl::inject_fault(const std::string& kind, double value, std::string& err) {
@@ -447,13 +544,22 @@ bool ProcessPipelineControl::inject_fault(const std::string& kind, double value,
     return false;
   }
   if (std::fabs(cfg_.inject_drop - value) < 1e-9) return true;  // 幂等：注入值没变不重启
+  const bool clearing = value <= 0.0;
   cfg_.inject_drop = value;
   stop();
-  return spawn(err);
+  if (!spawn(err)) return false;
+  emit_local_event("pipeline.restart", json{{"reason", "fault_change"}, {"pid", pid_.load()}});
+  // 施加故障由 cued 自己报（fault.applied，scope=cued_start）；取消故障 cued 侧无从得知
+  // （它只是以 inject_drop=0 启动），所以 cleared 只能由控制面补上。
+  if (clearing) {
+    emit_local_event("fault.cleared",
+                     json{{"kind", kind}, {"value", value}, {"pid", pid_.load()}});
+  }
+  return true;
 }
 
 std::string ProcessPipelineControl::observation(const std::string& source, int tail, std::string& err) const {
-  if (source != "logs" && source != "procs" && source != "frames") {
+  if (source != "logs" && source != "procs" && source != "frames" && source != "events") {
     err = "unsupported source: " + source;
     return {};
   }
@@ -466,6 +572,16 @@ std::string ProcessPipelineControl::observation(const std::string& source, int t
     oss << "cued pid=" << pid << " running=" << (pid != 0 ? "true" : "false")
         << " restarts=" << restarts_ << " transcode=" << (cfg_.transcode ? "on" : "off")
         << " bitrate=" << cfg_.bitrate_kbps << "kbps gop=" << cfg_.gop;
+    return oss.str();
+  }
+  if (source == "events") {
+    if (events_.empty()) return {};
+    const std::size_t want = static_cast<std::size_t>(tail <= 0 ? 20 : tail);
+    const std::size_t n = std::min(want, events_.size());
+    for (std::size_t i = events_.size() - n; i < events_.size(); ++i) {
+      const auto& e = events_[i];
+      oss << "ev=" << e.type << " t_us=" << e.t_us << " data=" << e.data.dump() << '\n';
+    }
     return oss.str();
   }
   if (source == "frames") {

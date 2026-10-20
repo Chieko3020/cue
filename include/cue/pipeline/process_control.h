@@ -11,13 +11,26 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace cue::pipeline {
+
+// 一条事件：cued stdout 里的 [cue-event] 行，或 harness 自己合成的控制面事件。
+// data 原样保留（不同 ev 的字段不同，消费者按键取），t_us 是事件时间（unix us），
+// seen_us 是本进程读到它的单调时钟时刻——两者口径不同，跨进程比较只能用 seen_us。
+struct PipelineEvent {
+  std::string type;
+  nlohmann::json data = nlohmann::json::object();
+  int64_t t_us = 0;
+  int64_t seen_us = 0;
+};
 
 struct PipelineMetrics {
   double fps = 0;
@@ -58,6 +71,10 @@ class ProcessPipelineControl {
     uint64_t inject_seed = 42;
     bool fec = true;
     double send_mbps = 10.0;
+    // cued stdout 的 [cue-event] 行回调（SSE / 前端 / 评测消费事件用）。
+    // 在 reader 线程里调用：不要在里面阻塞，也不要调本类的阻塞方法（latest() 可以）。
+    // 构造后修改无效——需要换回调用 set_event_callback()。
+    std::function<void(const PipelineEvent&)> on_event;
   };
 
   explicit ProcessPipelineControl(Config cfg);
@@ -72,6 +89,13 @@ class ProcessPipelineControl {
   // 返回最近一次统计（无样本时 samples=0，alive 表示 cued 当下是否还活着）
   PipelineMetrics latest() const;
 
+  // 换事件回调（与 Config::on_event 等价，构造后也能改）。
+  void set_event_callback(std::function<void(const PipelineEvent&)> cb);
+
+  // 最近的事件（n=0 表示缓存里的全部；缓存上限见 kEventMax）。
+  // 事件缓存与 on_event 是同一份数据：解析到就入缓存，再回调。
+  std::vector<PipelineEvent> recent_events(std::size_t n = 0) const;
+
   // key ∈ bitrate_kbps / gop / preset / transcode / width / height；通过重启生效
   // width/height 必须成对给出且为偶数，0/0 表示沿用解码尺寸
   bool set_param(const std::string& key, const std::string& value, std::string& err);
@@ -85,6 +109,9 @@ class ProcessPipelineControl {
   bool spawn_locked(std::string& err); // 内部：调用方已持 spawn_mu_
   void reader_loop();
   void parse_line(const std::string& line);
+  void parse_event_line(const std::string& body);           // 已去掉事件标签的 JSON 体
+  void emit_local_event(std::string type, nlohmann::json data);  // harness 合成的事件
+  void record_event(PipelineEvent ev);  // 入缓存（最近 kEventMax 条）后回调
   void supervisor_loop();
   void push_log(std::string line);         // 内部持 mu_
   void push_log_locked(std::string line);  // 调用方已持 mu_
@@ -94,6 +121,8 @@ class ProcessPipelineControl {
   mutable std::mutex spawn_mu_;  // 串行化 spawn/stop（工具调用 vs 监督线程重启）
   PipelineMetrics metrics_;
   std::deque<std::string> log_tail_;  // #28：deque 头删 O(1)
+  std::deque<PipelineEvent> events_;   // 最近 kEventMax 条事件（observation/SSE 用）
+  std::function<void(const PipelineEvent&)> on_event_;  // 受 mu_ 保护
   int log_fd_ = -1;                   // 受 spawn_mu_ 保护；reader 线程只读
   std::atomic<pid_t> pid_{0};         // #26：所有访问都走原子量，不再无锁读写
   std::atomic<bool> stop_reader_{false};

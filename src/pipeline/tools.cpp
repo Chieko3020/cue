@@ -149,7 +149,7 @@ void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::ve
                                      .type = "string",
                                      .desc = "来源",
                                      .required = true,
-                                     .enum_values = {"logs", "procs", "frames"}},
+                                     .enum_values = {"logs", "procs", "frames", "events"}},
                                     {.name = "tail",
                                      .type = "integer",
                                      .desc = "日志行数",
