@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "cue/common/clock.h"
+
 namespace cue::pipeline {
 
 using json = nlohmann::json;
@@ -14,6 +16,41 @@ tool::ToolResult record(std::vector<ToolTrace>* trace, const char* name, tool::T
   return r;
 }
 
+// data 只放"我看到了什么"（真实测量值），不放"我做了什么"（请求参数）。
+// 否则 agent 可以引用自己的动作当观测证据（review-eval.md #26）。
+// age_ms / samples 让 agent 能判断这条是不是 cued 重启前的旧指标（#27）。
+json metrics_json(const PipelineMetrics& m, int64_t now) {
+  const int64_t age_us = m.updated_us == 0 ? -1 : now - m.updated_us;
+  return json{{"fps", m.fps},
+              {"frames_in", m.frames_in},
+              {"frames_out", m.frames_out},
+              {"dropped", m.dropped},
+              {"injected", m.injected},
+              {"decoded", m.decoded},
+              {"decode_errors", m.decode_errors},
+              {"recv_p50_ms", m.recv_p50},
+              {"buffer_p50_ms", m.buffer_p50},
+              {"decode_p50_ms", m.decode_p50},
+              {"decode_p99_ms", m.decode_p99},
+              {"op_p50_ms", m.op_p50},
+              {"op_p99_ms", m.op_p99},
+              {"send_p50_ms", m.send_p50},
+              {"samples", m.samples},
+              {"age_ms", age_us < 0 ? -1 : age_us / 1000}};
+}
+
+// 动作类工具的返回：动作写进 text，data 只带动作之后重新测到的指标
+tool::ToolResult action_result(std::vector<ToolTrace>* trace, const char* name, const std::string& text,
+                               ProcessPipelineControl& pipe) {
+  const auto m = pipe.latest();
+  if (m.samples == 0) {
+    return record(trace, name,
+                  tool::ToolResult{true, text + "（暂无媒体流采样）", json{{"samples", 0}}});
+  }
+  auto j = metrics_json(m, now_us());
+  return record(trace, name, tool::ToolResult{true, text + " 最新观测: " + j.dump(), j});
+}
+
 }  // namespace
 
 const char* real_ops_system_prompt() {
@@ -24,7 +61,8 @@ const char* real_ops_system_prompt() {
          "若要取消已有的丢包注入，用 inject_fault 且 value=0。"
          "diagnose 阶段提交 evidence 时，每条只从某次工具返回里逐字摘抄 key=value 片段"
          "（例如 injected=59、fps=30.3、decode_p99_ms=3.199），最多 4 条；"
-         "不要写解释性句子，也不要把多次观测合并成一条——判分会逐条校验。";
+         "严格禁止解释性文字、中文句子、根因说明或把多次观测合并成一条——"
+         "判分会逐条校验：只要出现引用之外的文字，该条证据即判伪。";
 }
 
 void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::vector<ToolTrace>* trace) {
@@ -45,20 +83,7 @@ void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::ve
               return record(trace, "query_metrics",
                             tool::ToolResult{false, "尚无采样（cued 未收到媒体流）", json::object()});
             }
-            json j{{"fps", m.fps},
-                   {"frames_in", m.frames_in},
-                   {"frames_out", m.frames_out},
-                   {"dropped", m.dropped},
-                   {"injected", m.injected},
-                   {"decoded", m.decoded},
-                   {"decode_errors", m.decode_errors},
-                   {"recv_p50_ms", m.recv_p50},
-                   {"buffer_p50_ms", m.buffer_p50},
-                   {"decode_p50_ms", m.decode_p50},
-                   {"decode_p99_ms", m.decode_p99},
-                   {"op_p50_ms", m.op_p50},
-                   {"op_p99_ms", m.op_p99},
-                   {"send_p50_ms", m.send_p50}};
+            const json j = metrics_json(m, now_us());
             return record(trace, "query_metrics", tool::ToolResult{true, "metrics=" + j.dump(), j});
           });
 
@@ -86,8 +111,8 @@ void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::ve
               return record(trace, "pipeline_set_param",
                             tool::ToolResult{false, "设置失败: " + err, json::object()});
             }
-            return record(trace, "pipeline_set_param",
-                          tool::ToolResult{true, "已设置 " + k + "=" + v + "（管线已重启）", a});
+            return action_result(trace, "pipeline_set_param",
+                                 "已设置 " + k + "=" + v + "（管线已重启）", pipe);
           });
 
   reg.add(tool::ToolSpec{.name = "inject_fault",
@@ -113,8 +138,8 @@ void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::ve
             if (!pipe.inject_fault(k, v, err)) {
               return record(trace, "inject_fault", tool::ToolResult{false, "注入失败: " + err, json::object()});
             }
-            return record(trace, "inject_fault",
-                          tool::ToolResult{true, "已注入 " + k + "=" + std::to_string(v) + "%", a});
+            return action_result(trace, "inject_fault", "已注入 " + k + "=" + std::to_string(v) + "%",
+                                 pipe);
           });
 
   reg.add(tool::ToolSpec{.name = "fetch_observation",
@@ -139,7 +164,9 @@ void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::ve
             const int tail = a.contains("tail") ? a["tail"].get<int>() : 20;
             const std::string obs = pipe.observation(src, tail, err);
             if (!err.empty()) return record(trace, "fetch_observation", tool::ToolResult{false, err, json::object()});
-            return record(trace, "fetch_observation", tool::ToolResult{true, obs, json{{"source", src}}});
+            // data 只带真实读数；source 是请求参数，放 text 里就够
+            return record(trace, "fetch_observation",
+                          tool::ToolResult{true, obs, json::object()});
           });
 }
 
