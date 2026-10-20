@@ -1,0 +1,35 @@
+{
+  "suite": "m4-diagnosis",
+  "version": 1,
+  "note": "M4 的 agent 可诊断集：根因全部落在 SPEC §7.6 的 8 类枚举内（m2-constraints 里的 fec_ghost_frame 不在枚举内，只能人工复现）。SLA 阈值取自 M2 实测：5% 丢包 + FEC/NACK 时帧完成率 97.7%~100%，30fps 对应 ~29fps；dropped 是 cued 的累计「未完成帧」计数，20s 窗口内 5% 丢包约 10~15。",
+  "cases": [
+    {
+      "id": "netloss-5pct",
+      "seed": 42,
+      "fault": { "kind": "drop", "params": { "inject_drop_pct": 5 } },
+      "pipeline": { "bitrate_kbps": 1500, "gop": 60 },
+      "prompt": "下行链路出现异常：服务端出帧率下降、累计丢帧上升。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
+      "expect": {
+        "root_cause": "network_loss",
+        "evidence_candidates": ["injected", "dropped", "fps"],
+        "allowed_actions": ["inject_fault", "pipeline_set_param", "query_metrics", "fetch_observation"],
+        "sla": { "fps_min": 25, "dropped_max": 30 }
+      },
+      "budget": { "max_turns": 12, "max_yuan": 0.3, "max_wall_s": 180 }
+    },
+    {
+      "id": "netloss-10pct-gop30",
+      "seed": 7,
+      "fault": { "kind": "drop", "params": { "inject_drop_pct": 10 } },
+      "pipeline": { "bitrate_kbps": 800, "gop": 30 },
+      "prompt": "下行链路时好时坏，帧率明显低于 30。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 20 以上。",
+      "expect": {
+        "root_cause": "network_loss",
+        "evidence_candidates": ["injected", "dropped", "fps"],
+        "allowed_actions": ["inject_fault", "pipeline_set_param", "query_metrics", "fetch_observation"],
+        "sla": { "fps_min": 20, "dropped_max": 60 }
+      },
+      "budget": { "max_turns": 12, "max_yuan": 0.3, "max_wall_s": 180 }
+    }
+  ]
+}
