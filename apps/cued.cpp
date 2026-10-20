@@ -16,12 +16,18 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <span>
 #include <map>
 #include <string>
 #include <string_view>
 #include <vector>
 
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 #include "cue/common/clock.h"
+#include "cue/media/encoder.h"
 #include "cue/media/h264_decoder.h"
 #include "cue/proto/wire.h"
 
@@ -56,6 +62,29 @@ class Ring {
   static constexpr std::size_t kCap = 4096;
   std::vector<int64_t> buf_;
   std::size_t head_ = 0;
+};
+
+// 令牌桶：按字节计费（SPEC §7.2 的每会话限速）
+class TokenBucket {
+ public:
+  TokenBucket(double bits_per_sec, double burst_bytes)
+      : rate_bytes_(bits_per_sec / 8.0), burst_(burst_bytes), tokens_(burst_bytes) {}
+
+  bool take(std::size_t bytes, int64_t now_us) {
+    if (last_us_ == 0) last_us_ = now_us;
+    const double dt = double(now_us - last_us_) / 1e6;
+    last_us_ = now_us;
+    tokens_ = std::min(burst_, tokens_ + dt * rate_bytes_);
+    if (tokens_ < double(bytes)) return false;
+    tokens_ -= double(bytes);
+    return true;
+  }
+
+ private:
+  double rate_bytes_;
+  double burst_;
+  double tokens_;
+  int64_t last_us_ = 0;
 };
 
 struct FrameAcc {
@@ -119,6 +148,15 @@ int main(int argc, char** argv) {
   std::string probe_host = "127.0.0.1";
   uint16_t probe_port = 9001;
 
+  bool transcode_enabled = false;
+  int out_w = 0;
+  int out_h = 0;
+  int out_kbps = 1500;
+  int out_fps = 30;
+  int out_gop = 60;
+  std::string preset = "veryfast";
+  double send_mbps = 10.0;
+
   for (int i = 1; i < argc; ++i) {
     std::string_view a = argv[i];
     auto next = [&]() -> std::string {
@@ -127,6 +165,14 @@ int main(int argc, char** argv) {
     if (a == "--ws-port") ws_port = static_cast<uint16_t>(std::stoi(next()));
     else if (a == "--probe-host") probe_host = next();
     else if (a == "--probe-port") probe_port = static_cast<uint16_t>(std::stoi(next()));
+    else if (a == "--transcode") transcode_enabled = (next() == "on");
+    else if (a == "--width") out_w = std::stoi(next());
+    else if (a == "--height") out_h = std::stoi(next());
+    else if (a == "--bitrate") out_kbps = std::stoi(next());
+    else if (a == "--fps") out_fps = std::stoi(next());
+    else if (a == "--gop") out_gop = std::stoi(next());
+    else if (a == "--preset") preset = next();
+    else if (a == "--send-mbps") send_mbps = std::stod(next());
     else if (a == "--help") {
       std::printf("cued --ws-port 9000 --probe-host 127.0.0.1 --probe-port 9001\n");
       return 0;
@@ -141,6 +187,10 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+
+  cue::media::TranscodeChain chain;
+  bool chain_ready = false;
+  TokenBucket bucket(send_mbps * 1e6, send_mbps * 1e6 / 8.0 * 0.05);
 
   net::io_context ioc;
   beast::error_code ec;
@@ -244,27 +294,61 @@ int main(int argc, char** argv) {
 
       const int64_t t_dec0 = cue::now_us();
       std::string derr;
-      auto info = decoder.decode(frame, derr);
+      AVFrame* decoded = decoder.decode(frame, derr);
       rings[2].push(cue::now_us() - t_dec0);
-      if (info) {
+      if (decoded) {
         ++c.frames_decoded;
       } else if (!derr.empty()) {
         ++c.decode_errors;
       }
 
       const int64_t t_op0 = cue::now_us();
-      rings[3].push(cue::now_us() - t_op0);
+      std::vector<uint8_t> encoded_buf;
+      std::span<const uint8_t> payload{frame};
+      bool keyframe = fa.keyframe;
+      bool skip_send = false;
 
+      if (transcode_enabled && decoded) {
+        if (!chain_ready) {
+          const int dw = out_w > 0 ? out_w : decoded->width;
+          const int dh = out_h > 0 ? out_h : decoded->height;
+          std::string cerr;
+          if (chain.configure(dw, dh, out_kbps, out_fps, out_gop, preset, cerr)) {
+            chain_ready = true;
+            std::fprintf(stderr, "[cued] transcode on: %dx%d %dkbps gop=%d preset=%s\n", dw, dh,
+                         out_kbps, out_gop, preset.c_str());
+          } else {
+            transcode_enabled = false;
+            std::fprintf(stderr, "[cued] transcode configure failed: %s\n", cerr.c_str());
+          }
+        }
+        if (chain_ready) {
+          std::string eerr;
+          auto enc = chain.process(decoded, fa.pts_us, eerr);
+          if (enc) {
+            encoded_buf = std::move(enc->data);
+            payload = encoded_buf;
+            keyframe = enc->keyframe;
+          } else {
+            skip_send = true;
+          }
+        }
+      }
+      rings[3].push(cue::now_us() - t_op0);
       rings[4].push(0);
 
       const int64_t t_send0 = cue::now_us();
-      auto datagrams =
-          cue::proto::split_into_datagrams(frame, session_id, h->frame_id, fa.pts_us, fa.keyframe);
-      if (datagrams.empty()) {
+      if (skip_send || !bucket.take(payload.size(), t_send0)) {
         ++c.frames_dropped;
       } else {
-        for (auto& d : datagrams) usock.send_to(net::buffer(d), probe_ep, 0, ec);
-        ++c.frames_out;
+        auto datagrams =
+            cue::proto::split_into_datagrams(payload, session_id, h->frame_id, fa.pts_us, keyframe);
+        if (datagrams.empty()) {
+          ++c.frames_dropped;
+        } else {
+          for (auto& d : datagrams) usock.send_to(net::buffer(d), probe_ep, 0, ec);
+          ++c.frames_out;
+        }
       }
       rings[5].push(cue::now_us() - t_send0);
 

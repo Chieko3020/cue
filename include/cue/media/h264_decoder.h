@@ -9,8 +9,8 @@
 #include <string>
 
 struct AVCodecContext;
-struct AVFrame;
 struct AVPacket;
+struct AVFrame;  // FFmpeg 的 typedef struct AVFrame AVFrame，前向声明即可
 
 namespace cue::media {
 
@@ -32,8 +32,8 @@ class H264Decoder {
   void close();
   bool is_open() const { return ctx_ != nullptr; }
 
-  // 喂一帧 Annex-B 数据；返回解码出的最后一张帧的信息（可能为 nullopt：需要更多数据或不产生输出）
-  std::optional<DecodedFrameInfo> decode(std::span<const uint8_t> frame, std::string& err);
+  // 喂一帧 Annex-B 数据；返回解码出的最后一张帧（借用指针，下次 decode 前有效；nullptr 表示无输出）
+  AVFrame* decode(std::span<const uint8_t> frame, std::string& err);
 
   // 累计统计
   struct Stats {
@@ -47,6 +47,7 @@ class H264Decoder {
  private:
   AVCodecContext* ctx_ = nullptr;
   AVFrame* frame_ = nullptr;
+  AVFrame* last_ = nullptr;
   AVPacket* pkt_ = nullptr;
   Stats stats_;
   bool flushed_ = false;

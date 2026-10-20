@@ -14,14 +14,14 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 find_package(Threads REQUIRED)
 find_package(Boost 1.83 REQUIRED COMPONENTS system)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavutil libswscale)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavutil libswscale x264)
 
 # ---- proto：纯头文件，编解码规则集中在一处 ----
 add_library(cue_proto INTERFACE)
 target_include_directories(cue_proto INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ---- cued：媒体管线（WS 接收 → 重组 → UDP 发送）----
-add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp)
+add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp)
 target_link_libraries(cued PRIVATE cue_proto Boost::system Threads::Threads PkgConfig::FFMPEG)
 target_include_directories(cued PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)

@@ -32,8 +32,9 @@ bool H264Decoder::open(std::string& err) {
     return false;
   }
   frame_ = av_frame_alloc();
+  last_ = av_frame_alloc();
   pkt_ = av_packet_alloc();
-  if (!frame_ || !pkt_) {
+  if (!frame_ || !last_ || !pkt_) {
     err = "av_frame_alloc/av_packet_alloc failed";
     close();
     return false;
@@ -43,18 +44,19 @@ bool H264Decoder::open(std::string& err) {
 
 void H264Decoder::close() {
   if (pkt_) av_packet_free(&pkt_);
+  if (last_) av_frame_free(&last_);
   if (frame_) av_frame_free(&frame_);
   if (ctx_) avcodec_free_context(&ctx_);
 }
 
-std::optional<DecodedFrameInfo> H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
-  if (!ctx_ || data.empty()) return std::nullopt;
+AVFrame* H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
+  if (!ctx_ || data.empty()) return nullptr;
 
   av_packet_unref(pkt_);
   if (av_new_packet(pkt_, static_cast<int>(data.size())) < 0) {
     err = "av_new_packet failed";
     ++stats_.errors;
-    return std::nullopt;
+    return nullptr;
   }
   std::memcpy(pkt_->data, data.data(), data.size());
   pkt_->pts = AV_NOPTS_VALUE;
@@ -63,11 +65,11 @@ std::optional<DecodedFrameInfo> H264Decoder::decode(std::span<const uint8_t> dat
   if (ret < 0 && ret != AVERROR(EAGAIN)) {
     ++stats_.errors;
     err = "send_packet failed: " + std::to_string(ret);
-    return std::nullopt;
+    return nullptr;
   }
   ++stats_.packets;
 
-  std::optional<DecodedFrameInfo> last;
+  bool got = false;
   for (;;) {
     ret = avcodec_receive_frame(ctx_, frame_);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
@@ -77,10 +79,13 @@ std::optional<DecodedFrameInfo> H264Decoder::decode(std::span<const uint8_t> dat
       break;
     }
     ++stats_.frames;
-    last = DecodedFrameInfo{frame_->width, frame_->height, static_cast<int>(frame_->format), frame_->pts};
-    av_frame_unref(frame_);
+    // 低延迟模式下一次 send 通常只产出 0~1 帧；若产出多帧只保留最后一帧
+    if (got) av_frame_unref(last_);
+    av_frame_move_ref(last_, frame_);
+    got = true;
   }
-  return last;
+  if (!got) return nullptr;
+  return last_;
 }
 
 }  // namespace cue::media
