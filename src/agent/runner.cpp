@@ -235,6 +235,17 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       break;
     }
 
+    if (resp->truncated) {
+      // finish_reason=length：输出被 max_tokens 截断，工具参数可能是半截 JSON（SPEC §7.9）。
+      // 不执行本轮的调用，回灌要求模型精简后重试（算一轮，受轮次预算约束）。
+      emit("llm.truncated", {{"turn", r.turns}, {"content_bytes", resp->content.size()}});
+      if (!resp->content.empty()) msgs.push_back(msg("assistant", resp->content));
+      msgs.push_back(msg("user", "上一次输出因 max_tokens 被截断（finish_reason=length），"
+                                "工具参数可能不完整而无法执行。请精简输出后重试："
+                                "一次只调用必要的工具，evidence 只摘抄关键片段。"));
+      continue;
+    }
+
     if (resp->tool_calls.empty()) {
       // 无工具调用不能推进状态（审查实测：verify 阶段模型说句"好了"就直接 done）。
       // 只算一轮无效轮次并把要求回灌，由模型自己决定下一步。

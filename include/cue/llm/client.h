@@ -3,6 +3,7 @@
 // - OpenAiCompatibleClient：真实调用（M3b 接入）
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -41,6 +42,9 @@ struct ChatRequest {
   double temperature = 0.0;
   // 1024 会在多工具/长证据时被截断（SPEC §7.9）。默认 2048，由 Runner::Config 覆盖。
   int max_tokens = 2048;
+  // 本次请求的硬超时（秒）；0 表示用客户端配置。Runner 用它把"剩余墙钟预算"传给 client，
+  // 避免单次 60 s 的 LLM 调用把整轮预算顶穿（SPEC §7.5 预算）。
+  int timeout_s = 0;
 };
 
 struct ChatResponse {
@@ -79,13 +83,25 @@ class OpenAiCompatibleClient : public ILlmClient {
     std::string api_key;
     std::string model;
     int timeout_s = 60;
+    // SPEC §7.9：重试仅对 429/5xx/网络错误，退避 200→800 ms，最多 2 次
+    int max_retries = 2;
+    // 响应体上限：异常端点不能把进程内存撑爆
+    std::size_t max_response_bytes = 8u * 1024u * 1024u;
   };
 
   explicit OpenAiCompatibleClient(Config cfg);
+  ~OpenAiCompatibleClient() override;
+  OpenAiCompatibleClient(const OpenAiCompatibleClient&) = delete;
+  OpenAiCompatibleClient& operator=(const OpenAiCompatibleClient&) = delete;
+  OpenAiCompatibleClient(OpenAiCompatibleClient&&) = delete;
+  OpenAiCompatibleClient& operator=(OpenAiCompatibleClient&&) = delete;
+
   std::expected<ChatResponse, std::string> chat(const ChatRequest& req) override;
 
  private:
+  struct Impl;  // CURL 句柄/头部复用（不把 libcurl 头暴露给调用方）
   Config cfg_;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace cue::llm
