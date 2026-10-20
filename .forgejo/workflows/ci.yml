@@ -1,0 +1,98 @@
+# Forgejo Actions（SPEC §9）：-Wall -Wextra -Wpedantic -Werror、GCC 14、ASan/UBSan/TSan 各一个 job。
+#
+# 约定：
+#   * 只依赖本机系统包（g++-14 / boost / nlohmann / ffmpeg+x264 / libcurl），不拉外部 CDN、不下载脚本；
+#   * 一律 -j1：本机 1.9 GiB 内存，-j2 编 libavcodec 相关 TU 会 OOM（见 docs 记录）；
+#   * 不上传任何产物（bench 数据与覆盖率日志留在 runner 本地）。
+#
+# 本地手动验证（本机没有注册 Forgejo runner 时）：逐条跑各 job 的 run: 命令即可，
+# 见 docs/research/m6-ci-bench.md 的「手跑验证」一节。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: build + ctest (g++-14, -Werror)
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链
+        run: |
+          set -eu
+          g++-14 --version | head -1
+          cmake --version | head -1
+          node --version
+
+      - name: 配置与构建（-j1 防 OOM）
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-ci -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-ci -j1 2>&1 | tee /tmp/cue-build.log
+          # 0 warning 是硬口径：构建日志里出现 "warning:" 就算失败
+          if grep -n "warning:" /tmp/cue-build.log; then
+            echo "::error::构建出现 warning（SPEC §9 要求 0 warning）"
+            exit 1
+          fi
+
+      - name: ctest
+        run: ctest --test-dir build-ci --output-on-failure
+
+  asan:
+    name: ASan+UBSan
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置（ASan+UBSan，自动关 -Werror）
+        run: cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCUE_SANITIZE=address,undefined
+
+      - name: 构建（-j1）
+        run: cmake --build build-asan -j1
+
+      - name: ctest（UBSan halt_on_error=1）
+        run: ctest --test-dir build-asan --output-on-failure
+
+  tsan:
+    name: TSan
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置（TSan 单独一个构建目录）
+        run: cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCUE_SANITIZE=thread
+
+      - name: 构建（-j1）
+        run: cmake --build build-tsan -j1
+
+      - name: ctest
+        run: ctest --test-dir build-tsan --output-on-failure
+
+  # 浏览器 e2e（M5 控制台）：需要 web/dist 与 playwright。缺任何一个都跳过而不是判失败——
+  # 它们的构建要联网装依赖，而本仓库 CI 的口径是「不依赖外部 CDN / 不拉外部包」。
+  e2e-console:
+    name: e2e-console（可选，缺依赖跳过）
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-e2e -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-e2e -j1
+
+      - name: 浏览器 e2e（缺 web/dist 或 playwright 则跳过）
+        run: |
+          set -eu
+          PW_NODE_MODULES="${PW_NODE_MODULES:-/tmp/pwtest/node_modules}"
+          if [ ! -d web/dist ] || [ ! -d "$PW_NODE_MODULES/playwright" ]; then
+            echo "缺少 web/dist 或 playwright（$PW_NODE_MODULES）→ 跳过 e2e-console"
+            exit 0
+          fi
+          NODE_PATH="$PW_NODE_MODULES" BUILD_DIR=build-e2e \
+            node scripts/e2e-console.cjs
