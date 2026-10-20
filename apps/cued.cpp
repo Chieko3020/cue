@@ -193,6 +193,9 @@ struct Counters {
   uint64_t rejected = 0;      // 协议边界拒绝（wire.h 的 validate_media 给出具体原因）
   uint64_t budget_drops = 0;  // 令牌桶不足丢的帧（先丢非关键帧）
   uint64_t send_errors = 0;   // sendto 失败的包（ENOBUFS/EMSGSIZE 不再被当成"已发送"）
+  uint64_t encode_errors = 0;  // 编码失败（尺寸/格式/编码器错误），不再混进"轻丢帧"
+  uint64_t encode_delays = 0;  // 编码器内部延迟：正常路径，无可发数据
+  uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
 };
 
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counters& c) {
@@ -212,15 +215,17 @@ const char* kStageNames[6] = {"recv", "buffer", "decode", "op", "encode", "send"
 void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, uint64_t& frames_prev) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
-  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu bkt=%llu serr=%llu dec=%llu "
-              "dec_err=%llu rej=%llu MB=%.2f",
+  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu bkt=%llu serr=%llu enc_err=%llu "
+              "dec=%llu dec_err=%llu dec_drop=%llu rej=%llu MB=%.2f",
               double(df) / dt, static_cast<unsigned long long>(c.frames_in),
               static_cast<unsigned long long>(c.frames_out), static_cast<unsigned long long>(c.frames_dropped),
               static_cast<unsigned long long>(c.injected_drops),
               static_cast<unsigned long long>(c.budget_drops),
               static_cast<unsigned long long>(c.send_errors),
+              static_cast<unsigned long long>(c.encode_errors),
               static_cast<unsigned long long>(c.frames_decoded),
               static_cast<unsigned long long>(c.decode_errors),
+              static_cast<unsigned long long>(c.decode_drops),
               static_cast<unsigned long long>(c.rejected),
               double(c.bytes_in) / (1024.0 * 1024.0));
   for (int i = 0; i < 6; ++i) {
@@ -245,7 +250,10 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
          {"decode_errors", c.decode_errors},
          {"rejected", c.rejected},
          {"budget_drops", c.budget_drops},
-         {"send_errors", c.send_errors}};
+         {"send_errors", c.send_errors},
+         {"encode_errors", c.encode_errors},
+         {"encode_delays", c.encode_delays},
+         {"decode_drops", c.decode_drops}};
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
       m[kStageNames[i]] = nullptr;
@@ -298,6 +306,7 @@ int main(int argc, char** argv) {
   int out_kbps = 1500;
   int out_fps = 30;
   int out_gop = 60;
+  int out_threads = 1;  // x264 线程数：2 vCPU 下默认 1，给解码与网络留核（review #33）
   std::string preset = "veryfast";
   double send_mbps = 10.0;
   double inject_drop = 0.0;
@@ -343,6 +352,8 @@ int main(int argc, char** argv) {
       out_fps = static_cast<int>(want_int(1, 240));
     } else if (a == "--gop") {
       out_gop = static_cast<int>(want_int(1, 600));
+    } else if (a == "--threads") {
+      out_threads = static_cast<int>(want_int(1, 16));
     } else if (a == "--preset") {
       const auto val = next();
       if (val.empty()) bad(val);
@@ -373,7 +384,7 @@ int main(int argc, char** argv) {
       std::printf(
           "cued --ws-port 9000 --probe-host 127.0.0.1 --probe-port 9001\n"
           "     [--transcode on|off] [--width N --height N] [--bitrate kbps] [--fps N]\n"
-          "     [--gop N] [--preset NAME] [--send-mbps F]\n"
+          "     [--gop N] [--preset NAME] [--threads N] [--send-mbps F]\n"
           "     [--inject-drop 0..100] [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n");
       return 0;
     } else {
@@ -531,6 +542,8 @@ int main(int argc, char** argv) {
       continue;
     }
     std::fprintf(stderr, "[cued] client connected\n");
+    // 新连接必须先丢参考帧：否则旧 SPS/PPS 与参考帧残留到下一个 IDR，表现为持续花屏（#30）
+    decoder.flush();
 
     std::map<uint32_t, FrameAcc> pending;
     Counters c;
@@ -561,6 +574,7 @@ int main(int argc, char** argv) {
         }
         // 报告同样不能挂在「帧完成」上：整帧持续丢尾片时 fps/丢帧仍要可见
         if (now_tick - t_last_report >= 1'000'000) {
+          c.decode_drops = decoder.stats().dropped;
           report(rings, c, now_tick, t_last_report, frames_prev);
         }
       }
@@ -653,7 +667,7 @@ int main(int argc, char** argv) {
           const int dw = out_w > 0 ? out_w : decoded->width;
           const int dh = out_h > 0 ? out_h : decoded->height;
           std::string cerr;
-          if (chain.configure(dw, dh, out_kbps, out_fps, out_gop, preset, cerr)) {
+          if (chain.configure(dw, dh, out_kbps, out_fps, out_gop, preset, cerr, out_threads)) {
             chain_ready = true;
             std::fprintf(stderr, "[cued] transcode on: %dx%d %dkbps gop=%d preset=%s\n", dw, dh,
                          out_kbps, out_gop, preset.c_str());
@@ -672,6 +686,15 @@ int main(int argc, char** argv) {
             keyframe = enc->keyframe;
           } else {
             skip_send = true;
+            if (enc.error() == cue::media::EncodeError::EncoderDelay) {
+              ++c.encode_delays;  // 编码器内部延迟：正常路径，不是配置错误
+            } else {
+              // 尺寸/格式/编码器错误过去混在 nullopt 里"指标轻微变差"，现在必须可见（review #31）
+              ++c.encode_errors;
+              err_log.log(cue::now_us(), std::string("编码失败[") +
+                                             cue::media::encode_error_name(enc.error()) + "]: " +
+                                             eerr);
+            }
           }
         }
       }

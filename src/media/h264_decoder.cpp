@@ -115,7 +115,6 @@ void H264Decoder::flush() {
   if (!ctx_) return;
   avcodec_flush_buffers(ctx_);
   if (last_) av_frame_unref(last_);
-  flushed_ = true;
   ++stats_.flushes;
 }
 

@@ -55,7 +55,6 @@ class H264Decoder {
   AVFrame* last_ = nullptr;
   AVPacket* pkt_ = nullptr;
   Stats stats_;
-  bool flushed_ = false;
 };
 
 }  // namespace cue::media

@@ -46,6 +46,7 @@ struct X264Encoder::Impl {
   int w = 0;
   int h = 0;
   int64_t frame_count = 0;
+  bool pic_in_alloced = false;  // #32：close() 只在真的 alloc 过时才 clean
 };
 
 X264Encoder::X264Encoder() : impl_(std::make_unique<Impl>()) {}
@@ -54,7 +55,7 @@ X264Encoder::~X264Encoder() { close(); }
 bool X264Encoder::is_open() const { return impl_ && impl_->enc != nullptr; }
 
 bool X264Encoder::open(int w, int h, int bitrate_kbps, int fps, int gop, std::string_view preset,
-                       std::string& err) {
+                       std::string& err, int threads) {
   close();
   if (w <= 0 || h <= 0 || w % 2 || h % 2) {
     err = "invalid dimensions (must be positive and even)";
@@ -81,10 +82,16 @@ bool X264Encoder::open(int w, int h, int bitrate_kbps, int fps, int gop, std::st
   im.param.i_keyint_max = gop > 0 ? gop : 60;
   im.param.i_keyint_min = 1;
   im.param.b_annexb = 1;  // 输出 Annex-B，与上行协议一致
-  im.param.i_threads = 1; // 2 vCPU：给解码与网络留核
+  im.param.i_threads = threads > 0 ? threads : 1;  // 2 vCPU 默认 1：给解码与网络留核
   im.param.b_vfr_input = 0;
   im.param.rc.i_lookahead = 0;
   im.param.i_bframe = 0;
+  // VBV（1 s 缓冲）：ABR 不禁突发，与「低延迟 + 10 Mbps 令牌桶」的实时语义不符。
+  // 开了 VBV 之后码率在 1 s 窗口内可控，下游令牌桶才有意义（review #33）。
+  const int kbps = im.param.rc.i_bitrate;
+  im.param.rc.i_vbv_max_bitrate = kbps;
+  im.param.rc.i_vbv_buffer_size = kbps;  // 单位 kbit → 1 s 缓冲
+  im.param.rc.f_vbv_buffer_init = 0.5;   // 初始只预灌半缓冲：低延迟优先
 
   if (x264_param_apply_profile(&im.param, "high") < 0) {
     err = "x264_param_apply_profile(high) failed";
@@ -100,6 +107,7 @@ bool X264Encoder::open(int w, int h, int bitrate_kbps, int fps, int gop, std::st
     close();
     return false;
   }
+  im.pic_in_alloced = true;
   return true;
 }
 
@@ -110,22 +118,34 @@ void X264Encoder::close() {
     x264_encoder_close(im.enc);
     im.enc = nullptr;
   }
-  x264_picture_clean(&im.pic_in);
+  if (im.pic_in_alloced) {  // 两次 close() 也安全，不依赖 x264_free(nullptr) 的实现细节
+    x264_picture_clean(&im.pic_in);
+    im.pic_in_alloced = false;
+  }
   im.pic_in = x264_picture_t{};
 }
 
-std::optional<EncodedResult> X264Encoder::encode(const AVFrame* frame, int64_t pts, std::string& err,
-                                                 int64_t* encode_ns) {
+std::expected<EncodedResult, EncodeError> X264Encoder::encode(const AVFrame* frame, int64_t pts,
+                                                             std::string& err, int64_t* encode_ns) {
   ElapsedWrite elapsed(encode_ns);
-  if (!is_open() || !frame) return std::nullopt;
+  if (!is_open()) {
+    err = "encoder not open";
+    return std::unexpected(EncodeError::NotOpen);
+  }
+  if (!frame) {
+    err = "null frame";
+    return std::unexpected(EncodeError::InvalidFrame);
+  }
   auto& im = *impl_;
   if (frame->width != im.w || frame->height != im.h) {
-    err = "frame size mismatch";
-    return std::nullopt;
+    err = "frame size mismatch: got " + std::to_string(frame->width) + "x" +
+          std::to_string(frame->height) + ", encoder is " + std::to_string(im.w) + "x" +
+          std::to_string(im.h);
+    return std::unexpected(EncodeError::SizeMismatch);
   }
   if (frame->format != AV_PIX_FMT_YUV420P) {
-    err = "frame format is not yuv420p";
-    return std::nullopt;
+    err = "frame format is not yuv420p (" + std::to_string(frame->format) + ")";
+    return std::unexpected(EncodeError::FormatMismatch);
   }
 
   for (int p = 0; p < 3; ++p) {
@@ -143,10 +163,11 @@ std::optional<EncodedResult> X264Encoder::encode(const AVFrame* frame, int64_t p
   int i_nals = 0;
   const int size = x264_encoder_encode(im.enc, &nals, &i_nals, &im.pic_in, &im.pic_out);
   if (size < 0) {
-    err = "x264_encoder_encode failed";
-    return std::nullopt;
+    err = "x264_encoder_encode failed: " + std::to_string(size);
+    return std::unexpected(EncodeError::EncodeFailed);
   }
-  if (size == 0 || i_nals <= 0) return std::nullopt;  // 编码器内部延迟，暂无可发数据
+  // 编码器内部延迟：此刻没有可发数据，是正常路径而不是配置错误
+  if (size == 0 || i_nals <= 0) return std::unexpected(EncodeError::EncoderDelay);
 
   EncodedResult r;
   r.keyframe = im.pic_out.b_keyframe != 0;
@@ -211,12 +232,12 @@ TranscodeChain::TranscodeChain() = default;
 TranscodeChain::~TranscodeChain() = default;
 
 bool TranscodeChain::configure(int dst_w, int dst_h, int bitrate_kbps, int fps, int gop,
-                               std::string_view preset, std::string& err) {
+                               std::string_view preset, std::string& err, int threads) {
   close();
   if (!scaler_) scaler_ = std::make_unique<Scaler>();
   dst_w_ = dst_w;
   dst_h_ = dst_h;
-  if (!encoder_.open(dst_w, dst_h, bitrate_kbps, fps, gop, preset, err)) return false;
+  if (!encoder_.open(dst_w, dst_h, bitrate_kbps, fps, gop, preset, err, threads)) return false;
   enabled_ = true;
   return true;
 }
@@ -227,19 +248,28 @@ void TranscodeChain::close() {
   if (scaler_) scaler_->reset();
 }
 
-std::optional<EncodedResult> TranscodeChain::process(const AVFrame* in, int64_t pts, std::string& err,
-                                                     int64_t* encode_ns) {
+std::expected<EncodedResult, EncodeError> TranscodeChain::process(const AVFrame* in, int64_t pts,
+                                                                 std::string& err, int64_t* encode_ns) {
   if (encode_ns) *encode_ns = 0;
-  if (!enabled_ || !in) return std::nullopt;
+  if (!enabled_) {
+    err = "transcode chain not configured";
+    return std::unexpected(EncodeError::NotOpen);
+  }
+  if (!in) {
+    err = "null frame";
+    return std::unexpected(EncodeError::InvalidFrame);
+  }
   if (!scaler_) scaler_ = std::make_unique<Scaler>();
 
   const AVFrame* src = in;
   if (in->width != dst_w_ || in->height != dst_h_ || in->format != AV_PIX_FMT_YUV420P) {
-    if (!scaler_->ensure(in->width, in->height, in->format, dst_w_, dst_h_, err)) return std::nullopt;
+    if (!scaler_->ensure(in->width, in->height, in->format, dst_w_, dst_h_, err)) {
+      return std::unexpected(EncodeError::ScaleFailed);
+    }
     if (sws_scale(scaler_->sws, in->data, in->linesize, 0, in->height, scaler_->dst->data,
                   scaler_->dst->linesize) <= 0) {
       err = "sws_scale failed";
-      return std::nullopt;
+      return std::unexpected(EncodeError::ScaleFailed);
     }
     src = scaler_->dst;
   }
