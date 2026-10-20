@@ -6,11 +6,11 @@
 #   ./scripts/run.sh demo-min     # 同上
 #   ./scripts/run.sh demo         # 构建后跑 <BUILD_DIR>/cue demo（脚本化 LLM，不联网、不花钱）
 #
-# 环境变量：BIND（静态页监听地址，默认 127.0.0.1）、WS_PORT、PROBE_PORT、HTTP_PORT、JOBS、
+# 环境变量：BIND（静态页与 cued 的监听地址，默认 127.0.0.1）、WS_PORT、PROBE_PORT、HTTP_PORT、JOBS、
 #           BUILD_DIR（构建目录，默认 build）、CXX（默认 g++-14，找不到时退回 g++）
 #
-# 安全口径（如实说明）：cued 目前没有 --bind 参数，WS 端口无条件 bind 0.0.0.0；
-# BIND 只作用于静态页。即 WS 端口（默认 9000）对可达网络开放，跨机演示请自行限制防火墙。
+# 安全口径（如实说明）：cued 有 --bind 参数，默认 127.0.0.1（仅本机）；
+# 本脚本把 BIND 同时传给静态页与 cued，跨机演示时 BIND=0.0.0.0 才会对可达网络开放。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -99,8 +99,8 @@ PROBE_PID=$!
 PIDS+=("$PROBE_PID")
 
 echo "[cue] cued   ws  :$WS_PORT  -> udp :$PROBE_PORT"
-echo "[cue] 注意：cued 无 --bind，WS :$WS_PORT 监听 0.0.0.0（BIND 仅作用于静态页）"
-"$BUILD_DIR/cued" --ws-port "$WS_PORT" --probe-port "$PROBE_PORT" &
+echo "[cue] cued bind $BIND  ws :$WS_PORT  udp :$PROBE_PORT"
+"$BUILD_DIR/cued" --ws-port "$WS_PORT" --probe-port "$PROBE_PORT" --bind "$BIND" &
 MEDIA_PID=$!
 PIDS+=("$MEDIA_PID")
 

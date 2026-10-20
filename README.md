@@ -80,7 +80,7 @@ ctest --test-dir build --output-on-failure     # 6 项，约 1 s
 
 > `run.sh` 只起媒体链路，不起 agent、不跑评测。脚本会把 URL 打印成 `http://127.0.0.1:8080/?ws_port=9000`，改过 `WS_PORT` 也能对上。
 >
-> **限制（如实说明）**：`cued` 目前没有 `--bind` 参数，WS 端口无条件监听 `0.0.0.0`；`BIND` 只改变静态页的监听地址。跨机演示时请用防火墙限制 9000/UDP 9001。
+> **监听地址**：`cued` 默认只监听 `127.0.0.1`（`--bind 0.0.0.0` 才对外）。`run.sh` 把 `BIND` 同时传给静态页与 cued，跨机演示时 `BIND=0.0.0.0 ./scripts/run.sh`，并自行用防火墙限制 9000/UDP 9001。
 
 agent 演示（脚本化 LLM，不联网、不花钱）：
 

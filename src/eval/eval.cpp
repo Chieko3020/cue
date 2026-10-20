@@ -143,7 +143,10 @@ bool residual_allowed(const std::string& word) {
       "ok",            "true",              "false",                "null",
       "cued",          "running",           "pid",                  "on",
       "off",           "ms",                "us",                   "s",
-      "pct",           "kbps",              "mbps",                 "fps"};
+      "pct",           "kbps",              "mbps",                 "fps",
+      // observation(frames) 在 M5 前置里新增的媒体元信息，agent 引用它们不算编造
+      "codec",         "sps",               "pps",                  "annexb",
+      "replayed",      "keyframe"};
   std::string lower;
   lower.reserve(word.size());
   for (char ch : word) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
