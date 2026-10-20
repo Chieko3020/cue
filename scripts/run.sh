@@ -75,7 +75,7 @@ done
 # CMake 不允许在已有 build 目录里原地更换编译器：缓存里若还是 g++（13），
 # 直接传 g++-14 只会在 configure 阶段报一堆"变量已改变"，看不懂。先给出可执行的处置。
 if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
-  CACHED_CXX="$(sed -n 's/^CMAKE_CXX_COMPILER:FILEPATH=//p' "$BUILD_DIR/CMakeCache.txt" | head -1)"
+  CACHED_CXX="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Za-z]*=//p' "$BUILD_DIR/CMakeCache.txt" | head -1)"
   if [[ -n "$CACHED_CXX" ]] && [[ "$(basename "$CACHED_CXX")" != "$(basename "$CXX")" ]]; then
     echo "[cue] $BUILD_DIR 是用 $CACHED_CXX 配置的，与 CXX=$CXX 不一致；" >&2
     echo "[cue] CMake 不能原地换编译器，请先 rm -rf $BUILD_DIR 再重跑，或 CXX=$CACHED_CXX ./scripts/run.sh" >&2
