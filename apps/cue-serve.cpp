@@ -386,7 +386,8 @@ class ConsoleApp {
       return {{"ok", false}, {"error", "请求体需要整数 id 与布尔 allow"}};
     }
     const uint64_t id = body["id"].get<uint64_t>();
-    const bool allow = body.value("allow", false);
+    // allow 必须是布尔：用 value() 在类型不符时会抛 type_error，把整个请求线程带走
+    const bool allow = body.contains("allow") && body["allow"].is_boolean() && body["allow"].get<bool>();
     if (!approvals_.decide(id, allow)) {
       status_code = 409;
       return {{"ok", false}, {"id", id}, {"allow", allow},
@@ -464,7 +465,8 @@ class ConsoleApp {
       else args = json::object();
     } else if (a == "set_param") {
       name = "pipeline_set_param";
-      const std::string key = body.value("key", std::string());
+      std::string key;
+      if (body.contains("key") && body["key"].is_string()) key = body["key"].get<std::string>();
       // 工具层 value 是 string（枚举/范围在工具内校验）；数字在入口处转字符串，
       // 不接受"数字原样塞进 string 参数"这种类型偷懒。
       std::string value;
@@ -479,7 +481,8 @@ class ConsoleApp {
       args = {{"key", key}, {"value", value}};
     } else if (a == "inject") {
       name = "inject_fault";
-      const std::string kind = body.value("kind", std::string("drop"));
+      std::string kind = "drop";
+      if (body.contains("kind") && body["kind"].is_string()) kind = body["kind"].get<std::string>();
       double value = 0;
       if (body.contains("value")) {
         const json& v = body["value"];
@@ -495,7 +498,9 @@ class ConsoleApp {
       args = {{"kind", kind}, {"value", value}};
     } else if (a == "observe") {
       name = "fetch_observation";
-      args = {{"source", body.value("source", std::string("procs"))}};
+      const std::string source =
+          body.contains("source") && body["source"].is_string() ? body["source"].get<std::string>() : "procs";
+      args = {{"source", source}};
       if (body.contains("tail")) args["tail"] = body["tail"];
     } else {
       return false;
@@ -792,7 +797,14 @@ class Server {
         serve_sse(*sp, req);
         break;  // SSE 是长连接，结束即断开
       }
-      const auto res = route(req);
+      // 请求体是外部输入：任何一格类型不符都不允许把进程带走（线程里抛 = std::terminate）
+      http::response<http::string_body> res;
+      try {
+        res = route(req);
+      } catch (const std::exception& e) {
+        res = json_res({{"ok", false}, {"error", std::string("内部错误：") + e.what()}}, req,
+                       http::status::internal_server_error);
+      }
       const bool keep = res.keep_alive();
       http::write(*sp, res, ec);
       if (ec || !keep) break;

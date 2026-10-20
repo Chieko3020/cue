@@ -79,6 +79,29 @@ function start(name, cmd, args, opts = {}) {
   return child;
 }
 
+
+// 直接读一段 SSE 流（用于验证 Last-Event-ID 补齐；浏览器页面之外的独立检查）
+async function readSse(headers, ms = 2500) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  let text = '';
+  try {
+    const res = await fetch(`${BASE}/events`, { headers, signal: ac.signal, cache: 'no-store' });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    while (text.length < 1500) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += dec.decode(value, { stream: true });
+    }
+    reader.cancel().catch(() => {});
+  } catch {
+    /* abort 是正常结束 */
+  }
+  clearTimeout(timer);
+  return text;
+}
+
 async function waitHttp(url, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -279,6 +302,41 @@ async function shutdown() {
   if (sseStatus !== 'live') fail(`SSE 状态是 ${sseStatus}，不是 live`);
   await page.screenshot({ path: path.join(SHOT_DIR, 'session.png'), fullPage: true });
 
+  // ---------------------------------------------------------------- 5b. Last-Event-ID 补齐
+  const st = await getState();
+  const lastId = (st.server && st.server.sse_last_id) || 0;
+  const from = Math.max(1, lastId - 3);
+  const replay = await readSse({ 'Last-Event-ID': String(from) });
+  if (!replay.includes(`"replayed_from":${from}`)) {
+    fail(`SSE Last-Event-ID 补齐没生效（期望 replayed_from=${from}）：${replay.slice(0, 200)}`);
+  } else {
+    const ids = [...replay.matchAll(/^id: (\d+)/gm)].map((m) => Number(m[1]));
+    if (!ids.some((n) => n > from)) fail(`补齐帧里没有 id > ${from}：${ids.join(',')}`);
+    else ok(`SSE Last-Event-ID 补齐生效（from=${from}，补发 ${ids.length} 帧）`);
+  }
+
+  // ---------------------------------------------------------------- 5c. 畸形请求不能把服务打挂
+  const bad = await page.evaluate(async () => {
+    const post = async (url, body) => {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: typeof body === 'string' ? body : JSON.stringify(body),
+      });
+      return { status: r.status, body: await r.json() };
+    };
+    return {
+      r1: await post('/api/action', { action: 'set_param', key: 123, value: {} }),
+      r2: await post('/api/action', { action: 'no-such-action' }),
+      r3: await post('/api/approve', '{"id":"x","allow":"y"}'),
+      health: await (await fetch('/api/health')).json(),
+    };
+  });
+  if (!bad.health.ok) fail('畸形请求之后 /api/health 不健康（服务被打挂了）');
+  else if (bad.r1.body.ok || bad.r2.body.ok || bad.r3.body.ok) {
+    fail(`畸形请求没有被拒绝：${JSON.stringify(bad).slice(0, 300)}`);
+  } else ok('畸形请求（类型错/未知 action/非布尔 allow）被拒绝且服务未崩溃');
+
   // ---------------------------------------------------------------- 6. 危险动作 → 审批 → 执行
   await page.click('[data-testid="tab-pipeline"]');
   await page.waitForSelector('[data-testid="ctl-inject"]');
@@ -313,12 +371,14 @@ async function shutdown() {
     if (s2.metrics && s2.metrics.pid) pipelinePid = s2.metrics.pid;
   }
 
-  // 执行结果也进了 SSE：会话页应有 tool.result 事件
+  // 执行结果也进了 SSE：会话页应有 status=executed 的 tool.result
+  // （注意列表里可能已有更早的 tool.result，比如畸形请求被拒的那条，所以按文本筛）
   await page.click('[data-testid="tab-session"]');
-  const toolResult = await page.waitForSelector('[data-testid="event-row"][data-ev="tool.result"]', { timeout: 10000 });
-  const trText = await toolResult.textContent();
-  if (!trText.includes('executed')) fail(`tool.result 事件里没有 executed：${trText}`);
-  else ok('SSE 上收到 tool.result（status=executed）');
+  const trText = await waitFor(async () => {
+    const texts = await page.locator('[data-testid="event-row"][data-ev="tool.result"]').allTextContents();
+    return texts.find((t) => t.includes('executed')) || null;
+  }, 10000, 'SSE 上出现 tool.result(status=executed)');
+  if (trText) ok('SSE 上收到 tool.result（status=executed）');
 
   // 管线页的结果面板也应该是"已执行"
   await page.click('[data-testid="tab-pipeline"]');
