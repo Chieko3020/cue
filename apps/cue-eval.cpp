@@ -43,7 +43,7 @@ int usage() {
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
       "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
       "\n"
-      "  --suite 必填（scripted 只是引擎自检，不会默认替用户选一个 suite）。\n"
+      "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
       "  real 模式需环境变量 CUE_API_KEY / CUE_BASE_URL，且需外部推流。\n"
       "  单价可用 CUE_YUAN_PER_MTOK 覆盖（估算，不是账单）。\n"
       "\n"
@@ -129,7 +129,6 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
 
   eval::RunConfig cfg;
-  cfg.suite_path.clear();
   std::string diff_a, diff_b;
   bool suite_set = false;
   bool mode_set = false;
@@ -228,10 +227,12 @@ int main(int argc, char** argv) {
                 cfg.agent_mode.c_str(), cfg.repeat);
   }
 
-  // scripted 只是引擎自检，不允许再"默认选一个 suite"糊出 100% 报告
   if (!suite_set && cfg.suite_path.empty()) {
-    std::fprintf(stderr, "缺 --suite：scripted 模式只是引擎自检，必须显式指定要跑的 suite\n");
-    return 2;
+    // 默认给诊断集（不是 m2 的 manual_only 集）：仍会打 scripted banner，
+    // 避免"没说跑哪个 suite"时拿一份不可判的集糊出 100%
+    cfg.suite_path = "suites/m4-diagnosis.json";
+    std::fprintf(stderr, "[eval] 未指定 --suite，使用默认 %s（scripted 只是引擎自检）\n",
+                 cfg.suite_path.c_str());
   }
 
   auto cases = eval::load_suite(cfg.suite_path);
