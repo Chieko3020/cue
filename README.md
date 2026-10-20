@@ -94,6 +94,19 @@ agent 演示（脚本化 LLM，不联网、不花钱）：
 ./build/cue-eval --suite suites/m4-diagnosis.json --mode scripted --repeat 1
 ```
 
+LLM 录制 / 回放（`real` 模式默认 `--replay`：只读 cassette，零网络、零 API 成本）：
+
+```bash
+# 回放：缺录制直接 run_error=cassette_miss，不会静默走网络
+./build/cue-eval --replay --suite suites/m4-diagnosis.json --cassette-dir cassettes
+# 真实调用并录制（需要 CUE_API_KEY；cassette 目录默认 cassettes/）
+./build/cue-eval --live --record --suite suites/m4-diagnosis.json
+# 不需要 key 的回放样例（假端点产的合成夹具）
+./build/cue demo --replay suites/cassettes/demo
+```
+
+cassette 每行 `{v:1, key, ts, model, request, response, usage}`，`key = sha256(model + messages + tools + temperature + max_tokens)`；`tool_call_id` 归一化、时间戳不进 key。回放时 `usage` 照抄录制值，成本统计可复现。真管线指标每次不同，跨轮回放需要在工具观测也可复现的环境里使用（见 `RECEIPT` 的限制说明）。
+
 链路自检（另开一个终端，在 `run.sh` 跑着的时候）：
 
 ```bash

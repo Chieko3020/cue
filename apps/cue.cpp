@@ -9,11 +9,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "cue/agent/agent.h"
+#include "cue/llm/cassette.h"
 #include "cue/pipeline/process_control.h"
 #include "cue/pipeline/tools.h"
 #include "cue/llm/client.h"
@@ -31,8 +33,11 @@ namespace {
 void print_usage() {
   std::printf(
       "usage:\n"
-      "  cue demo\n"
-      "      用脚本化 LLM 跑一次完整诊断（不联网、不花钱）\n"
+      "  cue demo [--http URL [--record DIR] | --replay DIR]\n"
+      "      脚本化 LLM 跑一次完整诊断（默认不联网、不花钱）。\n"
+      "      --http   改用 OpenAI 兼容端点（可指向假端点，用于录制 cassette）\n"
+      "      --record 把 --http 下每次成功调用录进 DIR（cassette）\n"
+      "      --replay 从 DIR 的 cassette 回放（不联网，miss 直接报错）\n"
       "  cue run [--goal TEXT] [--warmup S] [--model NAME] [--approval ask|auto|deny]\n"
       "          [--allow-dangerous NAMES|none] [--max-turns N] [--max-yuan Y] [--max-wall S]\n"
       "      接真实 LLM 对真实 cued 管线跑一次诊断（M3b 已接入）。\n"
@@ -271,12 +276,14 @@ struct ToolState {
   }
 };
 
-int run_demo() {
-  ToolState state;
-  tool::Registry reg;
-  state.build(reg);
+struct DemoOptions {
+  std::string http_base;   // 非空 = 走 OpenAI 兼容端点（可指向假端点）
+  std::string record_dir;  // 非空 = 把 --http 的成功调用录成 cassette
+  std::string replay_dir;  // 非空 = 用 CassetteClient 回放（不联网）
+};
 
-  llm::ScriptedClient client;
+// demo 的脚本序列。--http 时由同序列的假端点按序返回，因此录/放能与默认 demo 对照。
+std::vector<llm::ChatResponse> demo_script() {
   auto call = [](const char* id, const char* name, json args) {
     llm::ChatResponse r;
     llm::ToolCall tc;
@@ -287,17 +294,50 @@ int run_demo() {
     r.usage = {120, 30};
     return r;
   };
-  client.push(call("c1", "query_metrics", json{{"window_ms", 5000}}));
-  client.push(call("c2", "stage_complete", json{{"next", "diagnose"}}));
-  client.push(call("c3", "stage_complete",
-                   json{{"next", "repair"},
-                        {"root_cause", "network_loss"},
-                        {"evidence", {"nack_retransmit=42"}},
-                        {"confidence", 0.8}}));
-  client.push(call("c4", "pipeline_set_param", json{{"key", "bitrate_kbps"}, {"value", "800"}}));
-  client.push(call("c5", "stage_complete", json{{"next", "verify"}}));
-  client.push(call("c6", "query_metrics", json{{"window_ms", 5000}}));
-  client.push(call("c7", "stage_complete", json{{"next", "done"}}));
+  std::vector<llm::ChatResponse> script;
+  script.push_back(call("c1", "query_metrics", json{{"window_ms", 5000}}));
+  script.push_back(call("c2", "stage_complete", json{{"next", "diagnose"}}));
+  script.push_back(call("c3", "stage_complete",
+                        json{{"next", "repair"},
+                             {"root_cause", "network_loss"},
+                             {"evidence", {"nack_retransmit=42"}},
+                             {"confidence", 0.8}}));
+  script.push_back(call("c4", "pipeline_set_param", json{{"key", "bitrate_kbps"}, {"value", "800"}}));
+  script.push_back(call("c5", "stage_complete", json{{"next", "verify"}}));
+  script.push_back(call("c6", "query_metrics", json{{"window_ms", 5000}}));
+  script.push_back(call("c7", "stage_complete", json{{"next", "done"}}));
+  return script;
+}
+
+int run_demo(const DemoOptions& opt = {}) {
+  ToolState state;
+  tool::Registry reg;
+  state.build(reg);
+
+  std::unique_ptr<llm::ILlmClient> client;
+  llm::CassetteClient* replay = nullptr;
+  if (!opt.replay_dir.empty()) {
+    llm::CassetteClient::Config rc;
+    rc.dir = opt.replay_dir;
+    rc.default_model = "scripted";
+    auto c = std::make_unique<llm::CassetteClient>(rc);
+    replay = c.get();
+    client = std::move(c);
+  } else if (!opt.http_base.empty()) {
+    llm::OpenAiCompatibleClient::Config cc;
+    cc.base_url = opt.http_base;
+    const char* env_key = std::getenv("CUE_API_KEY");
+    cc.api_key = (env_key && *env_key) ? env_key : "test-key";
+    cc.model = "scripted";
+    cc.timeout_s = 15;
+    cc.max_retries = 0;
+    cc.record_dir = opt.record_dir;
+    client = std::make_unique<llm::OpenAiCompatibleClient>(cc);
+  } else {
+    auto scripted = std::make_unique<llm::ScriptedClient>();
+    for (auto& r : demo_script()) scripted->push(std::move(r));
+    client = std::move(scripted);
+  }
 
   agent::Runner::Config cfg;
   cfg.model = "scripted";
@@ -306,13 +346,22 @@ int run_demo() {
       "结论必须引用真实观测作为证据；每个阶段结束时调用 stage_complete。";
   cfg.ctx.mode = tool::ApprovalMode::Auto;
 
-  agent::Runner runner(client, reg, cfg);
+  agent::Runner runner(*client, reg, cfg);
   const auto res = runner.run("把下行端到端 p99 压到 120ms 以下", agent::Budget{}, print_event);
 
   print_result(res);
   std::printf("tools     : metrics=%d set_param=%d inject=%d\n", state.metrics_calls,
               state.set_param_calls, state.inject_calls);
   std::printf("verify    : %s\n", cfg.verify_sla ? "measured" : "model_claimed");
+  if (replay) {
+    const auto st = replay->stats();
+    std::printf("cassette  : replay dir=%s hits=%zu misses=%zu\n", opt.replay_dir.c_str(), st.hits,
+                st.misses);
+  } else if (!opt.http_base.empty()) {
+    std::printf("llm       : http=%s", opt.http_base.c_str());
+    if (!opt.record_dir.empty()) std::printf(" record=%s", opt.record_dir.c_str());
+    std::printf("\n");
+  }
   return res.ok() ? 0 : 1;
 }
 
@@ -412,18 +461,34 @@ int run_real(const RunOptions& o) {
 int main(int argc, char** argv) {
   const std::string cmd = argc > 1 ? argv[1] : "demo";
   if (cmd == "demo") {
-    if (argc > 2) {
-      for (int i = 2; i < argc; ++i) {
-        if (std::string(argv[i]) == "-h" || std::string(argv[i]) == "--help") {
-          print_usage();
-          return 0;
-        }
+    DemoOptions opt;
+    for (int i = 2; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "-h" || a == "--help") {
+        print_usage();
+        return 0;
       }
-      std::fprintf(stderr, "demo 不接受参数：%s\n", argv[2]);
-      print_usage();
+      if (a == "--http") {
+        if (!take_value(argc, argv, i, a, opt.http_base)) return 2;
+      } else if (a == "--record") {
+        if (!take_value(argc, argv, i, a, opt.record_dir)) return 2;
+      } else if (a == "--replay") {
+        if (!take_value(argc, argv, i, a, opt.replay_dir)) return 2;
+      } else {
+        std::fprintf(stderr, "demo 未知参数：%s\n", a.c_str());
+        print_usage();
+        return 2;
+      }
+    }
+    if (!opt.replay_dir.empty() && (!opt.http_base.empty() || !opt.record_dir.empty())) {
+      std::fprintf(stderr, "--replay 不能与 --http/--record 同时使用\n");
       return 2;
     }
-    return run_demo();
+    if (!opt.record_dir.empty() && opt.http_base.empty()) {
+      std::fprintf(stderr, "--record 需要 --http（ScriptedClient 不录）\n");
+      return 2;
+    }
+    return run_demo(opt);
   }
   if (cmd == "run") {
     RunOptions o;
