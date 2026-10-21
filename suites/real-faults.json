@@ -1,0 +1,204 @@
+{
+  "suite": "real-faults",
+  "version": 1,
+  "note": "AC-15 的真实故障复现集：5 类根因（全部落在 SPEC §7.6 的 8 类枚举内），每类一个 case，全部可从 cued 侧工具面（query_metrics / fetch_observation）诊断，不含任何前雇主代码/日志/数据/指标原值。阈值与数值都是本机实测（2 vCPU、g++-14 构建的 cued、30 fps 合成推流；每个 case 单独跑「故障态→修复态」，故障态读数取假 agent 那次真 query_metrics，修复态取 harness 重测的 final_fps，均为 3 次 repeat 的中位）：network_loss 上行丢包 50% → fps≈15.0（10 s 内逐秒 9.9~17.0）、injected 逐秒增长（4 s 时 63 个包）、dropped=0、frames_in==frames_out、budget_drops=0；inject_fault value=0 后 fps≈28.6。bandwidth_insufficient 发送上限 0.1 Mbps（720p@4000kbps）→ fps≈13.6、budget_drops=dropped=17、frames_in/out=122/105、encode_p50≈6.6 ms 正常；清除注入后 fps≈28.6。queue_backlog 发送节奏 12 帧/s → fps≈11.7、frames_in/out=59/24（积压深度单调增长）、dropped=budget_drops=0；清除注入后 fps≈28.6。encoder_too_slow 1600x900 + preset=placebo → encode_p50≈112 ms（帧预算 33 ms 的 3.4 倍）、op_p50≈0.46 ms（缩放几乎不耗时）、dropped=budget_drops=0、fps≈8.5；改 preset=ultrafast 后 fps≈28.5。resolution_too_high 输出 3840x2160 + veryfast（源 64x64 上采样）→ encode_p50≈55 ms、op_p50≈2.10 ms（缩放开销随输出像素线性增长，这是它与 preset 慢的区分点）、dropped=budget_drops=0、fps≈16.6；降到 1280x720 后 encode_p50≈6.3 ms、op_p50≈0.33 ms、fps≈28.7。五类统一 fps_min=25：故障态 8.5~16.6（低于阈值 ≥8.4 fps），修复态 28.5~28.7（高于阈值 ≥3.5 fps）。被淘汰的候选类（实测口径）：keyframe_storm —— 本机 x264 走 ABR+VBV，GOP 不改变平均码率，I 帧又不比 P 帧贵：gop=1 与 gop=60 的 encode_p50 相差 <10%（1080p 15.2 vs 14.4、1440p 26.5 vs 25.4、4K 60.8 vs 54.8 ms），budget_drops 恒为 0（10 Mbps 链路、20 Mbps 码率下也不丢），没有可校准的 SLA 信号；network_delay / clock_drift —— cued 侧没有对应可观测量：时延只体现在 probe 的端到端分位（工具面看不到），上行 PTS 只被透传给下游，不参与 cued 的任何计时。queue_backlog 与 bandwidth_insufficient 只有在限速策略被区分成『排队』与『丢包』后才可区分：前者 frames_in−frames_out 增长且 dropped/budget_drops 均为 0，后者 budget_drops 增长——不是同一类故障换名字。",
+  "cases": [
+    {
+      "id": "netloss-uplink-50pct",
+      "seed": 41,
+      "fault": {
+        "kind": "ingress_drop",
+        "params": {
+          "inject_ingress_pct": 50
+        }
+      },
+      "pipeline": {
+        "bitrate_kbps": 1500,
+        "gop": 60
+      },
+      "prompt": "上行链路是弱网：出帧率明显低于 30，注入计数在涨，但没有码控丢帧。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
+      "expect": {
+        "root_cause": "network_loss",
+        "evidence_candidates": [
+          "injected",
+          "fps"
+        ],
+        "allowed_actions": [
+          "inject_fault",
+          "pipeline_set_param",
+          "query_metrics",
+          "fetch_observation"
+        ],
+        "sla": {
+          "fps_min": 25
+        }
+      },
+      "budget": {
+        "max_turns": 16,
+        "max_yuan": 0.3,
+        "max_wall_s": 180
+      }
+    },
+    {
+      "id": "bw-starved-0p1mbps",
+      "seed": 42,
+      "fault": {
+        "kind": "rate",
+        "params": {
+          "rate_mbps": 0.1
+        }
+      },
+      "pipeline": {
+        "transcode": true,
+        "width": 1280,
+        "height": 720,
+        "bitrate_kbps": 4000,
+        "gop": 60
+      },
+      "prompt": "下行发送链路被限速：帧被成批丢弃，fps 掉到 15 以下，但编码耗时正常。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
+      "expect": {
+        "root_cause": "bandwidth_insufficient",
+        "evidence_candidates": [
+          "budget_drops",
+          "dropped",
+          "fps"
+        ],
+        "allowed_actions": [
+          "inject_fault",
+          "pipeline_set_param",
+          "query_metrics",
+          "fetch_observation"
+        ],
+        "sla": {
+          "fps_min": 25
+        }
+      },
+      "budget": {
+        "max_turns": 16,
+        "max_yuan": 0.3,
+        "max_wall_s": 180
+      }
+    },
+    {
+      "id": "queue-backlog-12fps",
+      "seed": 43,
+      "fault": {
+        "kind": "backlog",
+        "params": {
+          "queue_fps": 12
+        }
+      },
+      "pipeline": {
+        "transcode": true,
+        "width": 1280,
+        "height": 720,
+        "bitrate_kbps": 1500,
+        "gop": 60
+      },
+      "prompt": "消费端变慢：fps 掉到 15 以下，但没有任何丢帧或令牌桶丢包计数（积压体现在帧计数差上）。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
+      "expect": {
+        "root_cause": "queue_backlog",
+        "evidence_candidates": [
+          "frames_in",
+          "frames_out",
+          "dropped"
+        ],
+        "allowed_actions": [
+          "inject_fault",
+          "pipeline_set_param",
+          "query_metrics",
+          "fetch_observation"
+        ],
+        "sla": {
+          "fps_min": 25
+        }
+      },
+      "budget": {
+        "max_turns": 16,
+        "max_yuan": 0.3,
+        "max_wall_s": 180
+      }
+    },
+    {
+      "id": "enc-placebo-1600x900",
+      "seed": 44,
+      "fault": {
+        "kind": "none"
+      },
+      "pipeline": {
+        "transcode": true,
+        "width": 1600,
+        "height": 900,
+        "bitrate_kbps": 1500,
+        "gop": 60,
+        "preset": "placebo"
+      },
+      "repair": {
+        "preset": "ultrafast"
+      },
+      "prompt": "编码参数被改坏了：fps 掉到 15 以下，encode 段 p50 远超单帧预算 33 ms，但缩放（op）几乎不耗时、也没有丢帧。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
+      "expect": {
+        "root_cause": "encoder_too_slow",
+        "evidence_candidates": [
+          "encode_p50_ms",
+          "encode_p99_ms",
+          "fps"
+        ],
+        "allowed_actions": [
+          "pipeline_set_param",
+          "query_metrics",
+          "fetch_observation"
+        ],
+        "sla": {
+          "fps_min": 25
+        }
+      },
+      "budget": {
+        "max_turns": 16,
+        "max_yuan": 0.3,
+        "max_wall_s": 180
+      }
+    },
+    {
+      "id": "res-4k-veryfast",
+      "seed": 45,
+      "fault": {
+        "kind": "none"
+      },
+      "pipeline": {
+        "transcode": true,
+        "width": 3840,
+        "height": 2160,
+        "bitrate_kbps": 4000,
+        "gop": 60,
+        "preset": "veryfast"
+      },
+      "repair": {
+        "width": 1280,
+        "height": 720
+      },
+      "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
+      "expect": {
+        "root_cause": "resolution_too_high",
+        "evidence_candidates": [
+          "encode_p50_ms",
+          "op_p50_ms",
+          "fps"
+        ],
+        "allowed_actions": [
+          "pipeline_set_param",
+          "query_metrics",
+          "fetch_observation"
+        ],
+        "sla": {
+          "fps_min": 25
+        }
+      },
+      "budget": {
+        "max_turns": 16,
+        "max_yuan": 0.3,
+        "max_wall_s": 180
+      }
+    }
+  ]
+}
