@@ -107,7 +107,7 @@ ctest --test-dir build --output-on-failure
 ./scripts/run.sh demo
 ```
 
-它只构建 `cue` 一个 target，把完整诊断过程与结果写到 `runs/demo-<时间>.txt`，并在最后打印路径。干净 clone 首次运行（含 configure 与构建）实测 131 秒；只跑这一条时不需要先手动构建，脚本会自己 configure 并只编译 `cue`。
+它只构建 `cue` 一个 target，把完整诊断过程与结果写到 `runs/demo-<时间>.txt`，并在最后打印路径。干净 clone 首次运行（含 configure 与构建）实测 134 秒；只跑这一条时不需要先手动构建，脚本会自己 configure 并只编译 `cue`。
 
 ## 运行入口
 
