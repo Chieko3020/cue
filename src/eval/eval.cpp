@@ -23,6 +23,7 @@
 #include "cue/eval/state.h"
 #include "cue/llm/cassette.h"
 #include "cue/llm/client.h"
+#include "cue/pipeline/process_control.h"
 #include "cue/pipeline/tools.h"
 
 namespace cue::eval {

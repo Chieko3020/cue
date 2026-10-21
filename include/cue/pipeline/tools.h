@@ -1,4 +1,4 @@
-// 真实管线 → 工具层：把 ProcessPipelineControl 包装成 agent 可调用的工具。
+// 真实管线 → 工具层：把 IServicePipeline 包装成 agent 可调用的工具。
 // 单独放一层的理由（M4b）：`cue`（交互）与 `cue-eval`（评测）必须用**同一套**工具语义，
 // 否则「评测里 agent 能做的」和「交互里 agent 能做的」会分叉。
 //
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "cue/pipeline/process_control.h"
+#include "cue/pipeline/service_pipeline.h"
 #include "cue/tool/tool.h"
 
 namespace cue::pipeline {
@@ -33,6 +33,6 @@ nlohmann::json metrics_json(const PipelineMetrics& m, int64_t now_us);
 
 // 注册 4 个真实工具：query_metrics / pipeline_set_param / inject_fault / fetch_observation。
 // trace 可为空（交互模式不需要留痕）。
-void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::vector<ToolTrace>* trace);
+void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<ToolTrace>* trace);
 
 }  // namespace cue::pipeline

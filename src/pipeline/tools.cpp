@@ -55,7 +55,7 @@ tool::ToolResult record(std::vector<ToolTrace>* trace, const char* name, tool::T
 
 // 动作类工具的返回：动作写进 text，data 只带动作之后重新测到的指标
 tool::ToolResult action_result(std::vector<ToolTrace>* trace, const char* name, const std::string& text,
-                               ProcessPipelineControl& pipe) {
+                               IServicePipeline& pipe) {
   const auto m = pipe.latest();
   if (m.samples == 0) {
     return record(trace, name,
@@ -79,7 +79,7 @@ const char* real_ops_system_prompt() {
          "判分会逐条校验：只要出现引用之外的文字，该条证据即判伪。";
 }
 
-void build_real_tools(tool::Registry& reg, ProcessPipelineControl& pipe, std::vector<ToolTrace>* trace) {
+void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<ToolTrace>* trace) {
   reg.add(tool::ToolSpec{.name = "query_metrics",
                          .desc = "查询媒体管线指标（六段分位 + 帧统计，预聚合）",
                          .risk = tool::Risk::ReadOnly,
