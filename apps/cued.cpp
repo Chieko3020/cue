@@ -435,6 +435,13 @@ int main(int argc, char** argv) {
   std::string preset = "veryfast";
   double send_mbps = 10.0;
   double inject_drop = 0.0;
+  // 上行（浏览器 → cued）丢包：模拟上行链路的包丢失。与出向注入分开，是因为两者在
+  // cued 的指标上留下的是**不同**的证据（出向丢包只涨 injected；上行丢包还会让帧在
+  // 重组超时处被结算成 dropped，frames_out 因此掉下来）。
+  double inject_ingress_drop = 0.0;
+  // 发送侧排队：>0 时帧不立即发出，而是按这个节奏排空（丢包策略换成了排队）。
+  // 0 = 关（默认，保持 SPEC §7.2 的「令牌桶不足就丢」语义）。
+  double queue_fps = 0.0;
   uint64_t inject_seed = 42;
   std::string inject_trace;
   bool fec_enabled = true;
@@ -497,6 +504,12 @@ int main(int argc, char** argv) {
       // 旧实现用 stod + static_cast<uint64_t>，负数会变成巨大值（UB）
       const auto val = next();
       if (!parse_double(val, 0.0, 100.0, inject_drop)) bad(val);
+    } else if (a == "--inject-ingress-drop") {
+      const auto val = next();
+      if (!parse_double(val, 0.0, 100.0, inject_ingress_drop)) bad(val);
+    } else if (a == "--queue-fps") {
+      const auto val = next();
+      if (!parse_double(val, 0.0, 240.0, queue_fps)) bad(val);
     } else if (a == "--inject-seed") {
       const auto val = next();
       if (val.empty()) bad(val);
@@ -517,7 +530,8 @@ int main(int argc, char** argv) {
           "cued --ws-port 9000 [--bind 127.0.0.1] --probe-host 127.0.0.1 --probe-port 9001\n"
           "     [--transcode on|off] [--width N --height N] [--bitrate kbps] [--fps N]\n"
           "     [--gop N] [--preset NAME] [--threads N] [--send-mbps F]\n"
-          "     [--inject-drop 0..100] [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
+          "     [--inject-drop 0..100] [--inject-ingress-drop 0..100] [--queue-fps N]\n"
+          "     [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
           "  --bind 默认 127.0.0.1（只回环）；跨机演示才用 --bind 0.0.0.0，\n"
           "  并且必须自己限制网络可达性（cued 本身没有鉴权）。\n");
       return 0;
@@ -596,6 +610,9 @@ int main(int argc, char** argv) {
   probe_addr.sin_port = htons(probe_port);
   ::inet_pton(AF_INET, probe_host.c_str(), &probe_addr.sin_addr);
   const Injector injector(inject_seed, inject_drop);
+  // 上行注入用同一 seed 的派生值：两条链路的丢弃序列互不相关，但同一 (seed, pct)
+  // 仍然完全可复现（splitmix64 按包序号直接判定）。
+  const Injector ingress_injector(inject_seed ^ 0xD1B54A32D192ED03ULL, inject_ingress_drop);
   FILE* trace_fp = nullptr;
   if (!inject_trace.empty()) {
     trace_fp = std::fopen(inject_trace.c_str(), "w");
@@ -753,7 +770,45 @@ int main(int argc, char** argv) {
     // 旧口径 frame_id*64+pk 在 1080p 关键帧（>63 分片）时会与 FEC 包 / 下一帧撞号，
     // 丢包不再独立同分布；FEC 冗余包与数据包共用这一序号空间。
     uint64_t pkt_seq = 0;
+    // 上行注入用的包序号（独立空间）
+    uint64_t in_seq = 0;
     RateLimitedLog err_log;  // 每连接一份：重启 cued 后限流状态跟着新会话走
+
+    // 发送侧排队（--queue-fps）：不足「一帧的发送时刻」就留在队列里，而不是丢包。
+    // 队列深度对 agent 可见：frames_in（已收帧）减 frames_out（已发帧）就是积压深度，
+    // 这一点与令牌桶丢包（budget_drops 涨、深度不涨）是可区分的两种故障证据。
+    struct QueuedSend {
+      std::vector<std::vector<uint8_t>> datagrams;
+      int64_t due_us = 0;
+    };
+    std::deque<QueuedSend> sendq;
+    int64_t send_due_us = 0;
+    const double queue_period_us = queue_fps > 0.0 ? 1e6 / queue_fps : 0.0;
+    constexpr std::size_t kSendQueueMax = 8192;  // 兜底：队列不能无限涨（约 4.5 min @30fps）
+
+    // sendto 的返回值与 errno 不能丢：ENOBUFS/EMSGSIZE 会被算成「已发送」（review #16）
+    auto send_dgram = [&](const std::vector<uint8_t>& d) -> bool {
+      const ssize_t sn = ::sendto(usock, d.data(), d.size(), 0,
+                                  reinterpret_cast<const sockaddr*>(&probe_addr),
+                                  sizeof(probe_addr));
+      if (sn < 0) {
+        ++c.send_errors;
+        err_log.log(cue::now_us(), std::string("sendto 失败: ") + std::strerror(errno));
+        return false;
+      }
+      return true;
+    };
+    // 到期的排队帧按顺序发出；fps 因此由 --queue-fps 决定，而不是由「收到多少帧」决定
+    auto drain_sendq = [&](int64_t now_us) {
+      while (!sendq.empty() && sendq.front().due_us <= now_us) {
+        bool ok = true;
+        for (const auto& d : sendq.front().datagrams) {
+          if (!send_dgram(d)) ok = false;
+        }
+        if (ok) ++c.frames_out;
+        sendq.pop_front();
+      }
+    };
 
     for (;;) {
       beast::flat_buffer buf;
@@ -771,6 +826,7 @@ int main(int argc, char** argv) {
         }
         // 报告同样不能挂在「帧完成」上：整帧持续丢尾片时 fps/丢帧仍要可见
         if (now_tick - t_last_report >= 1'000'000) {
+          if (queue_period_us > 0.0) drain_sendq(now_tick);  // 报点前先把到期帧发出去
           c.decode_drops = decoder.stats().dropped;
           report(rings, c, now_tick, t_last_report, frames_prev);
         }
@@ -834,6 +890,14 @@ int main(int argc, char** argv) {
 
       session_id = h->stream_id;
       cur_session.store(session_id, std::memory_order_relaxed);
+      // 上行丢包注入：包在进入重组之前就丢了。单分片帧（本项目合成推流就是）整帧消失，
+      // frames_in/frames_out 都不计它，于是只有 fps 掉下来——dropped 保持 0；
+      // 多分片帧丢失非首片时会留在 pending 里，2 s 后由 cleanup_stale 结算成 dropped。
+      // 两种形状都只涨 injected，与出向注入（fps 不动）正好可以区分开。
+      if (ingress_injector.drop(in_seq++)) {
+        ++c.injected_drops;
+        continue;
+      }
       c.bytes_in += n;
       // frames_in 不再按 "frag_index==0" 计：首片丢失会少计、重复首片会多计。
       // 改成「帧完成或超时」时结算（review #35），与 probe 侧的 frames 口径一致。
@@ -962,32 +1026,21 @@ int main(int argc, char** argv) {
       } else {
         xmit_cache.put(h->frame_id, datagrams);
 
-        // sendto 的返回值与 errno 不能丢：ENOBUFS/EMSGSIZE 会被算成「已发送」（review #16）
-        auto send_dgram = [&](const std::vector<uint8_t>& d) -> bool {
-          const ssize_t sn = ::sendto(usock, d.data(), d.size(), 0,
-                                      reinterpret_cast<const sockaddr*>(&probe_addr),
-                                      sizeof(probe_addr));
-          if (sn < 0) {
-            ++c.send_errors;
-            err_log.log(cue::now_us(), std::string("sendto 失败: ") + std::strerror(errno));
-            return false;
-          }
-          return true;
-        };
-
         // 注入丢包：判定序号必须是整条连接全局单调、且与 FEC 包共用一个序号空间。
         // 旧口径 frame_id*64+pk 在分片数 >64（720p 关键帧）时会与 FEC 包撞号，
         // 且 frame_id*64+64 == (frame_id+1)*64 会跨帧撞号 → 丢包不再独立同分布。
-        bool all_sent = true;
+        // 注入在「进队之前」判定：排队模式换的是发送节奏，不是丢包策略。
+        std::vector<std::vector<uint8_t>> outgoing;
+        outgoing.reserve(datagrams.size() + 1);
         std::size_t pk = 0;
-        for (auto& d : datagrams) {
+        for (const auto& d : datagrams) {
           const std::size_t cur_pk = pk++;
           if (injector.drop(pkt_seq++)) {
             ++c.injected_drops;
             if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", h->frame_id, cur_pk);
             continue;
           }
-          if (!send_dgram(d)) all_sent = false;
+          outgoing.push_back(d);
         }
 
         // XOR-FEC：一帧的所有分片为一组，生成 1 个冗余包。
@@ -1020,12 +1073,31 @@ int main(int argc, char** argv) {
           const auto phb = cue::proto::encode(ph);
           fpkt.insert(fpkt.end(), phb.begin(), phb.end());
           fpkt.insert(fpkt.end(), parity.begin(), parity.end());
-          if (!injector.drop(pkt_seq++)) {
-            if (!send_dgram(fpkt)) all_sent = false;
-          }
+          if (!injector.drop(pkt_seq++)) outgoing.push_back(std::move(fpkt));
         }
-        // 真实上线率：只要有一包没被内核接受，这一帧就不算发出去（review #16）
-        if (all_sent) ++c.frames_out;
+
+        if (queue_period_us > 0.0) {
+          // 排队模式：帧不立即发，按 --queue-fps 的节奏排空。队列涨 = 消费侧积压
+          // （frames_in - frames_out 单调增长、dropped 不涨），与令牌桶丢包
+          // （budget_drops 涨、队列不涨）是两种可区分的故障证据。
+          if (sendq.size() >= kSendQueueMax) {
+            ++c.budget_drops;
+            ++c.frames_dropped;
+            err_log.log(t_send0, "发送队列已满：积压超过上限，按丢帧处理");
+          } else {
+            const int64_t due = send_due_us > 0 ? send_due_us : t_send0;
+            send_due_us = due + static_cast<int64_t>(queue_period_us);
+            sendq.push_back(QueuedSend{std::move(outgoing), due});
+            drain_sendq(t_send0);
+          }
+        } else {
+          // 真实上线率：只要有一包没被内核接受，这一帧就不算发出去（review #16）
+          bool all_sent = true;
+          for (const auto& d : outgoing) {
+            if (!send_dgram(d)) all_sent = false;
+          }
+          if (all_sent) ++c.frames_out;
+        }
       }
       rings[5].push(cue::now_us() - t_send0);
 
