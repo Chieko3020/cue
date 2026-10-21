@@ -977,9 +977,8 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
       o->tool_hits = st.hits;
       o->tool_misses = st.misses;
       if (st.misses > 0) {
-        const std::string miss = rp->last_error();
-        o->error_kind = o->error_kind.empty() ? "tools_replay_miss: " + miss
-                                              : "tools_replay_miss: " + miss + "；" + o->error_kind;
+        // 回放 miss 是根因：直接用它作 error_kind，别把工具失败链路层层套进去
+        o->error_kind = "tools_replay_miss: " + rp->last_error();
         o->scored = false;
       }
     }
@@ -1258,8 +1257,14 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
       o->tool_misses = st.misses;
       if (st.misses > 0) {
         const std::string miss = rp->last_error();
-        o->error_kind = o->error_kind.empty() ? "tools_replay_miss: " + miss
-                                              : "tools_replay_miss: " + miss + "；" + o->error_kind;
+        // 工具失败时 handler 已经把同一条 miss 文案带进了 error_kind，别重复一遍
+        const bool already = o->error_kind.find(miss) != std::string::npos;
+        if (!already) {
+          o->error_kind = o->error_kind.empty() ? miss : miss + "；" + o->error_kind;
+        }
+        if (o->error_kind.rfind("tools_replay_miss", 0) != 0) {
+          o->error_kind = "tools_replay_miss: " + o->error_kind;
+        }
         o->scored = false;
       }
     }
@@ -1318,7 +1323,12 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     }
   }
   {
-    const auto m = pipe->latest();
+    pipeline::PipelineMetrics m = pipe->latest();
+    if (replay_tools) {
+      // 回放：录制侧的 warmup 轮询可能先记录到 samples=0 再记录到有样本；
+      // 这里按「值」继续消费到第一条有样本的记录，不按时间（回放不 sleep）。
+      for (int i = 0; i < 20 && m.samples == 0; ++i) m = pipe->latest();
+    }
     if (m.samples == 0) {
       // 没有媒体流就别启动 agent：白烧钱，而且会把环境问题算成 agent 能力问题（P1#13）
       std::fprintf(stderr, "[eval][%s] %s\n", c.id.c_str(),
