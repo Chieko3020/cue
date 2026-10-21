@@ -24,6 +24,7 @@
 #include "cue/llm/cassette.h"
 #include "cue/llm/client.h"
 #include "cue/pipeline/process_control.h"
+#include "cue/pipeline/service_pipeline.h"
 #include "cue/pipeline/tools.h"
 
 namespace cue::eval {
@@ -679,10 +680,13 @@ std::string Engine::config_hash() const {
     llm_hash = "|llm=" + cfg_.llm_mode;
     if (cfg_.llm_mode == "replay") llm_hash += "|cassette=" + cassette_dir_hash(cfg_.cassette_dir);
   }
+  // endpoint 非空时被测 SUT 换成了 HTTP 服务：不进指纹会让"同一 suite 换个端点"复用旧缓存
+  // （端点为空的旧指纹保持逐字节不变，续跑兼容）。
+  const std::string ep_hash = cfg_.endpoint.empty() ? std::string() : "|endpoint=" + cfg_.endpoint;
   return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
                          "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
                          fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s) +
-                         llm_hash);
+                         llm_hash + ep_hash);
 }
 
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
@@ -765,7 +769,8 @@ struct SamplePoint {
 // 只在 agent 结束后看一个点无法回答"什么时候恢复的"。
 class MetricMonitor {
  public:
-  MetricMonitor(const pipeline::ProcessPipelineControl& pipe, int interval_ms)
+  // 只认接口：子进程 / HTTP 两种后端在监控线程眼里完全一样
+  MetricMonitor(const pipeline::IServicePipeline& pipe, int interval_ms)
       : pipe_(pipe), interval_ms_(interval_ms) {}
   ~MetricMonitor() { stop(); }
   MetricMonitor(const MetricMonitor&) = delete;
@@ -800,7 +805,7 @@ class MetricMonitor {
     }
   }
 
-  const pipeline::ProcessPipelineControl& pipe_;
+  const pipeline::IServicePipeline& pipe_;
   int interval_ms_;
   std::atomic<bool> stop_{false};
   mutable std::mutex mu_;
@@ -815,6 +820,35 @@ constexpr int kSleepStepMs = 200;
 // 超过这个年龄的采样算"陈旧"（cued 只在有媒体流时打点，流断了就不会更新）
 constexpr int64_t kStaleSampleUs = 3'000'000;
 
+// 从观测原文里取出 key 的 value 的**逐字**片段（JSON 的 "k": v 或文本的 k=v）。
+// scripted+endpoint 的假 agent 用它在真实观测里挑证据；不做格式化/四舍五入——
+// 判分侧按归一化子串与数值比对，写法一旦不同就可能失配（review-eval.md #5）。
+std::string observation_fragment(const std::string& text, const std::string& key) {
+  std::size_t value_at = std::string::npos;
+  const std::string json_pat = "\"" + key + "\":";
+  const std::size_t pos = text.find(json_pat);
+  if (pos != std::string::npos) {
+    value_at = pos + json_pat.size();
+  } else {
+    const std::string text_pat = key + "=";
+    const std::size_t pos2 = text.find(text_pat);
+    if (pos2 == std::string::npos) return {};
+    value_at = pos2 + text_pat.size();
+  }
+  while (value_at < text.size() && std::isspace(static_cast<unsigned char>(text[value_at]))) ++value_at;
+  std::size_t end = value_at;
+  while (end < text.size()) {
+    const unsigned char u = static_cast<unsigned char>(text[end]);
+    if (std::isalnum(u) || text[end] == '.' || text[end] == '-' || text[end] == '+') {
+      ++end;
+    } else {
+      break;
+    }
+  }
+  if (end == value_at) return {};
+  return key + "=" + text.substr(value_at, end - value_at);
+}
+
 }  // namespace
 
 bool Engine::cancelled() const { return cfg_.cancel != nullptr && cfg_.cancel->load(); }
@@ -823,6 +857,10 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   // 引擎自测：用 case 的 expect 构造"正确 agent"的结论，观测由真实管线字段模拟。
   // 目的不是证明模型能力，而是验证「判分器 + 引擎」这条链路本身工作正常。
   // 报告顶部会打 scripted banner，避免被读成"模型 100%"。
+  //
+  // --endpoint 时不能再"模拟"观测：AC-16 要的是假域被真驱动一遍，所以观测与 SLA
+  // 都取自 HTTP 后端（脚本里的写死值在假域里根本不存在，会直接把这条验收证伪）。
+  if (!cfg_.endpoint.empty()) return run_scripted_case_endpoint(c);
   CaseOutcome o;
   o.id = c.id;
   std::vector<Observation> obs;
@@ -864,6 +902,148 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   return o;
 }
 
+CaseOutcome Engine::run_scripted_case_endpoint(const Case& c) const {
+  // AC-16 主路径：假 agent 通过**同一份**工具层（build_real_tools）驱动 HTTP 后端——
+  // 观测来自后端、证据从观测里逐字摘抄、SLA 由 harness 复测。任何一步失败都记 run_error，
+  // 不拿写死的值兜底（否则这条验收只是在自证）。
+  CaseOutcome o;
+  o.id = c.id;
+  o.final_stage = "n/a";
+
+  pipeline::PipelineEndpoint ep;
+  ep.kind = pipeline::PipelineEndpoint::Kind::Http;
+  ep.http_base = cfg_.endpoint;
+  ep.http_timeout_ms = 3000;
+  std::string err;
+  auto pipe = pipeline::make_pipeline(ep, err);
+  if (!pipe) {
+    o.error_kind = "pipeline_create_failed: " + err;
+    return o;
+  }
+  struct StopGuard {
+    pipeline::IServicePipeline* p;
+    ~StopGuard() { p->stop(); }
+  } pipe_guard{pipe.get()};
+
+  if (!pipe->start(err)) {
+    o.error_kind = "pipeline_start_failed: " + err;
+    return o;
+  }
+  // 真路径每个 case 起一个新 cued 进程（计数器从 0 开始）。HTTP 端点在 case 之间是同一个
+  // 服务，用 stop→start 取得同样的"新管线"语义——否则上一个 case 的 dropped 会累进本 case
+  // 的 SLA 预算，同一份 suite 连跑第二遍就会假失败。
+  pipe->stop();
+  if (!pipe->start(err)) {
+    o.error_kind = "pipeline_restart_failed: " + err;
+    return o;
+  }
+
+  std::vector<pipeline::ToolTrace> trace;
+  tool::Registry reg;
+  pipeline::build_real_tools(reg, *pipe, &trace);
+  tool::CallContext ctx;
+  ctx.mode = tool::ApprovalMode::Auto;
+  ctx.allowed_dangerous = {"inject_fault"};
+  auto call = [&reg, &ctx](const char* name, const json& args, std::string& fail) -> bool {
+    const auto gr = reg.call_guarded(name, args, ctx);
+    if (gr.status == tool::GuardedCall::Status::Executed) return true;
+    fail = std::string(name) + ": " +
+           (gr.error.empty() ? gr.result.content : gr.error);
+    return false;
+  };
+
+  std::string fail;
+  // case 的管线档位：子进程后端是 cued 启动参数；HTTP 后端没有进程参数，
+  // 只能走同一套 set_param 工具生效（宽高这类假域不建模的字段不假装支持）。
+  if (!call("pipeline_set_param", json{{"key", "bitrate_kbps"}, {"value", std::to_string(c.bitrate_kbps)}}, fail) ||
+      !call("pipeline_set_param", json{{"key", "gop"}, {"value", std::to_string(c.gop)}}, fail) ||
+      (c.transcode && !call("pipeline_set_param", json{{"key", "transcode"}, {"value", "true"}}, fail))) {
+    o.error_kind = "set_param_failed: " + fail;
+    return o;
+  }
+
+  // 故障注入由评测器负责（与 cued 的启动参数同义）：agent 的任务是发现并修好它
+  bool injected = false;
+  if (c.fault_kind == "drop" && c.fault_value > 0.0) {
+    if (!call("inject_fault", json{{"kind", "drop"}, {"value", c.fault_value}}, fail)) {
+      o.error_kind = "inject_failed: " + fail;
+      return o;
+    }
+    injected = true;
+  }
+
+  // 观测：真调 query_metrics（content 是 "metrics={...}" 原文）
+  const auto q = reg.call("query_metrics", json::object());
+  if (!q) {
+    o.error_kind = "observe_failed: " + q.error();
+    return o;
+  }
+  // 假 agent 的证据 = 从这次真实观测里逐字摘抄 case 声明的候选指标（不编造、不改写）
+  std::vector<std::string> evidence;
+  for (const auto& cand : c.evidence_candidates) {
+    const std::string frag = observation_fragment(q->content, cand);
+    if (frag.empty()) continue;
+    evidence.push_back(frag);
+    if (evidence.size() >= 2) break;
+  }
+  if (evidence.empty()) {
+    o.error_kind = "no_evidence_in_observation";
+    return o;
+  }
+
+  // 假 agent 的"修复"：取消注入（真 agent 也是 inject_fault value=0）
+  if (injected) {
+    if (!call("inject_fault", json{{"kind", "drop"}, {"value", 0.0}}, fail)) {
+      o.error_kind = "repair_failed: " + fail;
+      return o;
+    }
+  }
+
+  // harness 复测 SLA：直接调接口（与 real 路径同一口径，不信 agent 自报）
+  Metrics m;
+  bool have_sample = false;
+  for (int i = 0; i < kRetestSamples; ++i) {
+    const auto pm = pipe->latest();
+    if (pm.samples == 0) continue;
+    m = to_metrics(pm);
+    have_sample = true;
+  }
+  if (!have_sample) {
+    o.error_kind = "no_retest_sample";
+    return o;
+  }
+
+  agent::RunResult fake;
+  fake.final_stage = agent::Stage::Done;
+  fake.turns = 6;
+  fake.cost_yuan = 0.01;
+  fake.diagnosis.root_cause = c.expect_root_cause;
+  fake.diagnosis.evidence = evidence;
+
+  std::vector<Observation> obs;
+  obs.reserve(trace.size());
+  for (const auto& t : trace) obs.push_back(Observation{t.tool, t.text, t.data});
+
+  o.score = judge_case(c, fake, obs, m);
+  o.scored = true;
+  o.turns = fake.turns;
+  o.cost_yuan = fake.cost_yuan;
+  o.diagnosis = fake.diagnosis;
+  o.final_stage = agent::stage_name(fake.final_stage);
+  o.final_fps = m.fps;
+  o.final_dropped = m.dropped;
+  o.final_samples = m.samples;
+  o.metrics = m;
+  o.observations = obs;
+  std::fprintf(stderr,
+               "[eval][%s] endpoint scripted：root=%d evidence=%d sla=%d（证据 %s；复测 fps=%.2f "
+               "dropped=%llu）\n",
+               c.id.c_str(), static_cast<int>(o.score.root), static_cast<int>(o.score.evidence),
+               static_cast<int>(o.score.sla), evidence.front().c_str(), m.fps,
+               static_cast<unsigned long long>(m.dropped));
+  return o;
+}
+
 CaseOutcome Engine::run_real_case(const Case& c) const {
   CaseOutcome o;
   o.id = c.id;
@@ -892,51 +1072,82 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   const char* base_env = std::getenv("CUE_BASE_URL");
   const std::string base_url = (base_env && *base_env) ? base_env : "https://api.deepseek.com";
 
-  // 1) 起管线（cued 由被测进程管理；推流由外部浏览器/采集端提供）
+  // 1) 起管线：默认起本机 cued；--endpoint 时改为连一个实现 REST 控制协议的 HTTP 服务。
+  //    此后所有使用（监控 / 工具 / SLA 复测）都只经 IServicePipeline，不认识具体后端。
   const auto pcfg = pipeline_config_for(c, cfg_);
-  pipeline::ProcessPipelineControl pipe(to_pipeline_config(pcfg));
-  struct StopGuard {
-    pipeline::ProcessPipelineControl* p;
-    ~StopGuard() { p->stop(); }
-  } pipe_guard{&pipe};
-
   std::string err;
-  std::fprintf(stderr, "[eval][%s] 启动 cued（inject_drop=%.1f%%, bitrate=%d, gop=%d）\n", c.id.c_str(),
-               pcfg.inject_drop, pcfg.bitrate_kbps, pcfg.gop);
-  if (!pipe.start(err)) {
+  std::unique_ptr<pipeline::IServicePipeline> pipe;
+  if (!cfg_.endpoint.empty()) {
+    pipeline::PipelineEndpoint ep;
+    ep.kind = pipeline::PipelineEndpoint::Kind::Http;
+    ep.http_base = cfg_.endpoint;
+    ep.http_timeout_ms = 3000;
+    pipe = pipeline::make_pipeline(ep, err);
+    if (!pipe) {
+      o.error_kind = "pipeline_create_failed: " + err;
+      return;
+    }
+    std::fprintf(stderr, "[eval][%s] 连接管线端点 %s（inject_drop=%.1f%%）\n", c.id.c_str(),
+                 cfg_.endpoint.c_str(), pcfg.inject_drop);
+  } else {
+    // Process 分支：唯一允许出现具体后端类型的地方（cued 的启动参数只有它认识）
+    pipe = std::make_unique<pipeline::ProcessPipelineControl>(to_pipeline_config(pcfg));
+    std::fprintf(stderr, "[eval][%s] 启动 cued（inject_drop=%.1f%%, bitrate=%d, gop=%d）\n",
+                 c.id.c_str(), pcfg.inject_drop, pcfg.bitrate_kbps, pcfg.gop);
+  }
+  struct StopGuard {
+    pipeline::IServicePipeline* p;
+    ~StopGuard() { p->stop(); }
+  } pipe_guard{pipe.get()};
+
+  if (!pipe->start(err)) {
     o.error_kind = "pipeline_start_failed: " + err;
     return;
   }
+  // Http 后端没有"进程启动参数"，case 的注入档位只能经接口补上（与 cued 启动参数同义）
+  if (!cfg_.endpoint.empty() && c.fault_kind == "drop" && c.fault_value > 0.0) {
+    std::string ierr;
+    if (!pipe->inject_fault(c.fault_kind, c.fault_value, ierr)) {
+      o.error_kind = "inject_failed: " + ierr;
+      return;
+    }
+  }
   const int64_t t_inject_us = now_us();
-  MetricMonitor mon(pipe, 500);
+  MetricMonitor mon(*pipe, 500);
   mon.start();
   struct MonGuard {
     MetricMonitor* m;
     ~MonGuard() { m->stop(); }
   } mon_guard{&mon};
 
-  // 2) warmup：等外部推流起来（agent 早于推流启动会拿到"尚无采样"）
-  for (int i = 0; i < cfg_.warmup_s; ++i) {
-    if (cancelled()) {
-      o.error_kind = "cancelled";
-      return;
+  // 2) warmup：等外部推流起来（agent 早于推流启动会拿到"尚无采样"）。
+  //    --endpoint（假域/远端服务）：推流早已在服务内部，跳过等待，只做一次采样检查。
+  if (cfg_.endpoint.empty()) {
+    for (int i = 0; i < cfg_.warmup_s; ++i) {
+      if (cancelled()) {
+        o.error_kind = "cancelled";
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-  }
-  for (int i = 0; i < 20; ++i) {
-    const auto m = pipe.latest();
-    if (m.samples > 0 && m.fps > 0.0) break;
-    if (cancelled()) {
-      o.error_kind = "cancelled";
-      return;
+    for (int i = 0; i < 20; ++i) {
+      const auto m = pipe->latest();
+      if (m.samples > 0 && m.fps > 0.0) break;
+      if (cancelled()) {
+        o.error_kind = "cancelled";
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
   {
-    const auto m = pipe.latest();
+    const auto m = pipe->latest();
     if (m.samples == 0) {
       // 没有媒体流就别启动 agent：白烧钱，而且会把环境问题算成 agent 能力问题（P1#13）
-      std::fprintf(stderr, "[eval][%s] warmup 后仍无采样 → 无媒体流，不启动 agent\n", c.id.c_str());
+      std::fprintf(stderr, "[eval][%s] %s\n", c.id.c_str(),
+                   cfg_.endpoint.empty()
+                       ? "warmup 后仍无采样 → 无媒体流，不启动 agent"
+                       : "端点没有返回有效采样（samples=0，或 /api/state 不可达）→ 不启动 agent");
       o.error_kind = "no_media_stream";
       return;
     }
@@ -947,7 +1158,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   // 3) 工具（每个返回都留痕，证据校验只认真实观测）
   std::vector<pipeline::ToolTrace> trace;
   tool::Registry reg;
-  pipeline::build_real_tools(reg, pipe, &trace);
+  pipeline::build_real_tools(reg, *pipe, &trace);
 
   // 4) LLM 客户端：replay 读 cassette（默认，零成本、可回归），live 才走网络。
   //    live + record 时把每次成功调用追加进 cassette（SPEC §7.9）。
@@ -978,7 +1189,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   ac.yuan_per_mtok = cfg_.yuan_per_mtok;
   // SPEC §7.5 的 verify→done 守卫：harness 重测，不信 agent 自报（事件里标 verify=measured）
   ac.verify_sla = [&pipe, &c](const agent::Diagnosis&) {
-    const auto m = pipe.latest();
+    const auto m = pipe->latest();
     if (m.samples == 0) return false;
     if (c.sla_fps_min > 0 && m.fps < c.sla_fps_min) return false;
     if (m.dropped > c.sla_dropped_max) return false;
@@ -1111,7 +1322,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     o.scored = true;
     o.score = judge_case(c, res, obs, m);
   }
-  pipe.stop();  // 每个 case 独占一条管线；StopGuard 兜底
+  pipe->stop();  // 每个 case 独占一条管线；StopGuard 兜底
 }
 
 void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {

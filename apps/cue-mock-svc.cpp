@@ -226,15 +226,25 @@ class MockPipeline {
   }
 
   json dispatch_locked(const std::string& tool, const json& args) {
-    if (tool == "pipeline_start" || tool == "pipeline_restart") {
-      const bool was_running = running_;
-      running_ = true;
-      if (!was_running) {
-        emit_locked("pipeline.started", json{{"running", true}, {"pid", kPid}});
-        log_locked("[mock-svc] pipeline started");
+    if (tool == "pipeline_start") {
+      if (running_) {
+        return reply(true, "executed", tool, "管线已在运行", json{{"running", true}}, "");
       }
-      return reply(true, "executed", tool, was_running ? "管线已在运行" : "管线已启动",
-                   json{{"running", true}}, "");
+      // 从"已停止"重新启动 = 服务按默认配置重新拉起（真 cued 由 harness 的启动参数决定，
+      // 假域这里用默认值；随后 harness/agent 再通过 set_param/inject 施加本 case 的档位）。
+      running_ = true;
+      reset_all_locked();
+      emit_locked("pipeline.started", json{{"running", true}, {"pid", kPid}, {"restart", false}});
+      log_locked("[mock-svc] pipeline started");
+      return reply(true, "executed", tool, "管线已启动", json{{"running", true}}, "");
+    }
+    if (tool == "pipeline_restart") {
+      // restart = 同配置重新 spawn（真 cued 的 restart 不清 cfg）：计数从 0，注入档位保留
+      running_ = true;
+      reset_counters_locked();
+      emit_locked("pipeline.started", json{{"running", true}, {"pid", kPid}, {"restart", true}});
+      log_locked("[mock-svc] pipeline restarted");
+      return reply(true, "executed", tool, "管线已重启（计数已清零）", json{{"running", true}}, "");
     }
     if (tool == "pipeline_stop") {
       if (running_) {
@@ -266,8 +276,9 @@ class MockPipeline {
       }
       emit_locked("param.changed", json{{"key", key}, {"value", value}, {"pid", kPid}});
       log_locked("[mock-svc] param " + key + "=" + value);
-      sample_locked();  // 回给调用方的观测必须是"新参数生效之后"的一次采样
-      return reply(true, "executed", tool, "已设置 " + key + "=" + value, metrics_locked(), "");
+      // 不在这里采样：采样只发生在"读指标"（/api/state 与 query_metrics）时，
+      // 否则写动作会把假域的时钟拨快，case 里的 dropped 预算会被动作次数污染。
+      return reply(true, "executed", tool, "已设置 " + key + "=" + value, json::object(), "");
     }
     if (tool == "inject_fault") {
       const std::string kind =
@@ -278,8 +289,7 @@ class MockPipeline {
       if (!apply_inject_locked(kind, value, err)) {
         return reply(false, "failed", tool, "", json::object(), err);
       }
-      sample_locked();  // 同理：注入后的观测才是"注入了多少"的现场读数
-      return reply(true, "executed", tool, "已注入 " + kind + "=" + num_text(value), metrics_locked(), "");
+      return reply(true, "executed", tool, "已注入 " + kind + "=" + num_text(value), json::object(), "");
     }
     if (tool == "fetch_observation") {
       if (!args.contains("source") || !args["source"].is_string()) {
@@ -386,6 +396,25 @@ class MockPipeline {
   double delay_factor_locked() const { return 1.0 / (1.0 + delay_ms_ / 1000.0); }
   double compute_fps_locked() const {
     return 30.0 * completion_locked() * gop_factor_locked() * delay_factor_locked();
+  }
+
+  void reset_counters_locked() {
+    frames_in_ = 0;
+    frames_out_ = 0;
+    dropped_ = 0;
+    samples_ = 0;
+    last_fps_ = 0.0;
+  }
+
+  // 全新启动 = 默认配置：不清掉的话，上一个使用者的注入/参数会污染下一条"新管线"
+  // （实测：curl 先注入 5% 再跑评测，会让第一个 case 的 dropped 多算一个档位）。
+  void reset_all_locked() {
+    reset_counters_locked();
+    drop_pct_ = 0.0;
+    delay_ms_ = 0.0;
+    bitrate_kbps_ = 1500;
+    gop_ = 60;
+    transcode_ = false;
   }
 
   void sample_locked() {

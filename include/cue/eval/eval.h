@@ -163,6 +163,9 @@ struct RunConfig {
   // M4b
   std::string resume_run_id;            // 非空 = 续跑该 run（复用已完成 case）
   std::string cued_bin = "./build/cued";
+  // M7 / AC-16：非空 = 被测管线是一个实现了 REST 控制协议的 HTTP 服务（例如
+  // apps/cue-mock-svc.cpp），而不是本机子进程。空 = 现有子进程路径，行为完全不变。
+  std::string endpoint;
   std::string model = "deepseek-chat";  // real 模式模型名
   double yuan_per_mtok = 2.0;           // 成本核算单价（估算，不是账单）
   // LLM 传输（SPEC §7.9）：replay = 只读 cassette（默认，零成本）；live = 真实网络。
@@ -220,6 +223,8 @@ class Engine {
 
  private:
   CaseOutcome run_scripted_case(const Case& c) const;
+  // scripted + --endpoint：假 agent 的观测与指标都来自 HTTP 后端（不能再用写死的值）
+  CaseOutcome run_scripted_case_endpoint(const Case& c) const;
   CaseOutcome run_real_case(const Case& c) const;
   void run_real_case_impl(const Case& c, CaseOutcome& o) const;
   void run_cases(const std::vector<Case>& cases, RunReport& r);

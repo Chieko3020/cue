@@ -40,10 +40,13 @@ int usage() {
       "\n"
       "  cue-eval --suite <path> [--mode scripted|real] [--repeat k] [--max-yuan N]\n"
       "           [--out dir] [--warmup s] [--model name] [--cued path]\n"
+      "           [--endpoint URL]\n"
       "           [--replay|--live] [--record] [--cassette-dir dir]\n"
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
       "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
       "\n"
+      "  --endpoint URL 被测管线改为 HTTP 服务（实现 GET /api/state + POST /api/action），\n"
+      "                 不再起 cued；warmup 等待也跳过（假域无需等外部推流）。\n"
       "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
       "  real 模式的 LLM 传输默认 replay：只读 cassette，零成本；缺录制直接报错\n"
       "  （run_error=cassette_miss，不静默走网络）。--live 才用真实网络（需 CUE_API_KEY /\n"
@@ -178,6 +181,13 @@ int main(int argc, char** argv) {
       cfg.model = next();
     } else if (a == "--cued") {
       cfg.cued_bin = next();
+    } else if (a == "--endpoint") {
+      cfg.endpoint = next();
+      if (cfg.endpoint.rfind("http://", 0) != 0 && cfg.endpoint.rfind("https://", 0) != 0) {
+        std::fprintf(stderr, "--endpoint 需要 http(s):// 开头的 URL（收到：%s）\n",
+                     cfg.endpoint.empty() ? "(空)" : cfg.endpoint.c_str());
+        return 2;
+      }
     } else if (a == "--resume") {
       cfg.resume_run_id = next();
     } else if (a == "--diff") {
