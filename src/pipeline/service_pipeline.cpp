@@ -6,18 +6,19 @@
 #include <string>
 
 #include "cue/pipeline/process_control.h"
+#include "cue/pipeline/http_pipeline.h"
 
 namespace cue::pipeline {
 
 std::unique_ptr<IServicePipeline> make_pipeline(const PipelineEndpoint& ep, std::string& err) {
   switch (ep.kind) {
     case PipelineEndpoint::Kind::Process:
+      // kind 在这里被显式忽略：分支本身已经决定了后端类型（ProcessPipelineControl 的
+      // 构造函数只读 cued 启动参数，不看 kind）。不加运行时校验是刻意的——那是行为变更，
+      // 会让"Http 端点却交给 Process 后端"从"能跑但指错了"变成启动失败。
       return std::make_unique<ProcessPipelineControl>(ep);
     case PipelineEndpoint::Kind::Http:
-      // 明确失败而不是返回空实现：调用方拿到 nullptr 必须查 err，不会把「什么也没做」
-      // 当成一条正常管线（HTTP 后端落地于 M7 后续）。
-      err = "Http 管线后端尚未实现（PipelineEndpoint::Kind::Http；http_base=" + ep.http_base + "）";
-      return nullptr;
+      return std::make_unique<HttpServicePipeline>(ep);
   }
   err = "未知的管线端点类型（PipelineEndpoint::Kind=" +
         std::to_string(static_cast<int>(ep.kind)) + "）";

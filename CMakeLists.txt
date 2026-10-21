@@ -122,8 +122,11 @@ add_custom_target(web ALL SOURCES web/index.html web/app.js)
 add_library(cue_pipeline STATIC
   src/pipeline/process_control.cpp
   src/pipeline/service_pipeline.cpp
+  src/pipeline/http_pipeline.cpp
   src/pipeline/tools.cpp)
-target_link_libraries(cue_pipeline PUBLIC cue_proto nlohmann_json::nlohmann_json Threads::Threads)
+# libcurl：HttpServicePipeline（REST 后端）是 pipeline 层的一部分，链接随之公开
+target_link_libraries(cue_pipeline PUBLIC
+  cue_proto nlohmann_json::nlohmann_json PkgConfig::CURL Threads::Threads)
 
 add_library(cue_agent STATIC
   src/llm/client.cpp

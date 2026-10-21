@@ -58,8 +58,9 @@ class IServicePipeline {
   virtual std::string observation(const std::string& source, int tail, std::string& err) const = 0;
 };
 
-// 按端点类型造实现。Process → ProcessPipelineControl；Http → 将来实现，现在返回
-// 明确错误（不要静默返回空指针）。
+// 按端点类型造实现：Process → ProcessPipelineControl（子进程 + stdout 解析），
+// Http → HttpServicePipeline（REST 控制协议，见 pipeline/http_pipeline.h）。
+// 失败时返回 nullptr 并写 err（不静默返回空实现）。
 std::unique_ptr<IServicePipeline> make_pipeline(const PipelineEndpoint& ep, std::string& err);
 
 }  // namespace cue::pipeline
