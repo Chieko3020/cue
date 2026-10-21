@@ -442,12 +442,15 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
   ::close(st_pipe[1]);
   if (devnull >= 0) ::close(devnull);
 
-  // 读子进程状态行（最多等 2 秒；正常情况下它是几微秒内的一次 write）。
+  // 读子进程状态行。要读到 EOF 而不是读到第一个换行就停：exec 失败时子进程会在
+  // "L\n"/"D:...\n" 之后再写一行 "X:..."，只看首行会把「没跑起来」记成 ran=true。
+  // 正常路径里 exec 会因 CLOEXEC 关掉写端，EOF 立刻到来，不会多等。
   std::string status_line;
   {
     const int64_t deadline = now_us() + 2'000'000;
     char buf[256];
-    while (status_line.find('\n') == std::string::npos && now_us() < deadline) {
+    for (;;) {
+      if (now_us() >= deadline) break;
       struct pollfd pfd {
         st_pipe[0], POLLIN, 0
       };
@@ -459,7 +462,7 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
         status_line.append(buf, static_cast<std::size_t>(n));
         continue;
       }
-      break;  // EOF：exec 成功（CLOEXEC 关掉了写端）或子进程早退
+      break;  // EOF：exec 成功（CLOEXEC 关掉写端）或子进程已退出
     }
   }
   ::close(st_pipe[0]);
@@ -481,6 +484,13 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
       r.degraded_reason = strip(rest);
     } else {  // 'X'
       r.error = "沙箱初始化失败: " + strip(rest);
+    }
+    // exec 失败会在沙箱状态之后再追加一行：这时沙箱本身初始化成功过，
+    // 但命令并没有执行，必须是 ran=false + failed，不能拿 exit=127 冒充执行结果。
+    const std::size_t x = status_line.find("\nX:");
+    if (x != std::string::npos) {
+      r.ran = false;
+      r.error = "沙箱初始化失败: " + strip(status_line.substr(x + 2));
     }
   }
 
@@ -567,13 +577,17 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
     r.signal = WTERMSIG(status);
   }
 
-  // 没有状态行 + 退出码 127/126 = 子进程在 exec/初始化时死了（状态行也随 exec 前的
-  // 失败路径一起写了，走到这里说明连 write 都没发生）。
-  if (!r.ran && r.error.empty() && (r.exit_code == 126 || r.exit_code == 127)) {
+  // 没有状态行 + 退出码 127/126 = 子进程在 exec/初始化时死了（正常失败路径都会写状态行，
+  // 走到这里说明连 write 都没发生）。其余无状态行的情况也要给原因，不能留空的 error。
+  if (!r.ran && r.error.empty()) {
     if (r.exit_code == 127) {
       r.error = "execv 失败（子进程退出 127：可执行文件可能在 fork 后被移走）";
-    } else {
+    } else if (r.exit_code == 126) {
       r.error = "子进程沙箱初始化失败（退出 126）";
+    } else if (r.timed_out || r.cancelled) {
+      r.error = "在 exec 完成前被终止";
+    } else {
+      r.error = "子进程未报告沙箱状态（可能在 exec 前异常退出）";
     }
   }
 
