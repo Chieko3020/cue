@@ -176,6 +176,13 @@ target_link_libraries(cue-eval PRIVATE cue_eval)
 add_executable(cue-serve apps/cue-serve.cpp)
 target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline Boost::system Threads::Threads)
 
+# ---- M7 假域服务（AC-16）----
+# 只依赖 Beast + nlohmann：不链接 cue_pipeline（指标 JSON 字段是按 metrics_json 的键名
+# 手写的，这样它才是"外部服务"，而不是拿被测侧的实现给自己出题），也不依赖 cued/FFmpeg。
+add_executable(cue-mock-svc apps/cue-mock-svc.cpp)
+target_link_libraries(cue-mock-svc PRIVATE cue_proto nlohmann_json::nlohmann_json
+  Boost::system Threads::Threads)
+
 # ---- 测试 ----
 enable_testing()
 add_executable(test_wire tests/test_wire.cpp)
