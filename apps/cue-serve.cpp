@@ -46,6 +46,8 @@
 #include <vector>
 
 #include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "console/approval_queue.h"
 #include "console/report_index.h"
@@ -729,35 +731,44 @@ class Server {
       acceptor_.accept(sock, ec);
       if (ec) continue;
       auto sp = std::make_shared<tcp::socket>(std::move(sock));
+      // 解阻塞用的「唤醒描述符」：dup 一份专供 stop() 使用。
+      // 直接对工作线程手里的 socket/fd 做 shutdown 会和它的 read/write 抢同一份对象状态；
+      // 跨线程 close 更糟——fd 号会被内核回收，工作线程的写可能落到被复用的 fd 上
+      // （M6 的 TSan 在这里报出 data race：file descriptor destroyed by another thread）。
+      // dup 之后两个描述符指向同一个打开文件描述，stop() 只碰自己那份，永不 close 别人的。
+      const int wake_fd = ::dup(sock.native_handle());
+      if (wake_fd < 0) {
+        std::fprintf(stderr, "[cue-serve] dup 连接描述符失败：%s（该连接退出时可能多等 10 s）\n",
+                     std::strerror(errno));
+      }
       {
         std::lock_guard<std::mutex> lk(mu_);
         purge_finished_locked();
-        live_.push_back(sp);
         auto done = std::make_shared<std::atomic<bool>>(false);
         threads_.push_back(ThreadRec{
-            std::jthread([this, sp, done] { serve_conn(sp); done->store(true); }), done});
+            std::jthread([this, sp, done] { serve_conn(sp); done->store(true); }), done, wake_fd});
       }
     }
   }
 
-  // 关闭所有连接的 socket（解除阻塞读），再 join
+  // 用 dup 出来的唤醒描述符 shutdown（不动工作线程的 socket），再 join。
+  // shutdown 会让阻塞中的 read/write 立刻返回错误，工作线程自己收尾并 close 自己的 fd。
   void stop() {
     std::vector<ThreadRec> threads;
-    std::vector<std::shared_ptr<tcp::socket>> live;
     {
       std::lock_guard<std::mutex> mu_lk(mu_);
       threads.swap(threads_);
-      live.swap(live_);
     }
     beast::error_code ec;
     acceptor_.close(ec);
-    for (auto& s : live) {
-      if (!s->is_open()) continue;
-      s->shutdown(tcp::socket::shutdown_both, ec);
-      s->close(ec);
+    for (auto& t : threads) {
+      if (t.done->load() || t.wake_fd < 0) continue;
+      ::shutdown(t.wake_fd, SHUT_RDWR);  // 返回值无所谓：对端已走时是 ENOTCONN
     }
     for (auto& t : threads) {
       if (t.th.joinable()) t.th.join();
+      if (t.wake_fd >= 0) ::close(t.wake_fd);
+      t.wake_fd = -1;
     }
   }
 
@@ -765,21 +776,20 @@ class Server {
   struct ThreadRec {
     std::jthread th;
     std::shared_ptr<std::atomic<bool>> done;
+    int wake_fd = -1;
   };
 
+  // 只在线程结束后 join/释放：socket 与 wake_fd 在连接活着的时候只有工作线程在用，
+  // 主线程读 is_open() 之类的状态同样是一次未同步访问（旧的 live_ 清理就在这么干）。
   void purge_finished_locked() {
     for (auto it = threads_.begin(); it != threads_.end();) {
       if (it->done->load()) {
         if (it->th.joinable()) it->th.join();
+        if (it->wake_fd >= 0) ::close(it->wake_fd);
         it = threads_.erase(it);
       } else {
         ++it;
       }
-    }
-    // 已关闭的连接不再需要保留 socket 引用
-    for (auto it = live_.begin(); it != live_.end();) {
-      if (!(*it)->is_open()) it = live_.erase(it);
-      else ++it;
     }
   }
 
@@ -997,7 +1007,6 @@ class Server {
   tcp::acceptor acceptor_;
   std::mutex mu_;
   std::vector<ThreadRec> threads_;
-  std::vector<std::shared_ptr<tcp::socket>> live_;
 };
 
 }  // namespace
