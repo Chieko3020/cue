@@ -5,6 +5,7 @@
 #include <csignal>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -368,32 +369,32 @@ int run_demo(const DemoOptions& opt = {}) {
 
 // ---------------------------------------------------------------- run（真实管线）
 
-// warmup 期间的信号处理：只置标志，让用户 Ctrl-C 能干净收尾（不杀到一半留孤儿 cued）
-volatile std::sig_atomic_t g_interrupted = 0;
-void on_interrupt(int) { g_interrupted = 1; }
+// run 全程的取消标志（SIGINT/SIGTERM）：handler 里只做一次原子 store，不碰 printf/malloc，
+// 因此是 async-signal-safe 的。阻塞点（warmup 睡眠、curl 传输、工具之间）各自轮询它，
+// 保证「用户已经放弃」不会被执行到底。
+std::atomic<bool> g_cancel{false};
 
-// 只在 warmup 期间接管 SIGINT/SIGTERM，之后恢复默认——agent 阶段的 Ctrl-C 行为不变
-bool warmup_wait(int seconds) {
-  if (seconds <= 0) return true;
+void on_cancel_signal(int) { g_cancel.store(true, std::memory_order_relaxed); }
+
+// 只在 run 路径安装：demo 是一次性脚本执行，不需要改信号语义。
+bool install_cancel_handlers() {
   struct sigaction sa {};
-  sa.sa_handler = on_interrupt;
+  sa.sa_handler = on_cancel_signal;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  struct sigaction old_int {};
-  struct sigaction old_term {};
-  sigaction(SIGINT, &sa, &old_int);
-  sigaction(SIGTERM, &sa, &old_term);
-  g_interrupted = 0;
+  sa.sa_flags = 0;  // 不设 SA_RESTART：被中断的阻塞调用应看到 EINTR
+  return sigaction(SIGINT, &sa, nullptr) == 0 && sigaction(SIGTERM, &sa, nullptr) == 0;
+}
 
+// warmup 与 agent 阶段共用同一个标志：Ctrl-C 在 warmup 里是「跳过等待」，
+// 在 agent 阶段是「取消本次 run」，两者都不应该留下孤儿 cued。
+bool warmup_wait(int seconds) {
+  if (seconds <= 0) return !g_cancel.load();
   std::fprintf(stderr, "[cue] warmup %d s：请在此期间开始推流（Ctrl-C 可跳过）\n", seconds);
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-  while (!g_interrupted && std::chrono::steady_clock::now() < deadline) {
+  while (!g_cancel.load() && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
-
-  sigaction(SIGINT, &old_int, nullptr);
-  sigaction(SIGTERM, &old_term, nullptr);
-  return !g_interrupted;
+  return !g_cancel.load();
 }
 
 int run_real(const RunOptions& o) {
@@ -407,6 +408,12 @@ int run_real(const RunOptions& o) {
   const std::string model =
       !o.model.empty() ? o.model : (model_env && *model_env ? model_env : "deepseek-chat");
 
+  // 信号接管覆盖整个 run 生命周期（warmup + agent）：退出前必须收回 cued（AC-8）
+  if (!install_cancel_handlers()) {
+    std::fprintf(stderr, "安装 SIGINT/SIGTERM 处理器失败: %s\n", std::strerror(errno));
+    return 1;
+  }
+
   cue::pipeline::ProcessPipelineControl::Config pc;
   pc.cued_bin = "./build/cued";
   pc.inject_drop = 5.0;  // 演练场景：先注入 5% 丢包，让 agent 去发现
@@ -418,7 +425,7 @@ int run_real(const RunOptions& o) {
   }
   std::fprintf(stderr, "[cue] cued 已启动（注入 5%% 丢包作为初始故障）\n");
   if (!warmup_wait(o.warmup_s)) {
-    std::fprintf(stderr, "[cue] warmup 被中断，清理管线后退出\n");
+    std::fprintf(stderr, "[cue] 已取消（warmup 阶段）：回收 cued 后退出\n");
     pipe.stop();
     return 130;
   }
@@ -441,6 +448,7 @@ int run_real(const RunOptions& o) {
 
   agent::Runner::Config cfg;
   cfg.model = model;
+  cfg.cancel = &g_cancel;  // 每轮开始 / 每次 LLM 调用 / 工具之间都会检查
   cfg.system_prompt = cue::pipeline::real_ops_system_prompt();
   cfg.ctx.mode = o.approval == "deny"   ? tool::ApprovalMode::Deny
                  : o.approval == "ask" ? tool::ApprovalMode::Ask
@@ -455,12 +463,18 @@ int run_real(const RunOptions& o) {
 
   agent::Runner runner(client, reg, cfg);
   const auto res = runner.run(o.goal, o.budget, print_event);
+  // 先收子进程再打印：取消路径上 cued 的存活时间不计入「结果输出」这段
+  pipe.stop();
 
+  const bool cancelled = g_cancel.load();
+  if (cancelled) {
+    // 明确一行「已取消」而不是让用户从 error=cancelled 里猜（也不打印幻觉结果）
+    std::fprintf(stderr, "[cue] 已取消：LLM 调用/工具执行已中断，cued 已回收\n");
+  }
   print_result(res);
   std::printf("dangerous : %s\n", o.allow_dangerous.empty() ? "(none)" : o.allow_dangerous.c_str());
 
-  pipe.stop();
-  return res.ok() ? 0 : 1;
+  return cancelled ? 130 : (res.ok() ? 0 : 1);
 }
 
 }  // namespace
