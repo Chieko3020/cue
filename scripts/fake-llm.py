@@ -179,7 +179,7 @@ class EvalBrain:
 BRAINS = {"demo": DemoBrain, "eval": EvalBrain}
 
 
-def make_handler(brain):
+def make_handler(brain, stall_s=0.0):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -189,6 +189,11 @@ def make_handler(brain):
         def do_POST(self):  # noqa: N802（BaseHTTPRequestHandler 的命名约定）
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length)
+            if stall_s > 0:
+                # AC-8：卡在 LLM 调用里的场景。请求已经收全但故意不回，客户端阻塞在
+                # curl_easy_perform 里。这一行是给 scripts/test-cancel.sh 的同步点。
+                print(f"[fake-llm] request received, stalling {stall_s:g}s", flush=True)
+                time.sleep(stall_s)
             try:
                 request = json.loads(raw or b"{}")
             except json.JSONDecodeError:
@@ -199,7 +204,11 @@ def make_handler(brain):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except OSError:
+                # 客户端被取消后连接已断：写失败是预期结果，不要把 traceback 打到 stderr
+                pass
             self.close_connection = True
 
     return Handler
@@ -210,12 +219,15 @@ def main():
     ap.add_argument("--port", type=int, default=18765)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--mode", choices=sorted(BRAINS), default="demo")
+    ap.add_argument("--stall-s", type=float, default=0.0,
+                    help="收完请求后先睡 N 秒再回（模拟卡在 LLM 调用里；默认 0）")
     args = ap.parse_args()
 
     brain = BRAINS[args.mode]()
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(brain))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(brain, args.stall_s))
     server.daemon_threads = True
-    print(f"[fake-llm] mode={args.mode} http://{args.host}:{args.port}", flush=True)
+    print(f"[fake-llm] mode={args.mode} http://{args.host}:{args.port} stall_s={args.stall_s:g}",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
