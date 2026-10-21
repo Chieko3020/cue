@@ -10,8 +10,8 @@
 #      用 C++ 另写一份注入器就测不到同一条代码路径了。
 #
 # 用法：
-#   scripts/bench.sh                          # 默认 build-ci，每场景 12 s
-#   BUILD_DIR=build-ci SECONDS_PER_RUN=20 scripts/bench.sh
+#   scripts/bench.sh                          # 默认 build，每场景 12 s
+#   BUILD_DIR=build SECONDS_PER_RUN=20 scripts/bench.sh
 #   SKIP_LOSS=1 scripts/bench.sh              # 只跑无故障两档
 #
 # 输出：bench/<timestamp>.md（Markdown 表格）+ bench/<timestamp>/raw/*.log（原始日志）
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-$ROOT/build-ci}"
+BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 SECONDS_PER_RUN="${SECONDS_PER_RUN:-12}"
 FPS="${FPS:-30}"
 DROP_PCT="${DROP_PCT:-5}"
@@ -36,7 +36,7 @@ SKIP_LOSS="${SKIP_LOSS:-0}"
 
 die() { echo "[bench] $*" >&2; exit 1; }
 
-[ -x "$BUILD_DIR/cued" ] || die "找不到 $BUILD_DIR/cued（先构建：cmake -S . -B build-ci -DCMAKE_CXX_COMPILER=g++-14 && cmake --build build-ci -j1）"
+[ -x "$BUILD_DIR/cued" ] || die "找不到 $BUILD_DIR/cued（先构建：cmake -S . -B build -DCMAKE_CXX_COMPILER=g++-14 && cmake --build build -j1）"
 [ -x "$BUILD_DIR/cue-probe" ] || die "找不到 $BUILD_DIR/cue-probe"
 command -v node >/dev/null || die "需要 node"
 command -v ffmpeg >/dev/null || die "需要 ffmpeg（生成测试码流）"

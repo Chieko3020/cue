@@ -16,8 +16,8 @@
 #   e) 负向：把录制里某个 set_param 的 key 改掉，回放必须报错（参数不符），不能静默给默认值。
 #
 # 用法：
-#   BUILD_DIR=build-a6 ./scripts/test-replay-consistency.sh
-#   REPEAT=3 BUILD_DIR=build-a6 ./scripts/test-replay-consistency.sh
+#   BUILD_DIR=build ./scripts/test-replay-consistency.sh
+#   REPEAT=3 BUILD_DIR=build ./scripts/test-replay-consistency.sh
 #
 # 环境变量：BUILD_DIR（默认 build）、REPEAT（默认 3）、SUITE（默认 suites/m4-diagnosis.json）、
 #           WORK_ROOT（默认 runs/ac6-replay）、PUSH_SECONDS（每次推流秒数，默认 2）

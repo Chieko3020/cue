@@ -12,12 +12,12 @@
 #   3) ps 里没有 cued / cue-probe 残留
 #
 # 用法：
-#   BUILD_DIR=build-a8 ./scripts/test-cancel.sh
-#   STALL_S=60 BUILD_DIR=build-a8 ./scripts/test-cancel.sh
+#   BUILD_DIR=build ./scripts/test-cancel.sh
+#   STALL_S=60 BUILD_DIR=build ./scripts/test-cancel.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-build-a8}"
+BUILD_DIR="${BUILD_DIR:-build}"
 CUE="$ROOT/$BUILD_DIR/cue"
 CUED="$ROOT/$BUILD_DIR/cued"
 LIMIT_MS=5000

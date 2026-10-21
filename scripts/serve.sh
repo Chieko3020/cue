@@ -4,9 +4,9 @@
 # 用法：
 #   ./scripts/serve.sh              # http://127.0.0.1:8080/（审批模式 ask）
 #   ./scripts/serve.sh --approval auto
-#   PORT=8081 BUILD_DIR=build-m5 ./scripts/serve.sh
+#   PORT=8081 BUILD_DIR=build ./scripts/serve.sh
 #
-# 环境变量：BUILD_DIR（默认 build-m5）、PORT（8080）、WS_PORT（9000）、
+# 环境变量：BUILD_DIR（默认 build）、PORT（8080）、WS_PORT（9000）、
 #           PROBE_PORT（9001）、APPROVAL（ask）、BIND（127.0.0.1）
 #           NPM_REGISTRY（默认 npmmirror，国内直连 registry.npmjs.org 慢）
 set -euo pipefail
@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-BUILD_DIR="${BUILD_DIR:-build-m5}"
+BUILD_DIR="${BUILD_DIR:-build}"
 PORT="${PORT:-8080}"
 WS_PORT="${WS_PORT:-9000}"
 PROBE_PORT="${PROBE_PORT:-9001}"

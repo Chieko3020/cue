@@ -23,10 +23,10 @@
 #   d) 故障态 fps 的 repeat 间离散度 ≤30%，修复态 fps 的离散度 ≤10%（阈值没抖）。
 #
 # 用法：
-#   BUILD_DIR=build-a15 ./scripts/test-real-faults.sh
-#   REPEAT=3 BUILD_DIR=build-a15 SUITE=suites/real-faults.json ./scripts/test-real-faults.sh
+#   BUILD_DIR=build ./scripts/test-real-faults.sh
+#   REPEAT=3 BUILD_DIR=build SUITE=suites/real-faults.json ./scripts/test-real-faults.sh
 #
-# 环境变量：BUILD_DIR（默认 build；必须显式指向你自己的构建目录）、REPEAT（默认 3）、
+# 环境变量：BUILD_DIR（默认 build；有自己的构建目录时用 BUILD_DIR 指定）、REPEAT（默认 3）、
 #           SUITE（默认 suites/real-faults.json）、WORK_ROOT（默认 runs/ac15-real-faults）、
 #           PUSH_SECONDS（每次推流秒数，默认 3）
 #

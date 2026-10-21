@@ -12,11 +12,11 @@
 # 断言只读审计与进程状态；rm 从来没有被执行过（沙箱在 fork 之前就拒绝）。
 #
 # 用法：
-#   BUILD_DIR=build-a11 ./scripts/test-shell-audit.sh
+#   BUILD_DIR=build ./scripts/test-shell-audit.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-build-a11}"
+BUILD_DIR="${BUILD_DIR:-build}"
 CUE="$ROOT/$BUILD_DIR/cue"
 EVAL="$ROOT/$BUILD_DIR/cue-eval"
 MOCK="$ROOT/$BUILD_DIR/cue-mock-svc"
