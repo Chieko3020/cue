@@ -37,7 +37,7 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 
 ### harness（`src/agent`、`src/tool`、`src/llm`、`src/sandbox`）
 
-外层是阶段状态机 `collect → diagnose → repair → verify → done/give_up`，内层是 ReAct 工具循环。工具用声明式 spec 描述参数与风险级，校验分三层（JSON 类型 → 枚举/范围 → 语义），审批分 `ReadOnly` / `Mutating` / `Dangerous` 三级，模式分 `Ask` / `Auto` / `Deny`。上下文预算按 turn 计数，超出前压缩。
+外层是阶段状态机 `collect → diagnose → repair → verify → done/give_up`，内层是 ReAct 工具循环。工具用声明式 spec 描述参数与风险级，校验分三层（JSON 类型 → 枚举/范围 → 语义），审批分 `ReadOnly` / `Mutating` / `Dangerous` 三级，模式分 `Ask` / `Auto` / `Deny`。上下文有 token 预算：超长观测按字节截断并留 `…[truncated N bytes]` 标记，不静默丢字段。
 
 边界：harness 层的头文件不得 include `media/`、`pipeline/`（CMake 在配置期扫描，违者直接 configure 失败）；工具层只认识 `IServicePipeline` 接口，不知道背后是子进程还是 HTTP 服务。
 
@@ -57,7 +57,7 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 
 ### 可观测（`src/eval` 的事件、`apps/cue-serve.cpp`、`web/console`）
 
-`cue-serve` 提供 `GET /events`（SSE，`id` 单调递增，环形缓冲 5000 条，支持 `Last-Event-ID` 补齐）、`GET /api/state` 快照、`POST /api/action` 控制动作、`POST /api/approve` 审批决策，并托管 `web/dist`。控制台五页是设备、管线、会话、审批、评测；审批页展示待审批队列与倒计时，动作必须走 `Registry::call_guarded`，不直接碰管线。
+`cue-serve` 提供 `GET /events`（SSE，`id` 单调递增，环形缓冲 512 条，支持 `Last-Event-ID` 补齐；更旧的事件靠 `/api/state` 全量快照恢复）、`GET /api/state` 快照、`POST /api/action` 控制动作、`POST /api/approve` 审批决策，并托管 `web/dist`。控制台五页是设备、管线、会话、审批、评测；审批页展示待审批队列与倒计时，动作必须走 `Registry::call_guarded`，不直接碰管线。
 
 边界：控制台是单机开发工具，没有鉴权、没有多租户；跨机部署需要自己在前面加一层（例如 nginx + SSO）。
 
@@ -107,7 +107,7 @@ ctest --test-dir build --output-on-failure
 ./scripts/run.sh demo
 ```
 
-它只构建 `cue` 一个 target，把完整诊断过程与结果写到 `runs/demo-<时间>.txt`，并在最后打印路径。干净 clone 首次运行（含 configure 与构建）实测 131 秒。
+它只构建 `cue` 一个 target，把完整诊断过程与结果写到 `runs/demo-<时间>.txt`，并在最后打印路径。干净 clone 首次运行（含 configure 与构建）实测 131 秒；只跑这一条时不需要先手动构建，脚本会自己 configure 并只编译 `cue`。
 
 ## 运行入口
 
@@ -133,23 +133,23 @@ ctest --test-dir build --output-on-failure
 # scripted：引擎自检，不需要 LLM（不判模型）
 ./build/cue-eval --suite suites/m4-diagnosis.json --mode scripted --repeat 1
 
-# real：默认回放 cassette，缺录制直接报 cassette_miss，不静默联网
+# 仓库里唯一入库的 cassette（假端点合成，只验证录制→回放链路）
+./build/cue demo --replay suites/cassettes/demo
+
+# real 模式默认回放；cassette 不随仓库分发，先用自己的 key 录一份
+./build/cue-eval --live --record --suite suites/m4-diagnosis.json    # 需要 CUE_API_KEY
 ./build/cue-eval --replay --suite suites/m4-diagnosis.json --cassette-dir cassettes
+# 缺录制时记 run_error=cassette_miss，不会静默联网
 
-# 真实调用并录制（需要 CUE_API_KEY）
-./build/cue-eval --live --record --suite suites/m4-diagnosis.json
-
-# 同一份工具观测回放 3 次，验证判定一致（注意：不是验证真实系统数值稳定）
-./build/cue-eval --suite suites/real-faults.json --mode scripted --repeat 3 \
-  --record-tools runs/tools --out runs
-./build/cue-eval --suite suites/real-faults.json --mode scripted --repeat 3 \
-  --replay-tools runs/tools --out runs
+# 真管线的工具观测：录制一次、回放 3 次（脚本包含合成推流与逐条断言）
+REPEAT=3 ./scripts/test-replay-consistency.sh
+REPEAT=3 ./scripts/test-real-faults.sh
 
 # 回归对比（退出码见下）
 ./build/cue-eval --diff run-<a> run-<b>
 ```
 
-`scripts/` 下的验证脚本都是自包含的：`test-real-faults.sh`（五类真实故障 × repeat，断言根因、SLA 与诊断特征）、`test-replay-consistency.sh`（真管线录制 + 回放 3 次）、`test-shell-audit.sh`（白名单拒绝与审计）、`test-cancel.sh`（取消后无残留）、`bench.sh`（六段与端到端分位）。
+`scripts/` 下的验证脚本都是自包含的：`test-real-faults.sh`（五类真实故障 × repeat，断言根因、SLA 与诊断特征）、`test-replay-consistency.sh`（真管线录制 + 回放 3 次）、`test-shell-audit.sh`（白名单拒绝与审计）、`test-cancel.sh`（取消后无残留）、`bench.sh`（六段与端到端分位）。前两个需要 node + python3 + ss，`test-cancel.sh` 与 `test-shell-audit.sh` 需要 python3，`bench.sh` 需要 node + ffmpeg；缺依赖时脚本第一行就会报缺什么。它们会占用 9000/9001/8080，跑之前先停掉 `run.sh` 与控制台。
 
 ## 评测口径
 
@@ -188,7 +188,7 @@ cassette 只覆盖 LLM 侧，不覆盖工具观测。所以：
 
 ## 安全边界
 
-工具按风险分三级：`ReadOnly`（`query_metrics`、`fetch_observation`）、`Mutating`（`pipeline_set_param`）、`Dangerous`（`inject_fault`、`run_shell`）。审批模式 `Ask` 逐条等控制台审批，`Auto` 自动批准但全量留痕，`Deny` 拒绝一切非只读动作。评测里 `Dangerous` 还受 case 的 `allowed_actions` 白名单约束。
+工具按风险分三级：`ReadOnly`（`query_metrics`、`fetch_observation`）、`Mutating`（`pipeline_set_param`）、`Dangerous`（`inject_fault`、`run_shell`）。审批模式 `Ask` 逐条等审批回调：控制台有审批队列，`cue run` 没接回调，非只读动作会被直接拒绝；`Auto` 自动批准但全量留痕，`Deny` 拒绝一切非只读动作。评测里 `Dangerous` 还受 case 的 `allowed_actions` 白名单约束。
 
 `run_shell` 是防御最深的一层：只允许 25 个只读诊断命令（`cat` / `ls` / `ps` / `ss` / `df` / `free` / `stat` / `grep` / `head` 等），按命令名精确匹配、不读 `PATH`、**不经 shell**（`execv` 直接启动，参数不拼接）；进入子进程后设 `RLIMIT_CPU=5s`、`RLIMIT_AS=256 MiB`、`RLIMIT_FSIZE=0`、`RLIMIT_NPROC=16`、`RLIMIT_NOFILE=64`，再用 landlock 只放行 `/usr`、`/lib`、`/lib64`（可读可执行）、`/etc`、`/proc`、`/sys`（只读）、工作目录（只读）与 `/dev/null`（可写）。每次调用——包括被白名单或审批拒绝的——都写一行审计 jsonl（`runs/audit.jsonl` 或 `runs/<run_id>/audit.jsonl`），带参数、退出码、耗时与截断标记。
 
