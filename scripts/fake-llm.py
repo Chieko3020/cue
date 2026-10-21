@@ -4,6 +4,8 @@
 两种剧本：
   demo  按序返回 `cue demo` 的 7 条脚本响应（用于验证录制/回放链路）
   eval  按对话状态返回一次「诊断」轨迹（用于 cue-eval --live --record）
+  shell / shell-long  AC-11 夹具：按序尝试 run_shell（越权拒绝 → 白名单命令 → 审计），
+                      shell-long 用一条长命令验证「工具执行中也能被取消」（AC-8）
 
 用法：
   python3 scripts/fake-llm.py --port 18765 --mode demo &
@@ -176,7 +178,57 @@ class EvalBrain:
         return text_reply("已进入 done，无需继续调用工具", usage)
 
 
-BRAINS = {"demo": DemoBrain, "eval": EvalBrain}
+# AC-11 夹具：按序尝试「白名单外 → 白名单内」命令。白名单外的 rm/sh/bash 只用于
+# 证明「拒绝 + 审计」，脚本里的 rm 永远不会被执行（沙箱在 fork 之前就拒了）。
+SHELL_SCRIPT = [
+    {"cmd": "rm", "args": ["-rf", "/tmp/cue-ac11-should-not-exist"]},
+    {"cmd": "/bin/sh", "args": ["-c", "echo ac11-pwned"]},
+    {"cmd": "bash", "args": ["-c", "echo ac11-pwned"]},
+    {"cmd": "ls", "args": ["/usr"]},
+]
+
+# AC-8 的「工具执行中被 SIGTERM」场景：ls -R -l /usr 在本机约 4.5 s（20 万+ 条目逐个 stat），
+# timeout_ms 设到工具允许的上限，保证信号到达时它一定还在执行。
+SHELL_LONG_SCRIPT = [{"cmd": "ls", "args": ["-R", "-l", "/usr"], "timeout_ms": 30000}]
+
+
+class ShellBrain:
+    """按剧本逐条返回 run_shell 调用，用完之后 give_up（避免无工具空转）。"""
+
+    def __init__(self, script):
+        self.script = script
+        self.lock = threading.Lock()
+        self.n = 0
+
+    def respond(self, request):
+        used = 0
+        for msg in request.get("messages", []):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                name, _ = _parse_call(tc)
+                if name == "run_shell":
+                    used += 1
+        with self.lock:
+            self.n += 1
+            turn = self.n
+        usage = (300 + turn * 7, 30 + turn)
+        if used < len(self.script):
+            step = self.script[used]
+            args = {"cmd": step["cmd"], "args": step["args"]}
+            if "timeout_ms" in step:
+                args["timeout_ms"] = step["timeout_ms"]
+            return tool_call(f"s{turn}", "run_shell", args, usage)
+        # 剧本走完：明确放弃，别让 Runner 用文本回复空转到轮次预算
+        return tool_call(f"s{turn}", "stage_complete", {"next": "give_up"}, usage)
+
+
+BRAINS = {
+    "demo": DemoBrain,
+    "eval": EvalBrain,
+    "shell": lambda: ShellBrain(SHELL_SCRIPT),
+    "shell-long": lambda: ShellBrain(SHELL_LONG_SCRIPT),
+}
 
 
 def make_handler(brain, stall_s=0.0):
