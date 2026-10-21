@@ -117,6 +117,12 @@ target_link_libraries(cue-probe PRIVATE cue_proto Threads::Threads)
 # ---- 静态资源目录（供本地 http server 使用）----
 add_custom_target(web ALL SOURCES web/index.html web/app.js)
 
+# ---- 沙箱层（AC-11）----
+# 独立成库：白名单 + landlock + rlimit 不依赖管线/agent，单测可以只链它，
+# 不必为了测「写被拒」而把假管线搬进来。
+add_library(cue_sandbox STATIC src/sandbox/sandbox.cpp)
+target_link_libraries(cue_sandbox PUBLIC cue_proto Threads::Threads)
+
 # ---- 分层静态库（SPEC §7.3）----
 # pipeline 只向下依赖 proto；agent 不认识 media/pipeline；eval 依赖两者。
 add_library(cue_pipeline STATIC
@@ -128,6 +134,8 @@ add_library(cue_pipeline STATIC
 # libcurl：HttpServicePipeline（REST 后端）是 pipeline 层的一部分，链接随之公开
 target_link_libraries(cue_pipeline PUBLIC
   cue_proto nlohmann_json::nlohmann_json PkgConfig::CURL Threads::Threads)
+# run_shell 的实现依赖沙箱层；头文件不暴露 sandbox，故 PRIVATE
+target_link_libraries(cue_pipeline PRIVATE cue_sandbox)
 
 add_library(cue_agent STATIC
   src/llm/client.cpp
@@ -225,6 +233,11 @@ add_executable(test_cassette tests/test_cassette.cpp)
 target_link_libraries(test_cassette PRIVATE cue_agent)
 add_test(NAME cassette COMMAND test_cassette)
 
+# AC-11 沙箱：白名单 / 真实执行 / landlock 写拒绝 / 超时 / 取消 / 输出截断
+add_executable(test_sandbox tests/test_sandbox.cpp)
+target_link_libraries(test_sandbox PRIVATE cue_sandbox)
+add_test(NAME sandbox COMMAND test_sandbox)
+
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
 # 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。
@@ -237,6 +250,9 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   if(_cue_san_runtime AND EXISTS "${_cue_san_runtime}")
     list(APPEND CUE_SAN_ENV "LD_PRELOAD=${_cue_san_runtime}")
   endif()
+  # test_sandbox 有意不在这个列表里：CUE_SAN_ENV 的 LD_PRELOAD=libasan 会被
+  # exec 出去的白名单命令继承，而 ASan 的 shadow 映射远超沙箱的 RLIMIT_AS=256 MB，
+  # 子进程会在 main 之前就死掉——那是测试夹具的冲突，不是沙箱的行为。
   foreach(_t wire agent context eval state compare console cassette)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
