@@ -3,10 +3,17 @@
 // 对抗用例直接取自 docs/research/review-eval.md 第 3 节：改判分器后必须复跑这些构造，
 // 任何一个被接受就是回归。
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "cue/eval/eval.h"
+#include "cue/pipeline/recorded_pipeline.h"
 
 namespace eval = cue::eval;
 namespace agent = cue::agent;
@@ -193,8 +200,178 @@ int main() {
     check(m4.has_value() && m4->size() == 2, "case10 m4-diagnosis 可加载");
   }
 
+
+// 11) 工具观测录制/回放（AC-6 的底层保证）：NaN 往返、参数不符报错、录制用尽报 miss
+class FakePipeline : public cue::pipeline::IServicePipeline {
+ public:
+  bool start(std::string&) override { return true; }
+  void stop() override { ++stops; }
+  bool running() const override { return true; }
+  cue::pipeline::PipelineMetrics latest() const override {
+    cue::pipeline::PipelineMetrics m;
+    m.fps = 29.97;
+    m.frames_in = 300;
+    m.samples = 1;
+    m.alive = true;
+    m.pid = 4242;
+    m.updated_us = 123456;
+    m.decode_p50 = 1.24;
+    // 没采到的分位：回放后必须仍是 NaN，不能变成 0
+    m.decode_p99 = cue::pipeline::kNoSample;
+    m.encode_p50 = cue::pipeline::kNoSample;
+    return m;
+  }
+  void set_event_callback(std::function<void(const cue::pipeline::PipelineEvent&)> cb) override {
+    cb_ = std::move(cb);
+  }
+  std::vector<cue::pipeline::PipelineEvent> recent_events(std::size_t) const override {
+    // 故意乱序：回调重放时必须按 t_us 排
+    return {cue::pipeline::PipelineEvent{"late", nlohmann::json::object(), 20, 21},
+            cue::pipeline::PipelineEvent{"early", nlohmann::json::object(), 10, 11}};
+  }
+  bool set_param(const std::string& key, const std::string& value, std::string& err) override {
+    (void)value;
+    if (key == "gop") {
+      err = "gop out of range [1, 300]";
+      return false;
+    }
+    return true;
+  }
+  bool inject_fault(const std::string& kind, double value, std::string&) override {
+    (void)kind;
+    (void)value;
+    return true;
+  }
+  std::string observation(const std::string& source, int tail, std::string&) const override {
+    return source + ":" + std::to_string(tail);
+  }
+  int stops = 0;
+
+ private:
+  std::function<void(const cue::pipeline::PipelineEvent&)> cb_;
+};
+
+{
+  namespace fs = std::filesystem;
+  using cue::pipeline::RecordingPipeline;
+  using cue::pipeline::ReplayPipeline;
+  const fs::path dir = fs::temp_directory_path() / ("cue-test-replay-" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  const std::string rec_path = cue::pipeline::tools_record_path(dir.string(), "a/b");
+  check(rec_path.find("a-b.tools.jsonl") != std::string::npos,
+        "case11 case id 里的 / 被净化为 - 后落盘");
+
+  {
+    RecordingPipeline rp(std::make_unique<FakePipeline>(), dir.string(), "a/b");
+    check(rp.io_error().empty(), "case11 录制文件可写");
+    std::string err;
+    check(rp.start(err), "case11 录制 start");
+    const auto m = rp.latest();
+    check(m.samples == 1 && m.fps == 29.97, "case11 录制 latest 透传");
+    check(rp.set_param("bitrate_kbps", "800", err), "case11 录制 set_param 成功");
+    check(!rp.set_param("gop", "61", err), "case11 录制 set_param 失败也照录");
+    err.clear();
+    check(rp.inject_fault("drop", 5.0, err), "case11 录制 inject_fault");
+    err.clear();  // 调用方负责在每次调用前清空 err：录制按「err 是否为空」判成败
+    check(rp.observation("procs", 20, err) == "procs:20", "case11 录制 observation");
+    check(rp.recent_events(0).size() == 2, "case11 录制 recent_events");
+    check(rp.running(), "case11 录制 running");
+    rp.stop();
+    rp.stop();
+  }
+
+  // 文件格式：NaN 必须是 null（贴一行最容易被 0 冒充的字段）
+  std::string file_text;
+  {
+    std::ifstream in(rec_path);
+    std::string line;
+    while (std::getline(in, line)) file_text += line + "\n";
+  }
+  check(file_text.find("\"v\":1") != std::string::npos, "case11 录制带版本字段");
+  check(file_text.find("\"decode_p50_ms\":1.24") != std::string::npos, "case11 有样本的分位写数字");
+  check(file_text.find("\"decode_p99_ms\":null") != std::string::npos, "case11 无样本的分位写 null");
+  check(file_text.find("\"encode_p50_ms\":null") != std::string::npos, "case11 无样本的 encode 写 null");
+  check(file_text.find("\"decode_p99_ms\":0") == std::string::npos, "case11 无样本绝不写成 0");
+
+  {
+    ReplayPipeline rp(rec_path);
+    check(rp.load_error().empty(), "case11 回放加载成功");
+    std::string err;
+    check(rp.start(err), "case11 回放 start");
+    const auto m = rp.latest();
+    check(m.samples == 1 && m.fps == 29.97 && m.pid == 4242, "case11 回放指标一致");
+    check(cue::pipeline::has_sample(m.decode_p50) && m.decode_p50 == 1.24, "case11 回放 p50 还原");
+    check(!cue::pipeline::has_sample(m.decode_p99), "case11 回放 NaN 仍是 NaN（不是 0）");
+    check(!cue::pipeline::has_sample(m.encode_p50), "case11 回放 encode NaN 仍是 NaN");
+
+    check(rp.set_param("bitrate_kbps", "800", err), "case11 回放 set_param 命中");
+    err.clear();
+    check(!rp.set_param("gop", "61", err), "case11 回放录制中的失败也如实复现");
+    check(err.find("out of range") != std::string::npos, "case11 回放失败文案来自录制");
+    check(rp.inject_fault("drop", 5.0, err), "case11 回放 inject_fault 命中");
+    // 先试与录制不符的参数：必须明确失败且不消费录制（回放不能「拿另一条顶上」）
+    err.clear();
+    check(rp.observation("procs", 21, err).empty(), "case11 回放参数不符必须失败");
+    check(err.find("参数不符") != std::string::npos, "case11 参数不符的错误文案明确");
+    err.clear();
+    check(rp.observation("procs", 20, err) == "procs:20", "case11 回放 observation 命中");
+    const auto evs = rp.recent_events(0);
+    check(evs.size() == 2 && evs[0].type == "late" && evs[1].type == "early",
+          "case11 回放 recent_events 原样返回");
+    check(rp.running(), "case11 回放 running 返回录制值");
+    rp.stop();
+    rp.stop();  // 幂等空操作：不消费、不记 miss
+    std::vector<std::string> order;
+    rp.set_event_callback([&order](const cue::pipeline::PipelineEvent& e) { order.push_back(e.type); });
+    check(order.size() == 2 && order[0] == "early" && order[1] == "late",
+          "case11 事件回调按 t_us 重放");
+
+    // 相同参数的 set_param 再要一条：录制里没有 → miss 必须报错
+    const auto before = rp.stats().misses;
+    err.clear();
+    check(!rp.set_param("bitrate_kbps", "800", err), "case11 录制用尽 → 失败而不是给默认值");
+    check(rp.stats().misses == before + 1, "case11 miss 计数递增");
+    check(rp.last_error().find("miss") != std::string::npos, "case11 miss 有明确说明");
+    // latest 用尽：返回 samples=0，绝不伪造
+    err.clear();
+    check(rp.latest().samples == 0, "case11 latest 用尽返回 samples=0");
+    check(rp.stats().misses == before + 2, "case11 latest miss 计数递增");
+  }
+
+  // 负向：把录制里 set_param 的 key 改掉再回放 → 必须明确失败
+  {
+    const std::string bad = (dir / "bad.tools.jsonl").string();
+    std::string text = file_text;
+    const std::string from = "\"key\":\"bitrate_kbps\"";
+    const std::string to = "\"key\":\"gop\"";
+    const auto pos = text.find(from);
+    check(pos != std::string::npos, "case11 负向用例能定位到 set_param 的 key");
+    if (pos != std::string::npos) text.replace(pos, from.size(), to);
+    {
+      std::ofstream out(bad);
+      out << text;
+    }
+    ReplayPipeline rp(bad);
+    check(rp.load_error().empty(), "case11 改 key 后文件仍可加载");
+    std::string err;
+    check(rp.start(err), "case11 负向 start 命中");
+    check(!rp.set_param("bitrate_kbps", "800", err), "case11 参数不符 → 回放明确失败");
+    check(err.find("参数不符") != std::string::npos, "case11 参数不符不被静默接受");
+    check(rp.stats().misses == 1, "case11 参数不符计 miss");
+  }
+
+  // 负向：文件不存在 → 加载失败，不允许空实现
+  {
+    ReplayPipeline rp((dir / "missing.tools.jsonl").string());
+    check(!rp.load_error().empty(), "case11 缺录制文件 → load_error");
+    std::string err;
+    check(!rp.start(err), "case11 缺录制文件时 start 失败");
+  }
+  fs::remove_all(dir);
+}
+
   if (failures == 0) {
-    std::printf("test_eval: OK (10 groups)\n");
+    std::printf("test_eval: OK (11 groups)\n");
     return 0;
   }
   std::printf("test_eval: %d failure(s)\n", failures);

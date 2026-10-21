@@ -123,6 +123,7 @@ add_library(cue_pipeline STATIC
   src/pipeline/process_control.cpp
   src/pipeline/service_pipeline.cpp
   src/pipeline/http_pipeline.cpp
+  src/pipeline/recorded_pipeline.cpp
   src/pipeline/tools.cpp)
 # libcurl：HttpServicePipeline（REST 后端）是 pipeline 层的一部分，链接随之公开
 target_link_libraries(cue_pipeline PUBLIC
