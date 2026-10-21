@@ -94,23 +94,29 @@ lines.push(`- 主机：${meta.host}（${meta.nproc} vCPU，${meta.mem_gib} GiB�
 lines.push(`- 构建：\`${meta.build_dir}\`（${meta.build_type}，${meta.compiler}）`);
 lines.push(`- 样本：${meta.sample.name}，${meta.sample.width}x${meta.sample.height} @${meta.sample.fps}fps，`
   + `循环 ${meta.sample.frames} 帧 / 平均 ${meta.sample.avg_frame_bytes} B/帧 / `
-  + `${meta.sample.avg_fragments} 个下行数据报每帧`);
+  // 注意这是「上行 WS 分片数」（≤16 KiB/片），不是下行数据报数：下行由 cued 按 ≤1200 B 切片，
+  // 帧越大分片越多 —— FEC/NACK 只有在「每帧 >1 个下行数据报」时才真正参与。
+  + `${meta.sample.avg_fragments} 个上行 WS 分片每帧（下行按 ≤1200 B 再切片）`);
 lines.push(`- 每场景：客户端推 ${meta.seconds_per_run} s（${meta.fps} fps 目标），结束后再等 ${meta.settle_secs} s 让 probe 结算未完成帧`);
 lines.push(`- 注入：cued \`--inject-drop <pct>\`（分片后、sendto 前，\`splitmix64(seed=42, 包序号)\` 单线程决策）`);
 lines.push('');
 
 // ---- 表 1/2：六段耗时分位（无故障）----
 const clean = data.filter((d) => d.s.drop_pct === 0);
-const row = (d, p) => `| ${d.s.label} | \`--transcode ${d.s.transcode}\` | ${stage(d.cued, 'recv', p)} | ${stage(d.cued, 'buffer', p)} | `
+const row = (d, p, withLat) => `| ${d.s.label} | \`--transcode ${d.s.transcode}\` | ${stage(d.cued, 'recv', p)} | ${stage(d.cued, 'buffer', p)} | `
   + `${stage(d.cued, 'decode', p)} | ${stage(d.cued, 'op', p)} | ${stage(d.cued, 'encode', p)} | ${stage(d.cued, 'send', p)} |`
-  + ` ${d.lat ? f(d.lat.lat_p50, 2) : 'n/a'} / ${d.lat ? f(d.lat.lat_p99, 2) : 'n/a'} | ${f(d.cued && d.cued.fps, 1)} |`;
+  + (withLat
+    ? ` ${d.lat ? f(d.lat.lat_p50, 2) : 'n/a'} / ${d.lat ? f(d.lat.lat_p99, 2) : 'n/a'} | ${f(d.cued && d.cued.fps, 1)} |`
+    : ` ${f(d.cued && d.cued.fps, 1)} |`);
 
-for (const [title, p] of [['p50', 'p50'], ['p99', 'p99']]) {
+for (const [title, p, withLat] of [['p50', 'p50', true], ['p99', 'p99', false]]) {
   lines.push(`## cued 六段耗时 ${title}（无故障，单位 ms）`);
   lines.push('');
-  lines.push('| 场景 | 档位 | recv | buffer | decode | op | encode | send | probe 端到端 p50 / p99 (ms) | cued fps |');
-  lines.push('|---|---|---|---|---|---|---|---|---|---|');
-  for (const d of clean) lines.push(row(d, p));
+  lines.push(withLat
+    ? '| 场景 | 档位 | recv | buffer | decode | op | encode | send | probe 端到端 p50 / p99 (ms) | cued fps |'
+    : '| 场景 | 档位 | recv | buffer | decode | op | encode | send | cued fps |');
+  lines.push(withLat ? '|---|---|---|---|---|---|---|---|---|---|' : '|---|---|---|---|---|---|---|---|---|');
+  for (const d of clean) lines.push(row(d, p, withLat));
   lines.push('');
   lines.push('`encode` 为 `-` 表示该段没有被采样（passthrough 不编码），不是 0 ms。');
   lines.push('');
@@ -122,20 +128,24 @@ lines.push('');
 const lossy = data.filter((d) => d.s.drop_pct > 0);
 lines.push(`## ${meta.sample.drop_pct_for_lossy || 5}% 丢包下的帧完成率与 FEC/NACK 恢复`);
 lines.push('');
-lines.push('| 配置 | FEC | NACK | 客户端发帧 | probe 完成帧 | 帧完成率 | probe 判丢帧 | FEC 恢复分片 | NACK 请求 | 分片丢失率（窗口均值） |');
-lines.push('|---|---|---|---|---|---|---|---|---|---|');
+lines.push('| 配置 | FEC | NACK | 客户端发帧 | probe 完成帧 | 帧完成率 | probe 判丢帧 | FEC 恢复分片 | NACK 请求 | 注入丢包分片 | probe 缺片率均值 |');
+lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
 for (const d of lossy) {
   const sent = d.client.frames_sent;
   const done = d.probe ? d.probe.frames : null;
   const rate = sent && done !== null ? pct(done, sent) : NaN;
   lines.push(`| ${d.s.label} | ${d.s.fec ? 'on' : 'off'} | ${d.s.nack ? 'on' : 'off'} | ${f(sent, 0)} | ${f(done, 0)} | `
     + `${Number.isNaN(rate) ? 'n/a' : rate.toFixed(2) + '%'} | ${f(d.probe && d.probe.lost, 0)} | `
-    + `${f(d.probe && d.probe.fec_rec, 0)} | ${f(d.probe && d.probe.nack, 0)} | ${f(d.probe && d.probe.loss_pct, 2, '%')} |`);
+    + `${f(d.probe && d.probe.fec_rec, 0)} | ${f(d.probe && d.probe.nack, 0)} | ${f(d.cued && d.cued.injected, 0)} | ${f(d.lossWindow, 2, '%')} |`);
 }
 lines.push('');
 lines.push('帧完成率 = probe 完整重组的帧数 / 客户端实际发出的帧数（端到端，含 cued 侧令牌桶/切片失败丢的帧）。');
-lines.push('probe 判丢帧 = 2 s 内未凑齐分片而超时结算的帧数；'
-  + '分片丢失率 = probe 每个 1 s 窗口的 loss%（只统计有包到达的窗口）的均值。');
+lines.push('probe 判丢帧 = 2 s 内未凑齐分片而超时结算的帧数。');
+lines.push('');
+lines.push('「注入丢包分片」是 cued 自己的计数（准确）；「probe 缺片率均值」= probe 每个 1 s 窗口 '
+  + 'loss%（只统计有包到达的窗口）的均值，它用的是 recv_parts（**真实**收到的分片）：'
+  + 'FEC 修复的分片不计入 recv_parts，所以「仅 FEC」档这个数字仍接近原始丢包率；'
+  + 'NACK 重传到达后会被计入，所以「仅 NACK」档接近 0。两者不能互相替代。');
 lines.push('');
 
 // ---- 表 4：恢复率（相对无恢复基线）----
@@ -168,6 +178,8 @@ lines.push('## 原始计数');
 lines.push('');
 lines.push('| 场景 | cued frames_in | cued frames_out | cued injected | budget_drops | encode_errors | probe pkts | probe 完成帧 |');
 lines.push('|---|---|---|---|---|---|---|---|');
+// cued 的计数来自最后一次每秒 METRICS，比 probe 的结算时刻早 ≤1 s：
+// 无故障档会出现「probe 完成帧 > cued frames_out」，这不是丢帧，是采样时刻差。
 for (const d of data) {
   const c = d.cued || {};
   lines.push(`| ${d.s.label} | ${f(c.frames_in, 0)} | ${f(c.frames_out, 0)} | ${f(c.injected, 0)} | `

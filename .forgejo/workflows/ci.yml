@@ -5,8 +5,14 @@
 #   * 一律 -j1：本机 1.9 GiB 内存，-j2 编 libavcodec 相关 TU 会 OOM（见 docs 记录）；
 #   * 不上传任何产物（bench 数据与覆盖率日志留在 runner 本地）。
 #
-# 本地手动验证（本机没有注册 Forgejo runner 时）：逐条跑各 job 的 run: 命令即可，
-# 见 docs/research/m6-ci-bench.md 的「手跑验证」一节。
+# runner 前置（self-hosted）：
+#   * g++-14 / cmake>=3.20 / node / ffmpeg+x264 / libboost-system / nlohmann-json / libcurl；
+#   * tsan job 需要把 vm.mmap_rnd_bits 调到 28：内核默认 32 时 GCC 14 的 libtsan 会随机
+#     FATAL: unexpected memory mapping（见 tsan job 的「环境」步骤，sudo 不可用时只告警）；
+#   * ASan 的 LD_PRELOAD 由 CMake 的 ctest ENVIRONMENT 处理（本机 /etc/ld.so.preload 预加载
+#     libonion.so，会把 libasan 挤到第二位），不需要 job 里额外写。
+#
+# 本地手动验证（本机没有注册 Forgejo runner 时）：逐条跑各 job 的 run: 命令即可。
 name: ci
 
 on:
@@ -62,6 +68,14 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+
+      - name: 环境（TSan 需要较低的 mmap 随机化位数）
+        run: |
+          # vm.mmap_rnd_bits=32（Ubuntu 24.04 内核默认）下 libtsan 会随机
+          # FATAL: ThreadSanitizer: unexpected memory mapping；28 是 6.6 之前的默认值。
+          # 只是本次运行的临时改动，重启即恢复。
+          sudo -n sysctl -w vm.mmap_rnd_bits=28 \
+            || echo "::warning::无 sudo 权限，未能下调 vm.mmap_rnd_bits；若 tsan 报 unexpected memory mapping，请以 root 执行 sysctl -w vm.mmap_rnd_bits=28"
 
       - name: 配置（TSan 单独一个构建目录）
         run: cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCUE_SANITIZE=thread
