@@ -1187,6 +1187,10 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   // SPEC §7.4：dangerous 工具必须由 case 显式授权；空集合 = 一个都不允许
   ac.ctx.allowed_dangerous = c.allowed_actions;
   ac.yuan_per_mtok = cfg_.yuan_per_mtok;
+  // AC-8：评测路径同样要能被打断。RunConfig::cancel 由 apps/cue-eval.cpp 的信号处理置位，
+  // Runner 每轮/每次 LLM 调用前检查，并把指针写进 ChatRequest.cancel 交给 curl 的中止回调。
+  // 少了这一行，SIGTERM 后 agent 会一直卡到 LLM 超时（最坏 3 分钟），AC-8 的 5 秒失效。
+  ac.cancel = cfg_.cancel;
   // SPEC §7.5 的 verify→done 守卫：harness 重测，不信 agent 自报（事件里标 verify=measured）
   ac.verify_sla = [&pipe, &c](const agent::Diagnosis&) {
     const auto m = pipe->latest();
