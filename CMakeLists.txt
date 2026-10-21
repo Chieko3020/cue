@@ -121,6 +121,7 @@ add_custom_target(web ALL SOURCES web/index.html web/app.js)
 # pipeline 只向下依赖 proto；agent 不认识 media/pipeline；eval 依赖两者。
 add_library(cue_pipeline STATIC
   src/pipeline/process_control.cpp
+  src/pipeline/service_pipeline.cpp
   src/pipeline/tools.cpp)
 target_link_libraries(cue_pipeline PUBLIC cue_proto nlohmann_json::nlohmann_json Threads::Threads)
 

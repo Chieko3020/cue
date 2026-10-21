@@ -1,4 +1,4 @@
-// ProcessPipelineControl：用「子进程 + stdout 解析」实现 IPipelineControl
+// ProcessPipelineControl：用「子进程 + stdout 解析」实现 IServicePipeline
 // 这是 M3 的过渡实现：接口与 SPEC §7.3 一致，后续可整体替换成 UDS 后端而不动 agent/工具层。
 //
 // 已知限制（写进 RECEIPT）：
@@ -9,10 +9,8 @@
 #include <sys/types.h>
 
 #include <atomic>
-#include <cmath>
 #include <cstdint>
 #include <deque>
-#include <limits>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -22,101 +20,49 @@
 
 #include <nlohmann/json.hpp>
 
+#include "cue/pipeline/metrics.h"
+#include "cue/pipeline/service_pipeline.h"
+
 namespace cue::pipeline {
 
-// 分位缺失的哨兵：NaN 而不是 0（见 PipelineMetrics 的注释）
-inline constexpr double kNoSample = std::numeric_limits<double>::quiet_NaN();
+// 观测数据模型（PipelineEvent / PipelineMetrics / kNoSample / has_sample）已搬到
+// cue/pipeline/metrics.h：所有管线后端共用一份口径，本头文件继续把它们带进来，
+// 所以原先只 include process_control.h 的代码不需要改动。
 
-// 该分位是否真的采到了（NaN 表示没有样本）
-inline bool has_sample(double v) { return std::isfinite(v); }
-
-// 一条事件：cued stdout 里的 [cue-event] 行，或 harness 自己合成的控制面事件。
-// data 原样保留（不同 ev 的字段不同，消费者按键取），t_us 是事件时间（unix us），
-// seen_us 是本进程读到它的单调时钟时刻——两者口径不同，跨进程比较只能用 seen_us。
-struct PipelineEvent {
-  std::string type;
-  nlohmann::json data = nlohmann::json::object();
-  int64_t t_us = 0;
-  int64_t seen_us = 0;
-};
-
-struct PipelineMetrics {
-  double fps = 0;
-  uint64_t frames_in = 0;
-  uint64_t frames_out = 0;
-  uint64_t dropped = 0;
-  uint64_t injected = 0;
-  uint64_t decoded = 0;
-  uint64_t decode_errors = 0;
-  uint64_t rejected = 0;  // 协议边界拒绝数（wire.h 的拒绝原因分类在 cued 侧汇总）
-  // cued METRICS 行里原本就有、但过去没往 agent 侧暴露的计数（0 是真实读数，不是缺省）
-  uint64_t send_errors = 0;    // sendto 失败（ENOBUFS/EMSGSIZE），不是"已发送"
-  uint64_t encode_errors = 0;  // 编码失败（尺寸/格式/编码器错误）
-  uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
-  uint64_t budget_drops = 0;   // 令牌桶不足丢的帧
-  // 六段 p50（ms）。NaN = 这一段没有样本（cued 的 METRICS 对应段是 null）：
-  // "没采到"与"花了 0 ms"是两件事，消费者必须输出 null/n/a，不能用 0 冒充。
-  double recv_p50 = kNoSample, buffer_p50 = kNoSample, decode_p50 = kNoSample,
-         op_p50 = kNoSample, encode_p50 = kNoSample, send_p50 = kNoSample;
-  // 六段 p99（ms，同上：只有 cued 真正打印了 p99 的段才有值）
-  double decode_p99 = kNoSample, op_p99 = kNoSample, encode_p99 = kNoSample;
-  int64_t updated_us = 0;
-  uint64_t samples = 0;
-  // 快照时的存活状态：cued 被 kill 后 latest() 不能继续撒谎（review #11）
-  bool alive = false;
-  // 指标属于哪个 cued 会话（同一个 cue 进程内可能重启过多代）；消费者据此判断跨进程拼接（#25）
-  pid_t pid = 0;
-};
-
-class ProcessPipelineControl {
+class ProcessPipelineControl : public IServicePipeline {
  public:
-  struct Config {
-    std::string cued_bin = "./build/cued";
-    int ws_port = 9000;
-    int probe_port = 9001;
-    // 初始参数
-    bool transcode = false;
-    int width = 0;
-    int height = 0;
-    int bitrate_kbps = 1500;
-    int fps = 30;
-    int gop = 60;
-    std::string preset = "veryfast";
-    double inject_drop = 0.0;
-    uint64_t inject_seed = 42;
-    bool fec = true;
-    double send_mbps = 10.0;
-    // cued stdout 的 [cue-event] 行回调（SSE / 前端 / 评测消费事件用）。
-    // 在 reader 线程里调用：不要在里面阻塞，也不要调本类的阻塞方法（latest() 可以）。
-    // 构造后修改无效——需要换回调用 set_event_callback()。
-    std::function<void(const PipelineEvent&)> on_event;
-  };
+  // 端点描述的唯一来源是 PipelineEndpoint（M7 起 ProcessPipelineControl::Config 只是它的
+  // 别名）：否则两个结构体字段各自演化，将来加字段必有一边漏掉。
+  using Config = PipelineEndpoint;
 
   explicit ProcessPipelineControl(Config cfg);
-  ~ProcessPipelineControl();
+  ~ProcessPipelineControl() override;
 
   // exec 握手失败（路径错/无权限）时返回 false 并带 errno 文案，不再"假装启动成功"（#10）
-  bool start(std::string& err);
-  void stop();
+  bool start(std::string& err) override;
+  void stop() override;
   // pid_ 由监督线程在子进程被回收时清零，所以对死进程不再返回 true（#11）
-  bool running() const { return pid_.load() != 0; }
+  bool running() const override { return pid_.load() != 0; }
 
   // 返回最近一次统计（无样本时 samples=0，alive 表示 cued 当下是否还活着）
-  PipelineMetrics latest() const;
+  PipelineMetrics latest() const override;
 
   // 换事件回调（与 Config::on_event 等价，构造后也能改）。
-  void set_event_callback(std::function<void(const PipelineEvent&)> cb);
+  void set_event_callback(std::function<void(const PipelineEvent&)> cb) override;
 
   // 最近的事件（n=0 表示缓存里的全部；缓存上限见 kEventMax）。
   // 事件缓存与 on_event 是同一份数据：解析到就入缓存，再回调。
-  std::vector<PipelineEvent> recent_events(std::size_t n = 0) const;
+  // 默认实参只在 IServicePipeline 上声明一次，这里不能再给。
+  std::vector<PipelineEvent> recent_events(std::size_t n) const override;
 
   // key ∈ bitrate_kbps / gop / preset / transcode / width / height；通过重启生效
   // width/height 必须成对给出且为偶数，0/0 表示沿用解码尺寸
-  bool set_param(const std::string& key, const std::string& value, std::string& err);
-  bool inject_fault(const std::string& kind, double value, std::string& err);
-  std::string observation(const std::string& source, int tail, std::string& err) const;
+  bool set_param(const std::string& key, const std::string& value, std::string& err) override;
+  bool inject_fault(const std::string& kind, double value, std::string& err) override;
+  std::string observation(const std::string& source, int tail, std::string& err) const override;
 
+  // 不在 IServicePipeline 里：这是「子进程后端」的实现细节（HTTP/回放后端没有 cued 启动参数），
+  // 工具层/评测层不得依赖它。
   const Config& config() const { return cfg_; }
 
  private:
