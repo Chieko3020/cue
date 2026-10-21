@@ -164,6 +164,9 @@ json cassette_request_json(const ChatRequest& req, const std::string& default_mo
   }
   for (const auto& m : req.messages) msgs.push_back(message_json(m, seen));
 
+  // 字段清单必须是「请求语义」的完整枚举：ChatRequest::cancel 是运行期控制信号
+  // （一个地址），不是请求内容——把它写进 key 会让「取消过一次」的进程算出不同的 key，
+  // 录制永远回放不中。timeout_s 同理（它随剩余墙钟变化，录/放必然不同）。
   return json{{"model", effective_model(req, default_model)},
               {"messages", std::move(msgs)},
               {"tools", req.tools.is_array() ? req.tools : json::array()},

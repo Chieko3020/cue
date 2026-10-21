@@ -60,8 +60,17 @@ struct HttpOutcome {
   bool overflow = false;
 };
 
+// 取消通道：libcurl 在传输期间至少每秒调一次 progress 回调（对端一个字节都没发时也一样），
+// 所以「外部取消标志」只能在这里被看见——否则请求要么等满 timeout_s，要么等重试退避跑完
+// （默认 60 s × 3 次）。回调只做一次原子 load，不碰锁/内存分配。
+int xferinfo_cb(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+  const auto* flag = static_cast<const std::atomic<bool>*>(userdata);
+  return (flag != nullptr && flag->load(std::memory_order_relaxed)) ? 1 : 0;
+}
+
 HttpOutcome perform(CURL* curl, const curl_slist* headers, const std::string& url,
-                    const std::string& payload, int timeout_s, std::size_t max_bytes) {
+                    const std::string& payload, int timeout_s, std::size_t max_bytes,
+                    const std::atomic<bool>* cancel) {
   HttpOutcome o;
   // 复用句柄：reset 掉上次的选项，但保留连接缓存（省掉每轮一次 TLS 握手）
   curl_easy_reset(curl);
@@ -75,6 +84,10 @@ HttpOutcome perform(CURL* curl, const curl_slist* headers, const std::string& ur
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout_s));
   curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");  // 开启 gzip/deflate，curl 自动解压
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  // 取消：NOPROGRESS 必须关掉，否则 XFERINFOFUNCTION 不会被调用
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(cancel));
   o.rc = curl_easy_perform(curl);
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &o.http_code);
   o.overflow = sink.overflow;
@@ -209,6 +222,8 @@ OpenAiCompatibleClient::~OpenAiCompatibleClient() = default;
 
 std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const ChatRequest& req) {
   if (!impl_->curl) return std::unexpected("curl_easy_init failed");
+  // 已经取消就别浪费一次（可能是计费的）请求
+  if (req.cancel != nullptr && req.cancel->load()) return std::unexpected("cancelled");
 
   json body{
       {"model", req.model.empty() ? cfg_.model : req.model},
@@ -241,13 +256,21 @@ std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const Chat
       std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     }
     ++attempts;
-    outcome = perform(impl_->curl, impl_->headers, url, payload, timeout_s, cfg_.max_response_bytes);
+    outcome = perform(impl_->curl, impl_->headers, url, payload, timeout_s, cfg_.max_response_bytes,
+                      req.cancel);
+    // 取消是调用方主动放弃：立刻收手，绝不能落进 429/5xx 的退避重试（否则一次取消会
+    // 被拖成 200ms + 800ms + 又一次满超时，AC-8 的 5 秒预算就破了）
+    if (outcome.rc == CURLE_ABORTED_BY_CALLBACK) break;
     if (!retryable(outcome.rc, outcome.http_code, outcome.overflow)) break;
   }
 
   const std::string suffix = attempts > 1 ? " (after " + std::to_string(attempts) + " attempts)" : "";
   if (outcome.overflow) {
     return std::unexpected("response too large (> " + std::to_string(cfg_.max_response_bytes) + " bytes)");
+  }
+  if (outcome.rc == CURLE_ABORTED_BY_CALLBACK) {
+    // 与「网络超时」区分开：上层据此知道是取消而不是端点故障（也不会被重试）
+    return std::unexpected("cancelled");
   }
   if (outcome.rc != CURLE_OK) {
     return std::unexpected(std::string("curl: ") + curl_easy_strerror(outcome.rc) + suffix);

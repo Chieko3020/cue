@@ -3,6 +3,7 @@
 // - OpenAiCompatibleClient：真实调用（M3b 接入）
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -45,6 +46,10 @@ struct ChatRequest {
   // 本次请求的超时（秒）；0 表示用客户端配置。Runner 用它把"剩余墙钟预算"传给 client，
   // 避免单次调用把整轮预算顶穿（SPEC §7.5）。只允许**收紧**，不能放宽客户端配置。
   int timeout_s = 0;
+  // 非空且被置位 = 调用方要求中止本次请求（SIGTERM/预算耗尽）。传输层必须尽快返回
+  // 失败，不允许把「用户已经放弃」拖成一次正常超时。
+  // 它**不是**请求内容：cassette key 不包含它（否则回放必 miss）。
+  const std::atomic<bool>* cancel = nullptr;
 };
 
 struct ChatResponse {

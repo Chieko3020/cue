@@ -259,6 +259,17 @@ int main() {
     const std::string canon = llm::cassette_request_json(a).dump();
     check(canon.find("call_abc") == std::string::npos, "归一化请求不含原始 tool_call_id");
     check(canon.find("tcid-0") != std::string::npos, "归一化请求用 tcid 序号");
+
+    // AC-8：cancel 是运行期控制信号（一个地址），不是请求内容。只有它不同的两个请求
+    // 必须算出同一个 key，否则「取消过一次」的进程回放永远 miss。
+    std::atomic<bool> cancel_off{false};
+    std::atomic<bool> cancel_on{true};
+    llm::ChatRequest c_off = req;
+    c_off.cancel = &cancel_off;
+    llm::ChatRequest c_on = req;
+    c_on.cancel = &cancel_on;
+    check(llm::cassette_key(c_off) == k, "带 cancel 指针的请求与不带时同 key");
+    check(llm::cassette_key(c_off) == llm::cassette_key(c_on), "cancel 未置位/已置位不影响 key");
   }
 
   // 2) 录制（真实 HTTP）→ 回放（同序、usage 照抄、miss 报错）
