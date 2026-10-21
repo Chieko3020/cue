@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # AC-8 的可重复验证：kill -TERM cue 之后，进程与子进程是否都在 5 秒内消失。
 #
-# 两个场景都把 cue 卡在 LLM 调用里（假端点收完请求故意不回），区别是「管线在不在跑」：
-#   llm-only  没有管线在跑：cued 起来就退出，监督线程重启预算耗尽 → 纯 LLM 阻塞
-#   pipeline  真实 cued 在跑 → 取消必须把它（及其进程组）一起收掉
+# 三个场景都把进程卡在 LLM 调用里（假端点收完请求故意不回），区别是「管线在哪」：
+#   llm-only       没有管线在跑：cued 起来就退出，监督线程重启预算耗尽 → 纯 LLM 阻塞
+#   pipeline       真实 cued 在跑 → 取消必须把它（及其进程组）一起收掉
+#   eval-endpoint  cue-eval 走 --endpoint 指向假域（HTTP 后端）→ 评测路径的取消同样要成立
 #
 # 断言：
-#   1) 从 kill -TERM 到 cue 消失 < 5000 ms
-#   2) cue 退出码 130 且日志里有明确的「已取消」
+#   1) 从 kill -TERM 到进程消失 < 5000 ms
+#   2) 退出码 130 且（cue run）日志里有明确的「已取消」
 #   3) ps 里没有 cued / cue-probe 残留
 #
 # 用法：
@@ -54,6 +55,7 @@ wait_for_line() { # <file> <pattern> <timeout_s>
 
 CUE_PID=""
 LLM_PID=""
+MOCK_PIDS=()
 TMPDIRS=()
 
 cleanup() {
@@ -62,9 +64,15 @@ cleanup() {
   for p in "$CUE_PID" "$LLM_PID"; do
     if [ -n "$p" ]; then kill -TERM "$p" 2>/dev/null || true; fi
   done
+  for p in ${MOCK_PIDS[@]+"${MOCK_PIDS[@]}"}; do
+    kill -TERM "$p" 2>/dev/null || true
+  done
   sleep 0.2
   for p in "$CUE_PID" "$LLM_PID"; do
     if [ -n "$p" ]; then kill -KILL "$p" 2>/dev/null || true; fi
+  done
+  for p in ${MOCK_PIDS[@]+"${MOCK_PIDS[@]}"}; do
+    kill -KILL "$p" 2>/dev/null || true
   done
   local d
   for d in "${TMPDIRS[@]}"; do rm -rf "$d"; done
@@ -212,11 +220,88 @@ run_case() {
   stop_fake_llm
 }
 
+# <场景名>：cue-eval 的 real 路径（--endpoint 指向假域）同样要能在 5 秒内取消。
+# 这条在 ac.cancel 接线补齐之后才有意义：eval 与 cue run 共用同一个 Runner，少了那一行
+# SIGTERM 后 agent 会卡到 LLM 超时（最坏 3 分钟）。顺带覆盖「HTTP 管线后端 + 取消」两条路径。
+run_eval_case() {
+  local name="$1" tmp mock_log mock_pid mock_port eval_log i
+  tmp="$(mktemp -d)"
+  TMPDIRS+=("$tmp")
+  mock_log="$tmp/mock.log"
+  eval_log="$tmp/eval.log"
+
+  local eval_bin="$ROOT/$BUILD_DIR/cue-eval"
+  local mock_bin="$ROOT/$BUILD_DIR/cue-mock-svc"
+  [ -x "$eval_bin" ] || fail "[$name] 找不到 $eval_bin（先构建 $BUILD_DIR）"
+  [ -x "$mock_bin" ] || fail "[$name] 找不到 $mock_bin（先构建 $BUILD_DIR）"
+
+  mock_port="$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()')"
+  [ -n "$mock_port" ] || fail "[$name] 无法分配假域端口"
+
+  "$mock_bin" --port "$mock_port" > "$mock_log" 2>&1 &
+  mock_pid=$!
+  MOCK_PIDS+=("$mock_pid")
+
+  # 等假域真正 listen（不用 sleep 猜：能 connect 才算就绪）
+  for i in $(seq 1 100); do
+    if python3 -c "import socket
+s = socket.socket(); s.settimeout(0.2)
+try:
+    s.connect(('127.0.0.1', $mock_port))
+except OSError:
+    raise SystemExit(1)
+finally:
+    s.close()" >/dev/null 2>&1; then break; fi
+    sleep 0.1
+  done
+  kill -0 "$mock_pid" 2>/dev/null || { cat "$mock_log" >&2 || true; fail "[$name] 假域没起来"; }
+
+  local llm_log="$tmp/fake-llm.log"
+  start_fake_llm "$llm_log"
+
+  CUE_API_KEY=test-key CUE_BASE_URL="http://127.0.0.1:$LLM_PORT" \
+    "$eval_bin" --suite "$ROOT/suites/m4-diagnosis.json" --mode real --live \
+    --endpoint "http://127.0.0.1:$mock_port" --warmup 0 --repeat 1 --out "$tmp/runs" \
+    > "$eval_log" 2>&1 &
+  CUE_PID=$!
+
+  if ! wait_for_line "$llm_log" "request received" 30; then
+    cat "$eval_log" >&2 || true
+    cat "$llm_log" >&2 || true
+    fail "[$name] cue-eval 没有发起 LLM 请求（日志见上）"
+  fi
+  sleep 0.2
+  is_running "$CUE_PID" || { cat "$eval_log" >&2 || true; fail "[$name] cue-eval 在信号前就退出了"; }
+
+  local t0 t1 elapsed rc=0
+  t0="$(now_ms)"
+  kill -TERM "$CUE_PID"
+  while is_running "$CUE_PID"; do
+    if [ $(( $(now_ms) - t0 )) -gt 15000 ]; then
+      fail "[$name] kill -TERM 后 15 s 仍未退出"
+    fi
+    sleep 0.02
+  done
+  t1="$(now_ms)"
+  elapsed=$(( t1 - t0 ))
+  wait "$CUE_PID" 2>/dev/null || rc=$?
+  CUE_PID=""
+
+  # 130 = 被取消（与交互路径一致）：既不是「用例跑完」，也不是「用例失败」
+  [ "$rc" -eq 130 ] || { cat "$eval_log" >&2 || true; fail "[$name] 退出码 $rc（期望 130）"; }
+  [ "$elapsed" -lt "$LIMIT_MS" ] || { cat "$eval_log" >&2 || true; fail "[$name] ${elapsed} ms ≥ ${LIMIT_MS} ms"; }
+  check_no_residue
+
+  echo "[$name] SIGTERM → 进程消失：${elapsed} ms（退出码 ${rc}，cued/cue-probe 残留 0）"
+  stop_fake_llm
+}
+
 echo "[test-cancel] BUILD_DIR=$BUILD_DIR stall=${STALL_S}s 假端点 http://127.0.0.1:$LLM_PORT"
 run_case "llm-only" llm-only
 run_case "pipeline" pipeline
-# cue-eval 的 real 路径不在本脚本里断言：Runner::Config::cancel 的接线在 src/eval/eval.cpp，
-# 与本轮改动的文件由不同的人负责，合并前 eval 侧拿不到取消标志。这里显式留待补项，
-# 不随它变红（补上 ac.cancel = cfg_.cancel 后即可照抄上面的场景加一条 eval 用例）。
-echo "SKIP: cue-eval real 路径取消（等 src/eval/eval.cpp 接上 Runner::Config::cancel 后纳入）"
-echo "[test-cancel] PASS：两个场景都在 ${LIMIT_MS} ms 内退出且无残留"
+run_eval_case "eval-endpoint"
+echo "[test-cancel] PASS：三个场景都在 ${LIMIT_MS} ms 内退出且无残留"
