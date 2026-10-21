@@ -411,6 +411,13 @@ bool get_double(const json& j, const char* k, double& out, std::string& err) {
   return true;
 }
 
+bool x264_preset(const std::string& s) {
+  static const std::set<std::string> kPresets = {"ultrafast", "superfast", "veryfast", "faster",
+                                                 "fast",      "medium",    "slow",     "slower",
+                                                 "veryslow",  "placebo"};
+  return kPresets.count(s) != 0;
+}
+
 bool in_root_cause_enum(const std::string& s) {
   static const std::set<std::string> kEnum = {
       "network_loss",      "network_delay", "bandwidth_insufficient", "encoder_too_slow",
@@ -449,7 +456,9 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
   try {
     if (!j.is_object()) return std::unexpected("case 不是对象");
     std::string err;
-    if (!check_keys(j, {"id", "seed", "fault", "pipeline", "prompt", "expect", "budget", "manual_only"},
+    if (!check_keys(j,
+                    {"id", "seed", "fault", "pipeline", "prompt", "expect", "budget", "manual_only",
+                     "repair"},
                     "case", err)) {
       return std::unexpected(err);
     }
@@ -478,42 +487,62 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
       }
       if (c.fault_kind.empty()) c.fault_kind = "none";
       // 不支持的注入器必须报错：静默变基线会产出"故障未注入却 100% 通过"的假绿灯
-      if (c.fault_kind != "none" && c.fault_kind != "drop") {
+      static const std::set<std::string> kKinds = {"none", "drop", "ingress_drop", "rate", "backlog"};
+      if (kKinds.count(c.fault_kind) == 0) {
         return std::unexpected("case " + c.id + ": 不支持的 fault.kind \"" + c.fault_kind +
-                               "\"（当前只有 none / drop）");
+                               "\"（可用：none / drop / ingress_drop / rate / backlog）");
       }
       if (f.contains("params")) {
         const auto& p = f["params"];
         if (!p.is_object()) return std::unexpected("case " + c.id + ": fault.params 必须是对象");
-        if (!check_keys(p, {"inject_drop_pct", "drop_pct"}, "case.fault.params", err)) {
+        if (!check_keys(p, {"inject_drop_pct", "drop_pct", "inject_ingress_pct", "rate_mbps",
+                            "queue_fps"},
+                        "case.fault.params", err)) {
           return std::unexpected("case " + c.id + ": " + err);
         }
         if (p.contains("inject_drop_pct") && p.contains("drop_pct")) {
           return std::unexpected("case " + c.id + ": fault.params 同时给了 inject_drop_pct 与 drop_pct");
         }
-        const char* key = p.contains("drop_pct") ? "drop_pct" : "inject_drop_pct";
-        if (!get_double(p, key, c.fault_value, err)) {
-          return std::unexpected("case " + c.id + ": " + err);
+        // 每种 kind 只认自己的参数：写错键等于"故障没注入却绿灯"，必须 fail-closed
+        const char* key = nullptr;
+        if (c.fault_kind == "drop") {
+          key = p.contains("drop_pct") ? "drop_pct" : "inject_drop_pct";
+        } else if (c.fault_kind == "ingress_drop") {
+          key = "inject_ingress_pct";
+        } else if (c.fault_kind == "rate") {
+          key = "rate_mbps";
+        } else if (c.fault_kind == "backlog") {
+          key = "queue_fps";
+        }
+        if (key != nullptr) {
+          if (!p.contains(key)) {
+            return std::unexpected("case " + c.id + ": fault.kind=" + c.fault_kind +
+                                   " 需要 fault.params." + key);
+          }
+          if (!get_double(p, key, c.fault_value, err)) {
+            return std::unexpected("case " + c.id + ": " + err);
+          }
         }
         if (c.fault_value < 0.0 || c.fault_value > 100.0) {
-          return std::unexpected("case " + c.id + ": fault.params 丢包百分比必须在 [0,100]");
+          return std::unexpected("case " + c.id + ": fault.params 注入值必须在 [0,100]");
         }
       }
-      if (c.fault_kind == "drop" && c.fault_value <= 0.0) {
-        return std::unexpected("case " + c.id + ": fault.kind=drop 但没有有效丢包百分比");
+      if (c.fault_kind != "none" && c.fault_value <= 0.0) {
+        return std::unexpected("case " + c.id + ": fault.kind=" + c.fault_kind + " 但没有有效注入值");
       }
     }
 
     if (j.contains("pipeline")) {
       const auto& p = j["pipeline"];
       if (!p.is_object()) return std::unexpected("case " + c.id + ": pipeline 必须是对象");
-      if (!check_keys(p, {"transcode", "bitrate_kbps", "gop", "width", "height"}, "case.pipeline",
-                      err)) {
+      if (!check_keys(p, {"transcode", "bitrate_kbps", "gop", "width", "height", "preset"},
+                      "case.pipeline", err)) {
         return std::unexpected("case " + c.id + ": " + err);
       }
       if (!get_bool(p, "transcode", c.transcode, err) ||
           !get_int(p, "bitrate_kbps", c.bitrate_kbps, err) || !get_int(p, "gop", c.gop, err) ||
-          !get_int(p, "width", c.width, err) || !get_int(p, "height", c.height, err)) {
+          !get_int(p, "width", c.width, err) || !get_int(p, "height", c.height, err) ||
+          !get_string(p, "preset", c.preset, err)) {
         return std::unexpected("case " + c.id + ": " + err);
       }
       if (c.bitrate_kbps < 100 || c.bitrate_kbps > 20000) {
@@ -522,6 +551,70 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
       if (c.gop < 1 || c.gop > 600) return std::unexpected("case " + c.id + ": gop 必须在 [1,600]");
       if (c.width < 0 || c.height < 0 || (c.width % 2) != 0 || (c.height % 2) != 0) {
         return std::unexpected("case " + c.id + ": width/height 必须是非负偶数");
+      }
+      if (!x264_preset(c.preset)) {
+        return std::unexpected("case " + c.id + ": 未知 preset \"" + c.preset +
+                               "\"（x264 只有 ultrafast..placebo 十档）");
+      }
+    }
+
+    // scripted 模式的修复动作：字段与 pipeline 同形，但只允许 set_param 真能设的键
+    if (j.contains("repair")) {
+      const auto& r = j["repair"];
+      if (!r.is_object()) return std::unexpected("case " + c.id + ": repair 必须是对象");
+      if (!check_keys(r, {"transcode", "bitrate_kbps", "gop", "preset", "width", "height"},
+                      "case.repair", err)) {
+        return std::unexpected("case " + c.id + ": " + err);
+      }
+      if (r.contains("transcode")) {
+        if (!get_bool(r, "transcode", c.repair.transcode, err)) {
+          return std::unexpected("case " + c.id + ": " + err);
+        }
+        c.repair.set_transcode = true;
+      }
+      if (r.contains("bitrate_kbps")) {
+        if (!get_int(r, "bitrate_kbps", c.repair.bitrate_kbps, err)) {
+          return std::unexpected("case " + c.id + ": " + err);
+        }
+        if (c.repair.bitrate_kbps < 100 || c.repair.bitrate_kbps > 20000) {
+          return std::unexpected("case " + c.id + ": repair.bitrate_kbps 必须在 [100,20000]");
+        }
+        c.repair.set_bitrate = true;
+      }
+      if (r.contains("gop")) {
+        if (!get_int(r, "gop", c.repair.gop, err)) {
+          return std::unexpected("case " + c.id + ": " + err);
+        }
+        // set_param 的 gop 上限是 300（cued 的 --gop 允许 600）：修复动作必须真能执行
+        if (c.repair.gop < 1 || c.repair.gop > 300) {
+          return std::unexpected("case " + c.id + ": repair.gop 必须在 [1,300]");
+        }
+        c.repair.set_gop = true;
+      }
+      if (r.contains("preset")) {
+        if (!get_string(r, "preset", c.repair.preset, err)) {
+          return std::unexpected("case " + c.id + ": " + err);
+        }
+        if (!x264_preset(c.repair.preset)) {
+          return std::unexpected("case " + c.id + ": repair 里未知 preset \"" + c.repair.preset +
+                                 "\"");
+        }
+        c.repair.set_preset = true;
+      }
+      if (r.contains("width") || r.contains("height")) {
+        if (!r.contains("width") || !r.contains("height")) {
+          return std::unexpected("case " + c.id + ": repair 的 width/height 必须成对给出");
+        }
+        if (!get_int(r, "width", c.repair.width, err) ||
+            !get_int(r, "height", c.repair.height, err)) {
+          return std::unexpected("case " + c.id + ": " + err);
+        }
+        if (c.repair.width < 16 || c.repair.width > 4096 || c.repair.height < 16 ||
+            c.repair.height > 4096 || (c.repair.width % 2) != 0 || (c.repair.height % 2) != 0) {
+          return std::unexpected("case " + c.id +
+                                 ": repair.width/height 必须是 [16,4096] 内的偶数");
+        }
+        c.repair.set_size = true;
       }
     }
     c.prompt = "定位并修复当前管线异常";
@@ -699,12 +792,16 @@ PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
   pc.cued_bin = cfg.cued_bin;
   // 注入档位只来自 case：agent 必须自己从指标里发现故障，评测器不能替它"制造"结论
   pc.inject_drop = (c.fault_kind == "drop") ? c.fault_value : 0.0;
+  pc.inject_ingress_drop = (c.fault_kind == "ingress_drop") ? c.fault_value : 0.0;
+  pc.send_mbps = (c.fault_kind == "rate") ? c.fault_value : 10.0;
+  pc.queue_fps = (c.fault_kind == "backlog") ? c.fault_value : 0.0;
   pc.inject_seed = c.seed;
   pc.transcode = c.transcode;
   pc.width = c.width;
   pc.height = c.height;
   pc.bitrate_kbps = c.bitrate_kbps;
   pc.gop = c.gop;
+  pc.preset = c.preset;
   return pc;
 }
 
@@ -731,12 +828,16 @@ pipeline::ProcessPipelineControl::Config to_pipeline_config(const PipelineConfig
   pipeline::ProcessPipelineControl::Config out;
   out.cued_bin = pc.cued_bin;
   out.inject_drop = pc.inject_drop;
+  out.inject_ingress_drop = pc.inject_ingress_drop;
+  out.send_mbps = pc.send_mbps;
+  out.queue_fps = pc.queue_fps;
   out.inject_seed = pc.inject_seed;
   out.transcode = pc.transcode;
   out.width = pc.width;
   out.height = pc.height;
   out.bitrate_kbps = pc.bitrate_kbps;
   out.gop = pc.gop;
+  out.preset = pc.preset;
   return out;
 }
 
@@ -952,8 +1053,12 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   } else {
     // Process 分支：真实 cued 子进程（外部推流由验收脚本提供）
     pipe = std::make_unique<pipeline::ProcessPipelineControl>(to_pipeline_config(pcfg));
-    std::fprintf(stderr, "[eval][%s] 启动 cued（inject_drop=%.1f%%, bitrate=%d, gop=%d）\n",
-                 c.id.c_str(), pcfg.inject_drop, pcfg.bitrate_kbps, pcfg.gop);
+    std::fprintf(stderr,
+                 "[eval][%s] 启动 cued（inject_drop=%.1f%% ingress=%.1f%% send_mbps=%.2f "
+                 "queue_fps=%.1f bitrate=%d gop=%d preset=%s transcode=%d）\n",
+                 c.id.c_str(), pcfg.inject_drop, pcfg.inject_ingress_drop, pcfg.send_mbps,
+                 pcfg.queue_fps, pcfg.bitrate_kbps, pcfg.gop, pcfg.preset.c_str(),
+                 static_cast<int>(pcfg.transcode));
   }
   if (record_tools && !replay_tools) {
     const std::string path = pipeline::tools_record_path(cfg_.record_tools_dir, c.id);
@@ -1052,19 +1157,44 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   // HTTP 后端没有进程参数，只能走同一套 set_param 工具生效。
   if (!call("pipeline_set_param", json{{"key", "bitrate_kbps"}, {"value", std::to_string(c.bitrate_kbps)}}, fail) ||
       !call("pipeline_set_param", json{{"key", "gop"}, {"value", std::to_string(c.gop)}}, fail) ||
-      (c.transcode && !call("pipeline_set_param", json{{"key", "transcode"}, {"value", "true"}}, fail))) {
+      (c.transcode && !call("pipeline_set_param", json{{"key", "transcode"}, {"value", "true"}}, fail)) ||
+      (c.transcode && !call("pipeline_set_param", json{{"key", "preset"}, {"value", c.preset}}, fail))) {
     o.error_kind = "set_param_failed: " + fail;
     return o;
   }
 
   // 故障注入由评测器负责（与 cued 的启动参数同义）：agent 的任务是发现并修好它
   bool injected = false;
-  if (c.fault_kind == "drop" && c.fault_value > 0.0) {
-    if (!call("inject_fault", json{{"kind", "drop"}, {"value", c.fault_value}}, fail)) {
+  if (c.fault_kind != "none" && c.fault_value > 0.0) {
+    if (!call("inject_fault", json{{"kind", c.fault_kind}, {"value", c.fault_value}}, fail)) {
       o.error_kind = "inject_failed: " + fail;
       return o;
     }
     injected = true;
+  }
+
+  // 注入会重启 cued（计数器归零），第一条新采样往往只覆盖半个窗口：直接取证会让
+  // 故障态读数（budget_drops / frames_out / encode_p50）停在"还没坏起来"的瞬间。
+  // 这里按**返回值**等到 4 条新采样（约 4 s；令牌桶的 64 包突发会让限速类故障在头两秒
+  // 还看不出来）。与回放同构：只按样本号终止，回放不睡。
+  //
+  // 只对**真管线**（子进程后端）做这件事：HTTP 假域（cue-mock-svc）的计数器是按
+  // 「每读一次前进一拍」推进的，多读几次会把 dropped 预算直接读掉（实测 5% 丢包
+  // 从 16 涨到 48，m4 的 dropped_max=30 立刻假失败）。端点的假域不需要等稳态：
+  // 它的模型是确定的，也没有"重启后第一个窗口只覆盖半秒"的问题。
+  if (cfg_.endpoint.empty()) {
+    constexpr int kStableSamples = 4;
+    int seen = 0;
+    uint64_t last_samples = 0;
+    for (int i = 0; i < kWaitAttempts && seen < kStableSamples; ++i) {
+      const auto pm = pipe->latest();
+      if (pm.samples > last_samples) {
+        last_samples = pm.samples;
+        ++seen;
+      } else if (!replay_tools) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+    }
   }
 
   // 观测：真调 query_metrics（content 是 "metrics={...}" 原文）
@@ -1086,12 +1216,46 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     return o;
   }
 
-  // 假 agent 的"修复"：取消注入（真 agent 也是 inject_fault value=0）
+  // 假 agent 的"修复"：先清除注入（真 agent 也是 inject_fault value=0），
+  // 再按 case 的 repair 逐项 set_param（等价于真 agent 会做的改档动作）。
+  // 顺序固定，回放/重跑都走同一条调用序列。
   if (injected) {
-    if (!call("inject_fault", json{{"kind", "drop"}, {"value", 0.0}}, fail)) {
+    if (!call("inject_fault", json{{"kind", c.fault_kind}, {"value", 0.0}}, fail)) {
       o.error_kind = "repair_failed: " + fail;
       return o;
     }
+  }
+  if (c.repair.set_transcode &&
+      !call("pipeline_set_param",
+            json{{"key", "transcode"}, {"value", c.repair.transcode ? "true" : "false"}}, fail)) {
+    o.error_kind = "repair_failed: " + fail;
+    return o;
+  }
+  if (c.repair.set_preset &&
+      !call("pipeline_set_param", json{{"key", "preset"}, {"value", c.repair.preset}}, fail)) {
+    o.error_kind = "repair_failed: " + fail;
+    return o;
+  }
+  if (c.repair.set_gop &&
+      !call("pipeline_set_param", json{{"key", "gop"}, {"value", std::to_string(c.repair.gop)}},
+            fail)) {
+    o.error_kind = "repair_failed: " + fail;
+    return o;
+  }
+  if (c.repair.set_bitrate &&
+      !call("pipeline_set_param",
+            json{{"key", "bitrate_kbps"}, {"value", std::to_string(c.repair.bitrate_kbps)}}, fail)) {
+    o.error_kind = "repair_failed: " + fail;
+    return o;
+  }
+  // width/height 必须成对：set_param 一次只改一个键，先 width 再 height（两次重启）
+  if (c.repair.set_size &&
+      (!call("pipeline_set_param",
+             json{{"key", "width"}, {"value", std::to_string(c.repair.width)}}, fail) ||
+       !call("pipeline_set_param",
+             json{{"key", "height"}, {"value", std::to_string(c.repair.height)}}, fail))) {
+    o.error_kind = "repair_failed: " + fail;
+    return o;
   }
 
   // harness 复测 SLA：直接调接口（与 real 路径同一口径，不信 agent 自报）。
@@ -1235,8 +1399,12 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   } else {
     // Process 分支：唯一允许出现具体后端类型的地方（cued 的启动参数只有它认识）
     pipe = std::make_unique<pipeline::ProcessPipelineControl>(to_pipeline_config(pcfg));
-    std::fprintf(stderr, "[eval][%s] 启动 cued（inject_drop=%.1f%%, bitrate=%d, gop=%d）\n",
-                 c.id.c_str(), pcfg.inject_drop, pcfg.bitrate_kbps, pcfg.gop);
+    std::fprintf(stderr,
+                 "[eval][%s] 启动 cued（inject_drop=%.1f%% ingress=%.1f%% send_mbps=%.2f "
+                 "queue_fps=%.1f bitrate=%d gop=%d preset=%s transcode=%d）\n",
+                 c.id.c_str(), pcfg.inject_drop, pcfg.inject_ingress_drop, pcfg.send_mbps,
+                 pcfg.queue_fps, pcfg.bitrate_kbps, pcfg.gop, pcfg.preset.c_str(),
+                 static_cast<int>(pcfg.transcode));
   }
   if (record_tools && !replay_tools) {
     auto rec = std::make_unique<pipeline::RecordingPipeline>(std::move(pipe),
@@ -1285,7 +1453,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   }
   // Http 后端没有"进程启动参数"，case 的注入档位只能经接口补上（与 cued 启动参数同义）。
   // 回放时注入早已在录制里生效，不再调一次（那会多消费一条不存在的录制）。
-  if (!replay_tools && !cfg_.endpoint.empty() && c.fault_kind == "drop" && c.fault_value > 0.0) {
+  if (!replay_tools && !cfg_.endpoint.empty() && c.fault_kind != "none" && c.fault_value > 0.0) {
     std::string ierr;
     if (!pipe->inject_fault(c.fault_kind, c.fault_value, ierr)) {
       o.error_kind = "inject_failed: " + ierr;

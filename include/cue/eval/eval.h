@@ -58,8 +58,13 @@ struct Case {
   std::string suite;
   uint64_t seed = 42;
 
-  // 故障注入
-  std::string fault_kind;   // "drop" / "none"
+  // 故障注入（评测器负责施加，agent 负责发现并撤销）：
+  //   none         干净基线
+  //   drop         出向丢包（%）：只涨 injected，fps 不动（丢弃在 frames_out 结算之后）
+  //   ingress_drop 上行丢包（%）：重组超时 → dropped 涨、frames_out 掉
+  //   rate         发送速率上限（Mbps）：令牌桶不足 → budget_drops 涨
+  //   backlog      发送排队节奏（帧/s）：不丢包，积压 → frames_in−frames_out 涨
+  std::string fault_kind;   // "none" / "drop" / "ingress_drop" / "rate" / "backlog"
   double fault_value = 0.0;
 
   // 管线档位
@@ -68,6 +73,24 @@ struct Case {
   int height = 0;
   int bitrate_kbps = 1500;
   int gop = 60;
+  std::string preset = "veryfast";
+
+  // scripted 模式的修复动作（等价于 real 模式下 agent 会做的那几步）。
+  // 只做「case → 工具调用」的翻译，不参与判分：SLA 仍然由 harness 复测。
+  struct RepairFix {
+    bool set_transcode = false;
+    bool transcode = false;
+    bool set_bitrate = false;
+    int bitrate_kbps = 0;
+    bool set_gop = false;
+    int gop = 0;
+    bool set_preset = false;
+    std::string preset;
+    bool set_size = false;
+    int width = 0;
+    int height = 0;
+  };
+  RepairFix repair;
 
   std::string prompt;
 
@@ -119,7 +142,13 @@ struct PipelineConfig {
   int height = 0;
   int bitrate_kbps = 1500;
   int gop = 60;
+  std::string preset = "veryfast";
   double inject_drop = 0.0;
+  double inject_ingress_drop = 0.0;
+  // 0 = 不排队（默认）；>0 = 发送侧按该节奏排空（fault.kind=backlog）
+  double queue_fps = 0.0;
+  // 发送速率上限（fault.kind=rate 时生效；默认 10 Mbps = SPEC §7.2 的链路）
+  double send_mbps = 10.0;
   uint64_t inject_seed = 42;
 };
 
