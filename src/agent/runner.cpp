@@ -196,6 +196,11 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   auto emit = [&](const char* type, json data) {
     if (on_event) on_event(Event{type, std::move(data)});
   };
+  // AC-8：外部取消（SIGTERM）只看这个原子标志。取消不是失败重试、不是 guard 拒绝：
+  // 不消耗轮次/成本预算，也不写 done。
+  auto cancelled = [this] {
+    return cfg_.cancel != nullptr && cfg_.cancel->load(std::memory_order_relaxed);
+  };
 
   std::vector<llm::ChatMessage> msgs;
   msgs.push_back(msg("system", cfg_.system_prompt));
@@ -203,6 +208,11 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   emit("run.start", {{"goal", goal}, {"budget", {{"max_turns", budget.max_turns}}}});
 
   while (r.turns < budget.max_turns) {
+    // 每轮开始先看取消：预算检查在它之后，取消优先（否则会被报成预算耗尽）
+    if (cancelled()) {
+      stop_reason = "cancelled";
+      break;
+    }
     // 墙钟预算：每轮开头查，并把"剩余预算"作为本次 LLM 调用的硬超时，
     // 否则一次 60 s 的调用就能把 max_wall_s 顶穿（审查 P2）。
     const int64_t elapsed_us = now_us() - t_start;
@@ -237,6 +247,13 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       }
     }
 
+    // 把取消标志交给传输层：curl 只在 progress 回调里能看见它，否则会一路等到
+    // timeout_s（默认 60 s）并且还会重试 2 次——一次取消被拖成三分钟（AC-8 破防点）
+    req.cancel = cfg_.cancel;
+    if (cancelled()) {
+      stop_reason = "cancelled";
+      break;
+    }
     auto resp = llm_.chat(req);
     if (!resp) {
       stop_reason = resp.error();
@@ -295,6 +312,8 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
 
     std::size_t i = 0;
     for (; i < resp->tool_calls.size(); ++i) {
+      // 工具之间也查取消：一个 run_shell 之类的长工具不该把退出拖到 5 秒之外
+      if (cancelled()) break;
       const auto& tc = resp->tool_calls[i];
       // ---- 控制工具：阶段推进 ----
       if (tc.name == "stage_complete") {
@@ -418,6 +437,13 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       msgs.push_back(tool_msg(g.result.content, tc.id, tc.name));
     }
 
+    // 取消发生在工具之间：同批剩余 tool_call 不回填（run 到此结束，不会再有下一次
+    // LLM 调用需要这份历史），直接以 cancelled 收口
+    if (cancelled()) {
+      stop_reason = "cancelled";
+      break;
+    }
+
     // 状态已终结时，同批剩余 tool_call 不再执行，但每条都必须回填 tool 消息，
     // 否则 assistant(tool_calls) 后面缺 tool 结果，事件流/历史都是坏的配对。
     if (stage == Stage::Done || stage == Stage::GiveUp) {
@@ -435,6 +461,8 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   }
 
   r.final_stage = stage;
+  // 取消的 run 不能报 done：done 是「harness 实测达标」的结论，取消时没有结论
+  if (stop_reason == "cancelled") r.final_stage = Stage::GiveUp;
   if (r.final_stage != Stage::Done && r.final_stage != Stage::GiveUp) {
     // 没跑完必须显式失败：静默停在中间态会让评测把预算耗尽当成"答错"
     r.final_stage = Stage::GiveUp;

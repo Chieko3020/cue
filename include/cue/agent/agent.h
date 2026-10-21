@@ -2,6 +2,7 @@
 // M3a：状态机 + 守卫 + 工具循环；M3b 接入真实 LLM 与审批界面
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -67,6 +68,9 @@ class Runner {
     // 为空时保留"模型自称"的旧行为，但事件里标注 verify=model_claimed，
     // 避免评测/交互两条路径把"自报达标"当成"实测达标"。
     std::function<bool(const Diagnosis&)> verify_sla;
+    // 非空且被置位 = 中止本次 run（SIGTERM / 外部取消）。每轮开始与每次 LLM 调用前检查；
+    // 它不参与成本/轮次预算，也不写 done 阶段：取消的 run 一律以 error="cancelled" 失败。
+    const std::atomic<bool>* cancel = nullptr;
   };
 
   Runner(llm::ILlmClient& llm, const tool::Registry& tools, Config cfg);
