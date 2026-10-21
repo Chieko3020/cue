@@ -974,11 +974,13 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   std::vector<Observation> obs;
   Observation ob;
   ob.tool = "query_metrics";
-  ob.text =
-      "metrics={\"fps\":30.3,\"frames_in\":247,\"frames_out\":247,\"dropped\":0,\"injected\":59,"
-      "\"decoded\":247,\"decode_errors\":0}";
-  ob.data = json{{"fps", 30.3},     {"frames_in", 247}, {"frames_out", 247}, {"dropped", 0},
-                 {"injected", 59},  {"decoded", 247},   {"decode_errors", 0}};
+  // 假观测覆盖各类 case 会声明的候选指标（不同故障类的证据键不同：injected / budget_drops /
+  // frames_in-frames_out / encode_p50_ms ...）。值写死是自检路径的既定前提，报告顶部有 banner。
+  ob.data = json{{"fps", 30.3},        {"frames_in", 247},   {"frames_out", 247},
+                 {"dropped", 0},       {"injected", 59},     {"decoded", 247},
+                 {"decode_errors", 0}, {"budget_drops", 0},  {"encode_p50_ms", 6.4},
+                 {"encode_p99_ms", 9.1}, {"op_p50_ms", 0.3}, {"samples", 1}};
+  ob.text = "metrics=" + ob.data.dump();
   obs.push_back(ob);
 
   agent::RunResult fake;
@@ -986,7 +988,15 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   fake.turns = 6;
   fake.cost_yuan = 0.01;
   fake.diagnosis.root_cause = c.expect_root_cause;
-  fake.diagnosis.evidence = {"injected=59"};
+  // 证据同样按 case 的候选指标构造（否则非丢包类的 case 会在这条自检路径里恒假）：
+  // 逐字从假观测里摘 key=value，和真管线路径的口径一致。
+  for (const auto& cand : c.evidence_candidates) {
+    const std::string frag = observation_fragment(ob.text, cand);
+    if (frag.empty()) continue;
+    fake.diagnosis.evidence.push_back(frag);
+    if (fake.diagnosis.evidence.size() >= 2) break;
+  }
+  if (fake.diagnosis.evidence.empty()) fake.diagnosis.evidence = {"fps=30.3"};
 
   Metrics m;
   m.samples = 1;
