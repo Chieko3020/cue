@@ -431,7 +431,11 @@ int run_real(const RunOptions& o) {
   }
 
   tool::Registry reg;
-  cue::pipeline::build_real_tools(reg, pipe, nullptr);
+  // 交互模式默认审计到 runs/audit.jsonl（runs/ 已在 .gitignore 里，不会进库）；
+  // cancel 用 run 全程的 g_cancel，run_shell 执行中也能被 SIGINT/SIGTERM 打断（AC-8）。
+  cue::pipeline::build_real_tools(
+      reg, pipe, nullptr,
+      cue::pipeline::RealToolsOptions{.audit_log_path = "runs/audit.jsonl", .cancel = &g_cancel});
 
   llm::OpenAiCompatibleClient::Config cc;
   cc.base_url = base && *base ? base : "https://api.deepseek.com";

@@ -236,7 +236,11 @@ class ConsoleApp {
                                       : tool::ApprovalMode::Ask;
 
     // 工具层与 agent 完全同源（build_real_tools），控制台不再另开一条"后门"。
-    pipeline::build_real_tools(reg_, *pipe_, nullptr);
+    // 控制台也是交互入口：run_shell 一样要落审计（AC-11），关停信号 g_stop 兼作
+    // 取消指针——否则一个正在跑的诊断命令会把 shutdown 拖到工具超时。
+    pipeline::build_real_tools(
+        reg_, *pipe_, nullptr,
+        pipeline::RealToolsOptions{.audit_log_path = "runs/audit.jsonl", .cancel = &g_stop});
     add_pipeline_lifecycle_tools();
   }
 

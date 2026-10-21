@@ -1029,7 +1029,11 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
 
   std::vector<pipeline::ToolTrace> trace;
   tool::Registry reg;
-  pipeline::build_real_tools(reg, *pipe, &trace);
+  // 审计落在本 run 目录（runs/<run_id>/audit.jsonl），不进 git；
+  // cancel 透传到 run_shell，评测路径的 SIGTERM 同样能打断工具执行（AC-8）。
+  pipeline::build_real_tools(
+      reg, *pipe, &trace,
+      pipeline::RealToolsOptions{.audit_log_path = audit_log_path_, .cancel = cfg_.cancel});
   tool::CallContext ctx;
   ctx.mode = tool::ApprovalMode::Auto;
   ctx.allowed_dangerous = {"inject_fault"};
@@ -1345,7 +1349,11 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   // 3) 工具（每个返回都留痕，证据校验只认真实观测）
   std::vector<pipeline::ToolTrace> trace;
   tool::Registry reg;
-  pipeline::build_real_tools(reg, *pipe, &trace);
+  // 与 scripted-pipeline 路径同一份工具语义：审计路径 + 取消指针都要传，
+  // 否则 real 模式下的 run_shell 既无审计也不会被打断。
+  pipeline::build_real_tools(
+      reg, *pipe, &trace,
+      pipeline::RealToolsOptions{.audit_log_path = audit_log_path_, .cancel = cfg_.cancel});
 
   // 4) LLM 客户端：replay 读 cassette（默认，零成本、可回归），live 才走网络。
   //    live + record 时把每次成功调用追加进 cassette（SPEC §7.9）。
@@ -1551,6 +1559,8 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   r.fingerprint = base;
 
   const std::string run_dir = cfg_.out_dir + "/" + r.run_id;
+  // AC-11 审计落点：跟着 run 目录走，run 目录本来就被 .gitignore 排除
+  audit_log_path_ = run_dir + "/audit.jsonl";
   const std::string state_path = run_dir + "/state.jsonl";
   {
     std::error_code ec;

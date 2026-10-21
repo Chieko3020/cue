@@ -244,6 +244,9 @@ class Engine {
   bool cancelled() const;
 
   RunConfig cfg_;
+  // run_shell 的审计路径（<out_dir>/<run_id>/audit.jsonl）。run_id 要到 run_cases 里
+  // 才算得出来，而 run_real_case_impl 是 const，所以这里用 mutable 存一次。
+  mutable std::string audit_log_path_;
 };
 
 }  // namespace cue::eval

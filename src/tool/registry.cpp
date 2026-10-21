@@ -55,7 +55,8 @@ std::expected<void, std::string> validate_args(const ToolSpec& spec, const json&
     if (p.type == "number" && !v.is_number()) return std::unexpected(p.name + " must be number");
     if (p.type == "boolean" && !v.is_boolean()) return std::unexpected(p.name + " must be boolean");
 
-    if (!p.enum_values.empty()) {
+    // soft_enum：enum 只作为 schema 提示（见 ParamSpec 注释），由 handler 自己拒绝并留痕
+    if (!p.enum_values.empty() && !p.soft_enum) {
       bool hit = false;
       if (v.is_string()) {
         for (const auto& e : p.enum_values) {
