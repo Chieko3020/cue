@@ -151,6 +151,9 @@ struct CaseOutcome {
   // replay 模式的 cassette 命中/未命中次数（miss 会变成 run_error=cassette_miss）
   std::size_t cassette_hits = 0;
   std::size_t cassette_misses = 0;
+  // AC-6：工具观测回放的命中/miss（miss = 录制用尽或参数不符，必须报错并留档）
+  std::size_t tool_hits = 0;
+  std::size_t tool_misses = 0;
 };
 
 struct RunConfig {
@@ -173,6 +176,12 @@ struct RunConfig {
   std::string llm_mode = "replay";
   std::string cassette_dir = "cassettes";
   bool record = false;  // live 时把每次成功调用追加进 cassette_dir
+  // AC-6：工具观测的另一半录制。cassette 只录 LLM 一侧，真管线每轮观测都在变
+  // （fps 抖动、累计计数递增），messages 跟着变 → cassette key miss。
+  // record_tools_dir 非空 = 用 RecordingPipeline 包住真实管线；replay_tools_dir 非空 =
+  // 只用 ReplayPipeline（不 spawn cued、不连 endpoint）。两者互斥。
+  std::string record_tools_dir;
+  std::string replay_tools_dir;
   // SIGINT/SIGTERM：非空时每个 case 边界与等待循环检查，置位后尽快停管线退出
   const std::atomic<bool>* cancel = nullptr;
 };
@@ -201,6 +210,9 @@ struct RunReport {
   // replay 模式 cassette 命中/未命中合计（miss 计入 run_error，不进成功率分母）
   std::size_t cassette_hits = 0;
   std::size_t cassette_misses = 0;
+  // AC-6：工具观测回放命中/miss 合计（miss 必须出现在报告里）
+  std::size_t tool_hits = 0;
+  std::size_t tool_misses = 0;
   // 平均 MTTR（秒）：只统计「有 SLA 阈值且测到达标」的 case；取不到为 NaN
   double mttr_avg_s = kNoValue;
   std::vector<std::string> failure_modes;  // "root: 期望 X 实际 Y" 之类的聚合
@@ -223,8 +235,9 @@ class Engine {
 
  private:
   CaseOutcome run_scripted_case(const Case& c) const;
-  // scripted + --endpoint：假 agent 的观测与指标都来自 HTTP 后端（不能再用写死的值）
-  CaseOutcome run_scripted_case_endpoint(const Case& c) const;
+  // scripted 但管线是真的：--endpoint（HTTP 后端）、--record-tools / --replay-tools
+  // 都走这里——观测与指标来自真实管线（或它的录制），不能再用 run_scripted_case 的写死值。
+  CaseOutcome run_scripted_case_pipeline(const Case& c) const;
   CaseOutcome run_real_case(const Case& c) const;
   void run_real_case_impl(const Case& c, CaseOutcome& o) const;
   void run_cases(const std::vector<Case>& cases, RunReport& r);

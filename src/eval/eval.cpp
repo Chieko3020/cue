@@ -24,6 +24,7 @@
 #include "cue/llm/cassette.h"
 #include "cue/llm/client.h"
 #include "cue/pipeline/process_control.h"
+#include "cue/pipeline/recorded_pipeline.h"
 #include "cue/pipeline/service_pipeline.h"
 #include "cue/pipeline/tools.h"
 
@@ -683,10 +684,14 @@ std::string Engine::config_hash() const {
   // endpoint 非空时被测 SUT 换成了 HTTP 服务：不进指纹会让"同一 suite 换个端点"复用旧缓存
   // （端点为空的旧指纹保持逐字节不变，续跑兼容）。
   const std::string ep_hash = cfg_.endpoint.empty() ? std::string() : "|endpoint=" + cfg_.endpoint;
+  // AC-6：回放结果取决于录制内容，内容变了缓存必须失效；录制中（内容在变）不进指纹。
+  const std::string tools_hash =
+      cfg_.replay_tools_dir.empty() ? std::string()
+                                    : "|replay_tools=" + cassette_dir_hash(cfg_.replay_tools_dir);
   return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
                          "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
                          fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s) +
-                         llm_hash + ep_hash);
+                         llm_hash + ep_hash + tools_hash);
 }
 
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
@@ -860,7 +865,9 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   //
   // --endpoint 时不能再"模拟"观测：AC-16 要的是假域被真驱动一遍，所以观测与 SLA
   // 都取自 HTTP 后端（脚本里的写死值在假域里根本不存在，会直接把这条验收证伪）。
-  if (!cfg_.endpoint.empty()) return run_scripted_case_endpoint(c);
+  if (!cfg_.endpoint.empty() || !cfg_.record_tools_dir.empty() || !cfg_.replay_tools_dir.empty()) {
+    return run_scripted_case_pipeline(c);
+  }
   CaseOutcome o;
   o.id = c.id;
   std::vector<Observation> obs;
@@ -902,24 +909,82 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   return o;
 }
 
-CaseOutcome Engine::run_scripted_case_endpoint(const Case& c) const {
-  // AC-16 主路径：假 agent 通过**同一份**工具层（build_real_tools）驱动 HTTP 后端——
-  // 观测来自后端、证据从观测里逐字摘抄、SLA 由 harness 复测。任何一步失败都记 run_error，
-  // 不拿写死的值兜底（否则这条验收只是在自证）。
+CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
+  // 假 agent 通过**同一份**工具层（build_real_tools）驱动真实管线：
+  //  - --endpoint：HTTP 后端（AC-16 主路径）
+  //  - --record-tools / --replay-tools：本机子进程后端的录制与回放（AC-6）
+  // 观测来自管线（或它的录制）、证据从观测里逐字摘抄、SLA 由 harness 复测。
+  // 任何一步失败都记 run_error，不拿写死的值兜底（否则这条验收只是在自证）。
   CaseOutcome o;
   o.id = c.id;
   o.final_stage = "n/a";
 
-  pipeline::PipelineEndpoint ep;
-  ep.kind = pipeline::PipelineEndpoint::Kind::Http;
-  ep.http_base = cfg_.endpoint;
-  ep.http_timeout_ms = 3000;
+  const bool replay_tools = !cfg_.replay_tools_dir.empty();
+  const bool record_tools = !cfg_.record_tools_dir.empty();
+  const bool http = !cfg_.endpoint.empty();
+  const auto pcfg = pipeline_config_for(c, cfg_);
+
   std::string err;
-  auto pipe = pipeline::make_pipeline(ep, err);
-  if (!pipe) {
-    o.error_kind = "pipeline_create_failed: " + err;
-    return o;
+  std::unique_ptr<pipeline::IServicePipeline> pipe;
+  pipeline::ReplayPipeline* replay = nullptr;
+  if (replay_tools) {
+    const std::string path = pipeline::tools_record_path(cfg_.replay_tools_dir, c.id);
+    auto rp = std::make_unique<pipeline::ReplayPipeline>(path);
+    if (rp->load_error().empty()) {
+      replay = rp.get();
+      pipe = std::move(rp);
+    } else {
+      o.error_kind = "tools_replay_load_failed: " + rp->load_error();
+      return o;
+    }
+    std::fprintf(stderr, "[eval][%s] 回放工具观测 %s（不 spawn cued、不连 endpoint）\n",
+                 c.id.c_str(), path.c_str());
+  } else if (http) {
+    pipeline::PipelineEndpoint ep;
+    ep.kind = pipeline::PipelineEndpoint::Kind::Http;
+    ep.http_base = cfg_.endpoint;
+    ep.http_timeout_ms = 3000;
+    pipe = pipeline::make_pipeline(ep, err);
+    if (!pipe) {
+      o.error_kind = "pipeline_create_failed: " + err;
+      return o;
+    }
+  } else {
+    // Process 分支：真实 cued 子进程（外部推流由验收脚本提供）
+    pipe = std::make_unique<pipeline::ProcessPipelineControl>(to_pipeline_config(pcfg));
+    std::fprintf(stderr, "[eval][%s] 启动 cued（inject_drop=%.1f%%, bitrate=%d, gop=%d）\n",
+                 c.id.c_str(), pcfg.inject_drop, pcfg.bitrate_kbps, pcfg.gop);
   }
+  if (record_tools && !replay_tools) {
+    const std::string path = pipeline::tools_record_path(cfg_.record_tools_dir, c.id);
+    auto rec = std::make_unique<pipeline::RecordingPipeline>(std::move(pipe),
+                                                             cfg_.record_tools_dir, c.id);
+    if (!rec->io_error().empty()) {
+      o.error_kind = "tools_record_io_failed: " + rec->io_error();
+      return o;
+    }
+    pipe = std::move(rec);
+    std::fprintf(stderr, "[eval][%s] 录制工具观测到 %s\n", c.id.c_str(), path.c_str());
+  }
+  // 回放统计要在所有返回路径上收集（参数不符会让脚本提前 return），
+  // 因此用 RAII；miss>0 必须把这条件记成 run_error，不能静默。
+  struct ReplayStatsGuard {
+    pipeline::ReplayPipeline* rp;
+    CaseOutcome* o;
+    ~ReplayStatsGuard() {
+      if (rp == nullptr) return;
+      const auto st = rp->stats();
+      o->tool_hits = st.hits;
+      o->tool_misses = st.misses;
+      if (st.misses > 0) {
+        const std::string miss = rp->last_error();
+        o->error_kind = o->error_kind.empty() ? "tools_replay_miss: " + miss
+                                              : "tools_replay_miss: " + miss + "；" + o->error_kind;
+        o->scored = false;
+      }
+    }
+  } stats_guard{replay, &o};
+
   struct StopGuard {
     pipeline::IServicePipeline* p;
     ~StopGuard() { p->stop(); }
@@ -931,10 +996,35 @@ CaseOutcome Engine::run_scripted_case_endpoint(const Case& c) const {
   }
   // 真路径每个 case 起一个新 cued 进程（计数器从 0 开始）。HTTP 端点在 case 之间是同一个
   // 服务，用 stop→start 取得同样的"新管线"语义——否则上一个 case 的 dropped 会累进本 case
-  // 的 SLA 预算，同一份 suite 连跑第二遍就会假失败。
-  pipe->stop();
-  if (!pipe->start(err)) {
-    o.error_kind = "pipeline_restart_failed: " + err;
+  // 的 SLA 预算，同一份 suite 连跑第二遍就会假失败。回放没有真实服务可重启，不做这一步。
+  if (http && !replay_tools) {
+    pipe->stop();
+    if (!pipe->start(err)) {
+      o.error_kind = "pipeline_restart_failed: " + err;
+      return o;
+    }
+  }
+
+  // 等媒体流。终止条件只看 latest() 的返回值（不按墙上时间），回放时同一串录制值会
+  // 走出一模一样的循环次数——这就是「同一份观测」的前提。
+  constexpr int kWaitAttempts = 100;  // 录制时最多等 20 s（200 ms 一轮）；回放不睡
+  bool got_stream = false;
+  for (int i = 0; i < kWaitAttempts; ++i) {
+    if (cancelled()) {
+      o.error_kind = "cancelled";
+      return o;
+    }
+    const auto pm = pipe->latest();
+    if (pm.samples > 0 && pm.fps > 0.0) {
+      got_stream = true;
+      break;
+    }
+    if (!replay_tools) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  if (!got_stream) {
+    std::fprintf(stderr, "[eval][%s] 等不到媒体流采样（samples=0 或 fps=0）→ 不启动假 agent\n",
+                 c.id.c_str());
+    o.error_kind = "no_media_stream";
     return o;
   }
 
@@ -946,15 +1036,17 @@ CaseOutcome Engine::run_scripted_case_endpoint(const Case& c) const {
   ctx.allowed_dangerous = {"inject_fault"};
   auto call = [&reg, &ctx](const char* name, const json& args, std::string& fail) -> bool {
     const auto gr = reg.call_guarded(name, args, ctx);
-    if (gr.status == tool::GuardedCall::Status::Executed) return true;
+    // Executed 只表示 handler 跑完了；handler 内部失败（set_param 返回 false）也在
+    // result.ok=false 里。两者都要当失败，否则回放参数不符会被「继续往下跑」掩盖。
+    if (gr.status == tool::GuardedCall::Status::Executed && gr.result.ok) return true;
     fail = std::string(name) + ": " +
            (gr.error.empty() ? gr.result.content : gr.error);
     return false;
   };
 
   std::string fail;
-  // case 的管线档位：子进程后端是 cued 启动参数；HTTP 后端没有进程参数，
-  // 只能走同一套 set_param 工具生效（宽高这类假域不建模的字段不假装支持）。
+  // case 的管线档位：子进程后端是 cued 启动参数（同值 set_param 幂等、不重启）；
+  // HTTP 后端没有进程参数，只能走同一套 set_param 工具生效。
   if (!call("pipeline_set_param", json{{"key", "bitrate_kbps"}, {"value", std::to_string(c.bitrate_kbps)}}, fail) ||
       !call("pipeline_set_param", json{{"key", "gop"}, {"value", std::to_string(c.gop)}}, fail) ||
       (c.transcode && !call("pipeline_set_param", json{{"key", "transcode"}, {"value", "true"}}, fail))) {
@@ -999,14 +1091,35 @@ CaseOutcome Engine::run_scripted_case_endpoint(const Case& c) const {
     }
   }
 
-  // harness 复测 SLA：直接调接口（与 real 路径同一口径，不信 agent 自报）
+  // harness 复测 SLA：直接调接口（与 real 路径同一口径，不信 agent 自报）。
+  // 录制/回放路径先等一条修复后的新采样（修复会重启管线，立即读会拿到清零后的 0），
+  // 再取 kRetestSamples 条——等待只按返回值终止，回放才能逐步复现同一串调用。
   Metrics m;
   bool have_sample = false;
-  for (int i = 0; i < kRetestSamples; ++i) {
-    const auto pm = pipe->latest();
-    if (pm.samples == 0) continue;
-    m = to_metrics(pm);
-    have_sample = true;
+  if (replay_tools || record_tools) {
+    for (int i = 0; i < kWaitAttempts; ++i) {
+      const auto pm = pipe->latest();
+      if (pm.samples > 0) {
+        m = to_metrics(pm);
+        have_sample = true;
+        break;
+      }
+      if (!replay_tools) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (have_sample) {
+      for (int i = 0; i < kRetestSamples; ++i) {
+        const auto pm = pipe->latest();
+        if (pm.samples == 0) continue;
+        m = to_metrics(pm);
+      }
+    }
+  } else {
+    for (int i = 0; i < kRetestSamples; ++i) {
+      const auto pm = pipe->latest();
+      if (pm.samples == 0) continue;
+      m = to_metrics(pm);
+      have_sample = true;
+    }
   }
   if (!have_sample) {
     o.error_kind = "no_retest_sample";
@@ -1035,12 +1148,21 @@ CaseOutcome Engine::run_scripted_case_endpoint(const Case& c) const {
   o.final_samples = m.samples;
   o.metrics = m;
   o.observations = obs;
+  if (replay != nullptr) {
+    const auto st = replay->stats();  // 只为下面这行日志先读一次；终态由 RAII 守卫写回
+    o.tool_hits = st.hits;
+    o.tool_misses = st.misses;
+  }
+  const char* how = replay_tools ? "replay-tools" : (record_tools ? "record-tools" : "endpoint");
+  std::string miss_note;
+  if (replay) miss_note = "，工具回放 miss=" + std::to_string(o.tool_misses);
   std::fprintf(stderr,
-               "[eval][%s] endpoint scripted：root=%d evidence=%d sla=%d（证据 %s；复测 fps=%.2f "
-               "dropped=%llu）\n",
-               c.id.c_str(), static_cast<int>(o.score.root), static_cast<int>(o.score.evidence),
-               static_cast<int>(o.score.sla), evidence.front().c_str(), m.fps,
-               static_cast<unsigned long long>(m.dropped));
+               "[eval][%s] scripted+%s：root=%d evidence=%d sla=%d（证据 %s；复测 fps=%.2f "
+               "dropped=%llu%s）\n",
+               c.id.c_str(), how, static_cast<int>(o.score.root),
+               static_cast<int>(o.score.evidence), static_cast<int>(o.score.sla),
+               evidence.front().c_str(), m.fps,
+               static_cast<unsigned long long>(m.dropped), miss_note.c_str());
   return o;
 }
 
@@ -1075,9 +1197,27 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   // 1) 起管线：默认起本机 cued；--endpoint 时改为连一个实现 REST 控制协议的 HTTP 服务。
   //    此后所有使用（监控 / 工具 / SLA 复测）都只经 IServicePipeline，不认识具体后端。
   const auto pcfg = pipeline_config_for(c, cfg_);
+  const bool replay_tools = !cfg_.replay_tools_dir.empty();
+  const bool record_tools = !cfg_.record_tools_dir.empty();
+  // 录制/回放工具观测时不能有后台轮询线程：latest() 的序列按调用顺序消费，
+  // MetricMonitor 每 500 ms 抽一条会让回放侧消费位置漂移 → 同一份录制回放出不同数值。
+  // 代价是这两种模式没有 MTTR（记 n/a），换的是「同一份观测必然得到同一判定」。
+  const bool deterministic_tools = replay_tools || record_tools;
   std::string err;
   std::unique_ptr<pipeline::IServicePipeline> pipe;
-  if (!cfg_.endpoint.empty()) {
+  pipeline::ReplayPipeline* replay = nullptr;
+  if (replay_tools) {
+    const std::string path = pipeline::tools_record_path(cfg_.replay_tools_dir, c.id);
+    auto rp = std::make_unique<pipeline::ReplayPipeline>(path);
+    if (!rp->load_error().empty()) {
+      o.error_kind = "tools_replay_load_failed: " + rp->load_error();
+      return;
+    }
+    replay = rp.get();
+    pipe = std::move(rp);
+    std::fprintf(stderr, "[eval][%s] 回放工具观测 %s（不 spawn cued、不连 endpoint）\n",
+                 c.id.c_str(), path.c_str());
+  } else if (!cfg_.endpoint.empty()) {
     pipeline::PipelineEndpoint ep;
     ep.kind = pipeline::PipelineEndpoint::Kind::Http;
     ep.http_base = cfg_.endpoint;
@@ -1095,6 +1235,36 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     std::fprintf(stderr, "[eval][%s] 启动 cued（inject_drop=%.1f%%, bitrate=%d, gop=%d）\n",
                  c.id.c_str(), pcfg.inject_drop, pcfg.bitrate_kbps, pcfg.gop);
   }
+  if (record_tools && !replay_tools) {
+    auto rec = std::make_unique<pipeline::RecordingPipeline>(std::move(pipe),
+                                                             cfg_.record_tools_dir, c.id);
+    if (!rec->io_error().empty()) {
+      o.error_kind = "tools_record_io_failed: " + rec->io_error();
+      return;
+    }
+    pipe = std::move(rec);
+    std::fprintf(stderr, "[eval][%s] 录制工具观测到 %s\n", c.id.c_str(),
+                 pipeline::tools_record_path(cfg_.record_tools_dir, c.id).c_str());
+  }
+  // 回放统计要在所有返回路径上收集（参数不符会让脚本提前 return），
+  // 因此用 RAII；miss>0 必须把这条件记成 run_error，不能静默。
+  struct ReplayStatsGuard {
+    pipeline::ReplayPipeline* rp;
+    CaseOutcome* o;
+    ~ReplayStatsGuard() {
+      if (rp == nullptr) return;
+      const auto st = rp->stats();
+      o->tool_hits = st.hits;
+      o->tool_misses = st.misses;
+      if (st.misses > 0) {
+        const std::string miss = rp->last_error();
+        o->error_kind = o->error_kind.empty() ? "tools_replay_miss: " + miss
+                                              : "tools_replay_miss: " + miss + "；" + o->error_kind;
+        o->scored = false;
+      }
+    }
+  } stats_guard{replay, &o};
+
   struct StopGuard {
     pipeline::IServicePipeline* p;
     ~StopGuard() { p->stop(); }
@@ -1104,8 +1274,9 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     o.error_kind = "pipeline_start_failed: " + err;
     return;
   }
-  // Http 后端没有"进程启动参数"，case 的注入档位只能经接口补上（与 cued 启动参数同义）
-  if (!cfg_.endpoint.empty() && c.fault_kind == "drop" && c.fault_value > 0.0) {
+  // Http 后端没有"进程启动参数"，case 的注入档位只能经接口补上（与 cued 启动参数同义）。
+  // 回放时注入早已在录制里生效，不再调一次（那会多消费一条不存在的录制）。
+  if (!replay_tools && !cfg_.endpoint.empty() && c.fault_kind == "drop" && c.fault_value > 0.0) {
     std::string ierr;
     if (!pipe->inject_fault(c.fault_kind, c.fault_value, ierr)) {
       o.error_kind = "inject_failed: " + ierr;
@@ -1113,16 +1284,22 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     }
   }
   const int64_t t_inject_us = now_us();
-  MetricMonitor mon(*pipe, 500);
-  mon.start();
+  std::unique_ptr<MetricMonitor> mon;
+  if (!deterministic_tools) {
+    mon = std::make_unique<MetricMonitor>(*pipe, 500);
+    mon->start();
+  }
   struct MonGuard {
     MetricMonitor* m;
-    ~MonGuard() { m->stop(); }
-  } mon_guard{&mon};
+    ~MonGuard() {
+      if (m != nullptr) m->stop();
+    }
+  } mon_guard{mon.get()};
 
   // 2) warmup：等外部推流起来（agent 早于推流启动会拿到"尚无采样"）。
   //    --endpoint（假域/远端服务）：推流早已在服务内部，跳过等待，只做一次采样检查。
-  if (cfg_.endpoint.empty()) {
+  //    --replay-tools：观测已录好，不再等真实推流（也不得 spawn）。
+  if (!replay_tools && cfg_.endpoint.empty()) {
     for (int i = 0; i < cfg_.warmup_s; ++i) {
       if (cancelled()) {
         o.error_kind = "cancelled";
@@ -1225,19 +1402,40 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   // 5) harness 重测 SLA：等 agent 结束之后的连续 3 条新采样，取中位
   //    （单点采样会把"重启后 0.5 s 的瞬时窗口"当结论，见 review-eval.md #12）
   std::vector<SamplePoint> post;
-  const int64_t deadline_us = t_agent_end_us + int64_t(kRetestWaitMs) * 1000;
-  while (now_us() < deadline_us) {
-    const auto all = mon.snapshot();
-    post.clear();
-    for (const auto& s : all) {
-      if (s.t_us >= t_agent_end_us) post.push_back(s);
+  if (deterministic_tools) {
+    // 录制/回放：重测也是「等一条新采样 + 再取 3 条」的固定序列，终止只看返回值。
+    // 不做「采样陈旧」判定：updated_us 是录制时的时间，回放时必然显得很旧，
+    // 拿墙上时钟判它会把有效录制误判成 0 采样。
+    constexpr int kWaitAttempts = 100;  // 录制时最多等 20 s；回放不睡
+    for (int i = 0; i < kWaitAttempts && post.empty(); ++i) {
+      const auto pm = pipe->latest();
+      if (pm.samples > 0) {
+        post.push_back(SamplePoint{now_us(), to_metrics(pm)});
+      } else if (!replay_tools) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kSleepStepMs));
+      }
+      if (cancelled()) break;
     }
-    if (post.size() >= static_cast<std::size_t>(kRetestSamples)) break;
-    if (cancelled()) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(kSleepStepMs));
-  }
-  if (post.size() > static_cast<std::size_t>(kRetestSamples)) {
-    post.erase(post.begin(), post.end() - kRetestSamples);
+    for (int i = 0; i < kRetestSamples && !post.empty(); ++i) {
+      const auto pm = pipe->latest();
+      if (pm.samples == 0) continue;
+      post.push_back(SamplePoint{now_us(), to_metrics(pm)});
+    }
+  } else {
+    const int64_t deadline_us = t_agent_end_us + int64_t(kRetestWaitMs) * 1000;
+    while (now_us() < deadline_us) {
+      const auto all = mon->snapshot();
+      post.clear();
+      for (const auto& s : all) {
+        if (s.t_us >= t_agent_end_us) post.push_back(s);
+      }
+      if (post.size() >= static_cast<std::size_t>(kRetestSamples)) break;
+      if (cancelled()) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(kSleepStepMs));
+    }
+    if (post.size() > static_cast<std::size_t>(kRetestSamples)) {
+      post.erase(post.begin(), post.end() - kRetestSamples);
+    }
   }
 
   Metrics m;
@@ -1272,24 +1470,27 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     m.op.p50 = median(op50);
     m.op.p99 = median(op99);
     m.send.p50 = median(send);
-    const int64_t age_us =
-        m.updated_us == 0 ? kStaleSampleUs + 1 : now_us() - m.updated_us;
-    if (age_us > kStaleSampleUs) {
-      std::fprintf(stderr, "[eval][%s] 重测采样陈旧（%lld ms）→ SLA 不可判定为达标\n",
-                   c.id.c_str(), static_cast<long long>(age_us / 1000));
-      m.samples = 0;
+    if (!deterministic_tools) {
+      const int64_t age_us =
+          m.updated_us == 0 ? kStaleSampleUs + 1 : now_us() - m.updated_us;
+      if (age_us > kStaleSampleUs) {
+        std::fprintf(stderr, "[eval][%s] 重测采样陈旧（%lld ms）→ SLA 不可判定为达标\n",
+                     c.id.c_str(), static_cast<long long>(age_us / 1000));
+        m.samples = 0;
+      }
     }
   } else {
     m.samples = 0;  // 无采样 = 无法证明达成 = 不达标
     std::fprintf(stderr, "[eval][%s] 重测无有效采样 → SLA 不可判定为达标\n", c.id.c_str());
   }
 
-  // 6) MTTR：注入 → 指标首次回到 SLA（用整段时间序列，而不是只看最后一个点）
+  // 6) MTTR：注入 → 指标首次回到 SLA（用整段时间序列，而不是只看最后一个点）。
+  //    录制/回放模式没有后台时间序列，MTTR 记 n/a（不拿墙上时钟凑一个假数）。
   o.mttr_s = kNoValue;
   const bool has_sla =
       c.sla_fps_min > 0 || c.sla_dropped_max != UINT64_MAX || c.sla_frame_completion_min > 0;
-  if (has_sla) {
-    const auto all = mon.snapshot();
+  if (has_sla && mon != nullptr) {
+    const auto all = mon->snapshot();
     for (std::size_t i = 0; i < all.size(); ++i) {
       const auto& s = all[i];
       if (s.t_us < t_inject_us) continue;
@@ -1431,6 +1632,8 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
       r.cost_yuan += o.cost_yuan;
       r.cassette_hits += o.cassette_hits;
       r.cassette_misses += o.cassette_misses;
+      r.tool_hits += o.tool_hits;
+      r.tool_misses += o.tool_misses;
       ++attempt_count[c.id];
       if (o.scored && o.score.all()) ++pass_count[c.id];
       r.cases.push_back(std::move(o));
@@ -1539,6 +1742,13 @@ std::string Engine::render_markdown(const RunReport& r) const {
   o << "- 指纹: `" << r.fingerprint << "`（二进制 ⊕ git describe ⊕ 生效配置 ⊕ suite，SPEC §7.7）\n";
   o << "- 生效配置: cued=`" << cfg_.cued_bin << "`，model=`" << cfg_.model
     << "`，成本闸门 ¥" << cfg_.max_yuan << "，单价 ¥" << cfg_.yuan_per_mtok << "/Mtok（估算，非账单）\n";
+  if (!cfg_.record_tools_dir.empty()) {
+    o << "- 工具观测: 录制到 `" << cfg_.record_tools_dir << "`（每个 case 一份 <case_id>.tools.jsonl）\n";
+  }
+  if (!cfg_.replay_tools_dir.empty()) {
+    o << "- 工具观测: 回放 `" << cfg_.replay_tools_dir << "`，命中 " << r.tool_hits
+      << " 次，miss " << r.tool_misses << " 次\n";
+  }
   if (cfg_.agent_mode == "real") {
     o << "- LLM: `" << cfg_.llm_mode << "`，cassette=`" << cfg_.cassette_dir << "`";
     if (cfg_.llm_mode == "replay") {
@@ -1555,6 +1765,12 @@ std::string Engine::render_markdown(const RunReport& r) const {
   if (cfg_.agent_mode == "scripted") {
     o << "> **scripted 模式 = 引擎自检，不判模型**：结论与观测由 case 的 expect 构造，"
          "100% 通过只证明「判分器 + 引擎」链路通。要评模型能力请用 `--mode real`。\n\n";
+  }
+  if (!cfg_.replay_tools_dir.empty()) {
+    o << "> **工具回放**：管线调用来自 `" << cfg_.replay_tools_dir
+      << "` 的录制，不 spawn 后端、不连网络。回放证明的是**评测链路的确定性**"
+         "（同一份观测必然得到同一判定），不是「真实系统多次跑出同样数值」——"
+         "真管线的观测每轮都有抖动，那正是需要录制的原因。\n\n";
   }
   if (cfg_.agent_mode == "real" && cfg_.llm_mode == "replay") {
     o << "> **replay 模式**：LLM 响应来自 cassette（usage 照抄录制值），零网络、零成本；"

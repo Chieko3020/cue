@@ -47,7 +47,10 @@ int usage() {
       "\n"
       "  --endpoint URL 被测管线改为 HTTP 服务（实现 GET /api/state + POST /api/action），\n"
       "                 不再起 cued；warmup 等待也跳过（假域无需等外部推流）。\n"
-      "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
+      "  --record-tools DIR  把每个 case 的工具观测录到 DIR/<case_id>.tools.jsonl；\n"
+  "  --replay-tools DIR  只回放该录制：不 spawn cued、不连 endpoint，miss 明确报错。\n"
+  "                      两者互斥；--replay-tools 不能与 --endpoint 同时给。\n"
+  "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
       "  real 模式的 LLM 传输默认 replay：只读 cassette，零成本；缺录制直接报错\n"
       "  （run_error=cassette_miss，不静默走网络）。--live 才用真实网络（需 CUE_API_KEY /\n"
       "  CUE_BASE_URL），配 --record 把每次成功调用录进 --cassette-dir（默认 cassettes/）。\n"
@@ -188,6 +191,18 @@ int main(int argc, char** argv) {
                      cfg.endpoint.empty() ? "(空)" : cfg.endpoint.c_str());
         return 2;
       }
+    } else if (a == "--record-tools") {
+      cfg.record_tools_dir = next();
+      if (cfg.record_tools_dir.empty()) {
+        std::fprintf(stderr, "--record-tools 需要目录\n");
+        return 2;
+      }
+    } else if (a == "--replay-tools") {
+      cfg.replay_tools_dir = next();
+      if (cfg.replay_tools_dir.empty()) {
+        std::fprintf(stderr, "--replay-tools 需要目录\n");
+        return 2;
+      }
     } else if (a == "--resume") {
       cfg.resume_run_id = next();
     } else if (a == "--diff") {
@@ -207,6 +222,17 @@ int main(int argc, char** argv) {
       return 2;
     }
     return do_diff(diff_a, diff_b, cfg.out_dir);
+  }
+
+  // AC-6：工具观测的录制/回放互斥；回放时没有要连的后端，与 --endpoint 同给会让
+  // 「回放的是哪份观测」变得不可解释。
+  if (!cfg.record_tools_dir.empty() && !cfg.replay_tools_dir.empty()) {
+    std::fprintf(stderr, "--record-tools 与 --replay-tools 互斥\n");
+    return 2;
+  }
+  if (!cfg.replay_tools_dir.empty() && !cfg.endpoint.empty()) {
+    std::fprintf(stderr, "--replay-tools 不能与 --endpoint 同时使用（回放不连后端）\n");
+    return 2;
   }
 
   // 单价：环境变量优先（报告里回显的单价必须是实际使用的那个）
@@ -324,6 +350,13 @@ int main(int argc, char** argv) {
   if (cfg.agent_mode == "real") {
     std::printf("[eval] LLM=%s cassette=%s%s\n", cfg.llm_mode.c_str(), cfg.cassette_dir.c_str(),
                 cfg.record ? "（录制中）" : "");
+  }
+  if (!cfg.record_tools_dir.empty()) {
+    std::printf("[eval] 工具观测录制到 %s（miss 会报错）\n", cfg.record_tools_dir.c_str());
+  }
+  if (!cfg.replay_tools_dir.empty()) {
+    std::printf("[eval] 工具观测回放 %s（不 spawn cued、不连网络）\n",
+                cfg.replay_tools_dir.c_str());
   }
 
   cfg.cancel = &g_cancel;
