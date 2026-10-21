@@ -135,6 +135,15 @@ bool ProcessPipelineControl::spawn_locked(std::string& err) {
       "--inject-seed", std::to_string(cfg_.inject_seed),
       "--fec", cfg_.fec ? "on" : "off",
   };
+  // 上行注入与发送排队只在开启时下传：不带这两个参数时 cued 的行为与 M2 完全一致
+  if (cfg_.inject_ingress_drop > 0.0) {
+    args.push_back("--inject-ingress-drop");
+    args.push_back(std::to_string(cfg_.inject_ingress_drop));
+  }
+  if (cfg_.queue_fps > 0.0) {
+    args.push_back("--queue-fps");
+    args.push_back(std::to_string(cfg_.queue_fps));
+  }
   if (cfg_.transcode) {
     args.push_back("--transcode");
     args.push_back("on");
@@ -565,22 +574,52 @@ bool ProcessPipelineControl::set_param(const std::string& key, const std::string
 }
 
 bool ProcessPipelineControl::inject_fault(const std::string& kind, double value, std::string& err) {
-  if (kind != "drop") {
-    err = "M3 仅支持 kind=drop（delay/jitter/rate 见 RECEIPT 未实现项）";
+  // 四种注入对应四种不同的可观测量（real-faults 的五类里四类由此而来）：
+  //   drop          出向丢包（%）：只涨 injected；丢弃发生在 frames_out 结算之后 → fps 不动
+  //   ingress_drop  上行丢包（%）：帧重组超时 → dropped 涨、frames_out 掉
+  //   rate          发送速率上限（Mbps）：令牌桶不足 → budget_drops 涨、帧被丢
+  //   backlog       发送排队节奏（帧/s）：不丢包，队列积压 → frames_in−frames_out 涨
+  if (kind != "drop" && kind != "ingress_drop" && kind != "rate" && kind != "backlog") {
+    err = "不支持的注入类型 \"" + kind + "\"（可用：drop / ingress_drop / rate / backlog）";
     return false;
   }
-  if (value < 0 || value > 100) {
-    err = "drop percent out of range [0, 100]";
+  if (!(value >= 0.0 && value <= 100.0)) {  // 同时挡掉 NaN
+    err = "注入值超出范围 [0, 100]（0 = 清除全部注入）";
     return false;
   }
-  if (std::fabs(cfg_.inject_drop - value) < 1e-9) return true;  // 幂等：注入值没变不重启
+  if (kind == "rate" && value > 0.0 && value < 0.1) {
+    err = "rate 注入值必须在 [0.1, 100] Mbps（cued 的 --send-mbps 下限是 0.1）";
+    return false;
+  }
+  // value=0 = 清除**全部**注入：工具面只有一个「注入丢包计数」读数，agent 不该被要求
+  // 先猜是哪一路注入才能撤销（见 real_ops_system_prompt 的说明）。
   const bool clearing = value <= 0.0;
-  cfg_.inject_drop = value;
+  Config next = cfg_;
+  if (clearing) {
+    next.inject_drop = 0.0;
+    next.inject_ingress_drop = 0.0;
+    next.send_mbps = 10.0;  // SPEC §7.2 的默认链路：10 Mbps / 64 包突发
+    next.queue_fps = 0.0;
+  } else if (kind == "drop") {
+    next.inject_drop = value;
+  } else if (kind == "ingress_drop") {
+    next.inject_ingress_drop = value;
+  } else if (kind == "rate") {
+    next.send_mbps = value;
+  } else {
+    next.queue_fps = value;
+  }
+  if (next.inject_drop == cfg_.inject_drop &&
+      next.inject_ingress_drop == cfg_.inject_ingress_drop &&
+      next.send_mbps == cfg_.send_mbps && next.queue_fps == cfg_.queue_fps) {
+    return true;  // 幂等：注入值没变不重启
+  }
+  cfg_ = next;
   stop();
   if (!spawn(err)) return false;
   emit_local_event("pipeline.restart", json{{"reason", "fault_change"}, {"pid", pid_.load()}});
   // 施加故障由 cued 自己报（fault.applied，scope=cued_start）；取消故障 cued 侧无从得知
-  // （它只是以 inject_drop=0 启动），所以 cleared 只能由控制面补上。
+  // （它只是以未注入的档位启动），所以 cleared 只能由控制面补上。
   if (clearing) {
     emit_local_event("fault.cleared",
                      json{{"kind", kind}, {"value", value}, {"pid", pid_.load()}});
@@ -602,6 +641,12 @@ std::string ProcessPipelineControl::observation(const std::string& source, int t
     oss << "cued pid=" << pid << " running=" << (pid != 0 ? "true" : "false")
         << " restarts=" << restarts_ << " transcode=" << (cfg_.transcode ? "on" : "off")
         << " bitrate=" << cfg_.bitrate_kbps << "kbps gop=" << cfg_.gop;
+    // 编码器实际档位：agent 判断「编码段慢」到底是 preset 太慢还是输出像素太多，
+    // 必须能读到这两项（它们与 bitrate/gop 同属配置面，不是答案）。
+    oss << " size="
+        << (cfg_.width > 0 ? std::to_string(cfg_.width) + "x" + std::to_string(cfg_.height)
+                          : std::string("follow"))
+        << " preset=" << cfg_.preset;
     return oss.str();
   }
   if (source == "events") {

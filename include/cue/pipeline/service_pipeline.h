@@ -33,6 +33,11 @@ struct PipelineEndpoint {
   int width = 0, height = 0, bitrate_kbps = 1500, fps = 30, gop = 60;
   std::string preset = "veryfast";
   double inject_drop = 0.0;
+  // 上行（浏览器 → cued）丢包百分比：与出向 inject_drop 分开，因为两者在指标上留下
+  // 的是不同证据（见 ProcessPipelineControl::inject_fault 的注释）。
+  double inject_ingress_drop = 0.0;
+  // 发送侧排队节奏（帧/s）：>0 时不丢包，按这个节奏排空发送队列（queue_backlog）。
+  double queue_fps = 0.0;
   uint64_t inject_seed = 42;
   bool fec = true;
   double send_mbps = 10.0;
