@@ -289,7 +289,9 @@ const char* real_ops_system_prompt() {
          "每轮只能调用工具；结论必须引用真实观测作为证据；每个阶段结束调用 stage_complete。"
          "根因必须使用枚举值：network_loss / network_delay / bandwidth_insufficient / "
          "encoder_too_slow / resolution_too_high / queue_backlog / keyframe_storm / clock_drift。"
-         "若要取消已有的丢包注入，用 inject_fault 且 value=0。"
+         "inject_fault 的 kind 可选 drop（下行丢包 %）/ ingress_drop（上行丢包 %）/ "
+         "rate（发送速率上限 Mbps）/ backlog（发送排队节奏 fps）；"
+         "value=0 表示清除全部注入（不区分是哪一路）。"
          "diagnose 阶段提交 evidence 时，每条只从某次工具返回里逐字摘抄 key=value 片段"
          "（例如 injected=59、fps=30.3、decode_p99_ms=3.199），最多 4 条；"
          "严格禁止解释性文字、中文句子、根因说明或把多次观测合并成一条——"
@@ -326,7 +328,8 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
                                      .type = "string",
                                      .desc = "参数名",
                                      .required = true,
-                                     .enum_values = {"bitrate_kbps", "gop", "preset", "transcode"}},
+                                     .enum_values = {"bitrate_kbps", "gop", "preset", "transcode", "width",
+                                                                  "height"}},
                                     {.name = "value",
                                      .type = "string",
                                      .desc = "目标值",
@@ -348,16 +351,18 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
           });
 
   reg.add(tool::ToolSpec{.name = "inject_fault",
-                         .desc = "注入网络损伤（危险动作；取消注入用 value=0）",
+                         .desc = "注入网络损伤（危险动作；value=0 清除全部注入）",
                          .risk = tool::Risk::Dangerous,
                          .params = {{.name = "kind",
                                      .type = "string",
-                                     .desc = "类型",
+                                     .desc = "类型：drop=下行丢包% / ingress_drop=上行丢包% / "
+                                             "rate=发送速率上限Mbps / backlog=发送排队节奏fps",
                                      .required = true,
-                                     .enum_values = {"drop"}},
+                                     .enum_values = {"drop", "ingress_drop", "rate", "backlog"}},
                                     {.name = "value",
                                      .type = "number",
-                                     .desc = "丢包百分比 0-100",
+                                     .desc = "注入值（drop/ingress_drop 为百分比，rate 为 Mbps，"
+                                             "backlog 为帧/s；0 = 清除全部注入）",
                                      .required = true,
                                      .enum_values = {},
                                      .has_range = true,
@@ -370,8 +375,11 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
             if (!pipe.inject_fault(k, v, err)) {
               return record(trace, "inject_fault", tool::ToolResult{false, "注入失败: " + err, json::object()});
             }
-            return action_result(trace, "inject_fault", "已注入 " + k + "=" + std::to_string(v) + "%",
-                                 pipe);
+            if (v <= 0.0) {
+              return action_result(trace, "inject_fault", "已清除全部注入（kind=" + k + "）", pipe);
+            }
+            return action_result(trace, "inject_fault",
+                                 "已注入 " + k + "=" + std::to_string(v), pipe);
           });
 
   reg.add(tool::ToolSpec{.name = "fetch_observation",
