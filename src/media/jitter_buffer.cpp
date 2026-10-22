@@ -118,7 +118,15 @@ std::vector<JitterFrame> JitterBuffer::release_ready(int64_t now_us) {
       // 前端前面有空洞：只有预算能放弃那个缺失帧。这正是乱序帧回到正确位置的机会窗口，
       // 提前放行等于自己把窗口关掉。
       // 关键帧例外——IDR 不依赖缺失的前序帧，白等一个预算只会拉高延迟。
-      const int64_t need = front.keyframe ? hold : std::max(hold, cfg_.budget_us);
+      int64_t need = front.keyframe ? hold : std::max(hold, cfg_.budget_us);
+      // 与 NACK 联动：缺失的那一段正在被重传时，把预算放宽到一次往返的量级。
+      // 否则重传明明在跑，缓冲却按"纯丢包"在 40 ms 就放手——重传白跑，帧还是丢了。
+      // 只在"确实查到在途"时放宽，查不到就退化成原行为（可 A/B 对比）。
+      if (!front.keyframe && cfg_.retransmit_pending && cfg_.nack_wait_us > need &&
+          have_last_released_ &&
+          cfg_.retransmit_pending(last_released_pts_, front.pts_us)) {
+        need = cfg_.nack_wait_us;
+      }
       if (wait < need) break;
       count_hole(front.pts_us);
     } else {
@@ -233,7 +241,15 @@ int64_t JitterBuffer::next_deadline_us() const {
   const JitterFrame& front = q_.front().frame;
   const bool gap = gap_before(front.pts_us);
   int64_t need = hold_us();
-  if (gap && !front.keyframe) need = std::max(need, cfg_.budget_us);
+  if (gap && !front.keyframe) {
+    need = std::max(need, cfg_.budget_us);
+    // 与 release_ready 保持同一判据：否则 poll 会按 budget 提前醒来，
+    // 而 release_ready 又要等到 nack_wait——调用方的超时会与真实到期时刻对不上。
+    if (cfg_.retransmit_pending && cfg_.nack_wait_us > need && have_last_released_ &&
+        cfg_.retransmit_pending(last_released_pts_, front.pts_us)) {
+      need = cfg_.nack_wait_us;
+    }
+  }
   return front.arrival_us + need;
 }
 

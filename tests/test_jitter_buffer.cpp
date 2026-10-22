@@ -202,6 +202,68 @@ int main() {
     check(clean.loss_rate == 0.0, "自适应：干净窗口的丢包率为 0");
   }
 
+  // ---------------------------------------------------------------- 4b) 与 NACK 联动
+  // 空洞时若「缺失的那一段正在被重传」，等待预算要从 budget 放宽到 nack_wait；
+  // 查不到在途就退回 budget —— 这条差异是 A/B 对比的基准，不能悄悄失效。
+  // 用 target_frames=1（零驻留）让"首帧立即放行、后续帧形成空洞"这件事可预期；
+  // 深度 2 的配置下首帧本来就要等一帧才放行（见用例 1），那会把时序搅乱。
+  {
+    JitterBufferConfig c;
+    c.max_frames = 8;
+    c.target_frames = 1;         // hold = 0
+    c.budget_us = 50'000;
+    c.nominal_interval_us = kInterval;
+    c.nack_wait_us = 200'000;
+    uint64_t asked_lo = 0, asked_hi = 0;
+    int asks = 0;
+    bool inflight = true;
+    c.retransmit_pending = [&](uint64_t lo, uint64_t hi) {
+      ++asks;
+      asked_lo = lo;
+      asked_hi = hi;
+      return inflight;
+    };
+
+    {
+      JitterBuffer jb(c);
+      // PTS=0 建立基线并立即放行（无空洞）
+      auto first = jb.push(frame(0), 0);
+      check(first.size() == 1, "NACK 联动：零驻留时首帧立即放行并建立基线");
+      // PTS=2×interval：与基线之间空出 PTS=1×interval，构成空洞
+      auto got = jb.push(frame(2 * kInterval), 20'000);
+      check(got.empty(), "NACK 联动：有空洞且未到期时不放行");
+      check(asks > 0, "NACK 联动：空洞时确实查询了重传状态");
+      check(asked_lo == 0 && asked_hi == 2 * kInterval,
+            "NACK 联动：查询区间是 (最近已放行, 队首) 的开区间");
+      // budget(50 ms) 已过，但 nack_wait(200 ms) 未到：在途 → 继续等
+      check(jb.poll(20'000 + 60'000).empty(), "NACK 联动：重传在途时超过 budget 仍不放行");
+      // 越过 nack_wait → 放弃缺失帧、放行队首
+      check(!jb.poll(20'000 + 200'000).empty(), "NACK 联动：重传在途时等满 nack_wait 后放行");
+    }
+
+    {
+      // 同样时序但查不到在途：按 budget 放行，不被 nack_wait 拖住
+      inflight = false;
+      JitterBuffer jb2(c);
+      (void)jb2.push(frame(0), 0);
+      check(jb2.push(frame(2 * kInterval), 20'000).empty(), "NACK 联动：无在途时未到期不放行");
+      check(!jb2.poll(20'000 + 60'000).empty(),
+            "NACK 联动：无在途时按 budget 放行（不被 nack_wait 拖住）");
+      inflight = true;
+    }
+
+    {
+      // 没装回调 = 完全退回旧行为（nack_wait 配了也不起作用）
+      JitterBufferConfig c2 = c;
+      c2.retransmit_pending = nullptr;
+      JitterBuffer jb3(c2);
+      (void)jb3.push(frame(0), 0);
+      (void)jb3.push(frame(2 * kInterval), 20'000);
+      check(!jb3.poll(20'000 + 60'000).empty(),
+            "NACK 联动：没装回调时按 budget 放行（与改动前一致）");
+    }
+  }
+
   // ---------------------------------------------------------------- 5) 关键帧保护
   // 队列超容量时必须挤掉非关键帧，而不是把 IDR 扔掉——IDR 一丢，后面整个 GOP 的 P 帧全废。
   {

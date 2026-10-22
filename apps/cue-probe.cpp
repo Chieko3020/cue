@@ -584,6 +584,10 @@ int main(int argc, char** argv) {
   // SPEC §7.2：NACK 限速 8 包/秒。默认间隔 125 ms 正好对应 8 包/秒；间隔更大只会更慢。
   // 间隔小于 125 ms 时由 NackRateLimiter 夹到 8 包/秒的上限（这是协议上限，不是可选项）。
   long long nack_interval_ms = 125;
+  // 有重传在途时空洞的最长等待：要盖住「NACK 发出 → cued 重传 → 到达」一次往返。
+  // 120 ms 的取法：本机往返 <1 ms、跨机局域网通常 <10 ms，留足余量但仍远小于
+  // "追赶积压"造成的秒级延迟。设 0 = 关闭联动（退化成只等 budget）。
+  long long nack_wait_ms = 120;
   // 标称帧率只用于「卡顿阈值」的推断（阈值 = stall_factor × 1/fps），不是测量值。
   // 30 是这个项目的默认推流帧率（cued 的 --fps 默认 30）。
   long long nominal_fps = 30;
@@ -649,13 +653,16 @@ int main(int argc, char** argv) {
     } else if (a == "--nack-delay-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 5000, nack_delay_ms)) bad(a, val);
+    } else if (a == "--nack-wait-ms") {
+      const auto val = next();
+      if (!parse_int(val, 0, 2000, nack_wait_ms)) bad(a, val);
     } else if (a == "--nack-interval-ms") {
       const auto val = next();
       if (!parse_int(val, 1, 10000, nack_interval_ms)) bad(a, val);
     } else if (a == "--help") {
       std::printf(
           "cue-probe --port 9001 [--bind 0.0.0.0] [--nack on|off] [--nack-delay-ms 15]\n"
-          "          [--nack-interval-ms 125] [--fps 30] [--stall-factor 1.5]\n"
+          "          [--nack-interval-ms 125] [--nack-wait-ms 120] [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..3]\n"
           "          [--report-addrs host:port[,host:port]]\n"
@@ -686,6 +693,7 @@ int main(int argc, char** argv) {
   jb_cfg.max_frames = cue::media::kDepthLadder[jb_cfg.max_level] + 2;
   jb_cfg.nominal_interval_us = frame_interval_us;
   jb_cfg.budget_us = jitter_budget_ms * 1000;
+  jb_cfg.nack_wait_us = nack_wait_ms * 1000;  // 0 = 不联动（只有 budget 生效）
 
   net::io_context ioc;
   boost::system::error_code ec;
@@ -757,6 +765,22 @@ int main(int argc, char** argv) {
   ClockAlign clk;
   DecodeState dec;
   FrameStats fs;
+  // 与 NACK 联动（在 `pending` 声明之后接线）：抖动缓冲遇到 PTS 空洞时，如果那个缺失的
+  // 帧正在被重传（`nack_queued`），就把等待预算放宽到 nack_wait_us。
+  // 用 PTS 开区间查询而不是 frame_id：`FrameAcc` 本身就带 pts_us，且不依赖 frame_id 连续
+  // （cued 重启、转码重建时它会重新计数）。
+  // 单包探测模式**故意不参与**：探测的语义就是「少发、少等、能恢复就恢复」，
+  // 给它放宽等待会把冷却期又变回高延迟期，与 FR-PROBE.2 的初衷相反。
+  // 只在真的查到在途时放宽，查不到就退回原行为——这条差异是 A/B 对比的基准。
+  if (nack_enabled) {
+    jb_cfg.retransmit_pending = [&pending](uint64_t pts_lo, uint64_t pts_hi) {
+      for (const auto& [fid, fa] : pending) {
+        (void)fid;
+        if (fa.nack_queued && fa.pts_us > pts_lo && fa.pts_us < pts_hi) return true;
+      }
+      return false;
+    };
+  }
   // 抖动缓冲：插在重组之后、解码之前。组件不带线程，队列与时间都由本循环驱动。
   cue::media::JitterBuffer jb(jb_cfg);
   uint64_t frames = 0, lost_frames = 0, bytes = 0, packets = 0;

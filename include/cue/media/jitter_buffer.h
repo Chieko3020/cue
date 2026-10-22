@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <vector>
 
 namespace cue::media {
@@ -67,6 +68,18 @@ struct JitterBufferConfig {
 
   // 标称帧间隔（µs），hold 与空洞判定的起点；之后由 PTS 增量的 EWMA 慢慢跟踪真实帧率。
   int64_t nominal_interval_us = 33'333;
+
+  // ---- 与 NACK 联动（FR-PROBE.2 / FR-PROBE.4 的交界处）----
+  // 空洞时默认只等 budget_us 就放弃。但若那个缺失的帧**正在被重传**，多等一次 RTT
+  // 往往就能等到它——现在 probe 明明已经在发 NACK，缓冲却和"纯丢包"一样 40 ms 就放手，
+  // 等于重传白跑。
+  // 查询参数是 PTS 开区间 (pts_lo, pts_hi)：两侧都有 PTS，不需要 frame_id 的连续性假设
+  // （frame_id 在 cued 重启、转码重建时并不保证连续）。
+  // 空 = 不联动，行为与本改动前完全一致（单测与 A/B 对比依赖这一点）。
+  std::function<bool(uint64_t pts_lo, uint64_t pts_hi)> retransmit_pending;
+  // 有重传在途时的空洞最长等待：要盖住一次「NACK 发出 → cued 重传 → 到达」的往返。
+  // 比 budget 大，但仍有界——不能因为一个永远补不回来的帧把队列堵死。
+  int64_t nack_wait_us = 120'000;
 
   // 深度自适应（探针侧用）：按「丢包率 + 到达抖动」在档位阶梯上上下移动。
   bool adaptive = false;
