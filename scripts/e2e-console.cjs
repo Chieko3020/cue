@@ -311,8 +311,20 @@ async function shutdown() {
   await page.screenshot({ path: path.join(SHOT_DIR, 'session.png'), fullPage: true });
 
   // ---------------------------------------------------------------- 5b. Last-Event-ID 补齐
-  const st = await getState();
-  const lastId = (st.server && st.server.sse_last_id) || 0;
+  // CI 上事件产生比本地慢：直接取 sse_last_id 可能还是 0，
+  // 那样 from = max(1, 0-3) = 1 > last_id(0)，服务端没有可重放的事件，
+  // 于是不发 replayed_from —— 断言挂在"补齐没生效"，其实是"还没事件"。
+  // 先等到至少 5 条事件；等不到就明确失败（不静默跳过）。
+  let st = await getState();
+  let lastId = (st.server && st.server.sse_last_id) || 0;
+  for (let i = 0; i < 24 && lastId < 5; i++) {
+    await sleep(500);
+    st = await getState();
+    lastId = (st.server && st.server.sse_last_id) || 0;
+  }
+  if (lastId < 2) {
+    fail(`事件太少（sse_last_id=${lastId}，等 12 s 仍不足），无法验证 Last-Event-ID 补齐`);
+  }
   const from = Math.max(1, lastId - 3);
   const replay = await readSse({ 'Last-Event-ID': String(from) });
   if (!replay.includes(`"replayed_from":${from}`)) {
