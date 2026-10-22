@@ -155,6 +155,9 @@ ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0 \
 | `cue-serve` | 控制台后端：HTTP + SSE + 静态托管 + 审批队列 | 起控制台 |
 | `cue-mock-svc` | 确定性假域服务，实现同一套 REST 控制协议 | 起假域 |
 
+停全部进程用 `./scripts/stop.sh`：按**精确进程名**（不是 `pkill -f 路径`，那会把自己也杀掉——这个坑踩过两次）依次 SIGTERM → 宽限 5 s → SIGKILL，并清理被 SIGKILL 的进程留下的 `/tmp/cue/<pid>/` 控制 socket 目录。
+`--dry-run` 只列不停、`--force` 直接 KILL、`--keep-probe` 保留跨机的探针。
+
 `cue demo` 的变体：`--http URL [--record DIR]` 走 OpenAI 兼容端点并录制 cassette；`--replay DIR` 从 cassette 回放。`cue run` 的 `--approval ask|auto|deny`、`--allow-dangerous NAMES|none` 控制审批；`CUE_RECORD=1` 把成功调用录进 `CUE_CASSETTE_DIR`。
 
 `run.sh` 不带参数（或 `demo-min`）会起「`cue-probe` + `cued` + 采集源 + 静态页」，在终端打印 `http://127.0.0.1:8080/?ws_port=9000`。采集源默认是 `cue-capture --backend lavfi`（`testsrc2` 画面 + `sine` 音频，零采购真实源；走与浏览器同一套上行协议）；没有该二进制时回退到 `scripts/test-client.mjs`（Node 模拟浏览器）。`CUE_PRODUCER=page` 则不自动产帧，改由页面点「开始推流」——`cued` 一次只接一个客户端，采集端跑着时页面连不上，这是预期行为。`cued` 默认只监听 `127.0.0.1`；跨机演示用 `BIND=0.0.0.0` 并自行限制 9000/TCP 与 9001/UDP。改过 `WS_PORT` 也能对上。
