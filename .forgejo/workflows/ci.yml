@@ -53,7 +53,12 @@ jobs:
       - name: 配置与构建（-j1 防 OOM）
         run: |
           set -euo pipefail
-          cmake -S . -B build-ci -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          # 本机 2 vCPU / 1967 MB，runner 的 cgroup MemoryHigh=700M。带完整 -g 时
+          # cued.cpp（Boost+FFmpeg）单份 .o 就几十 MB，构建会一直贴着 MemoryHigh 被节流
+          # （实测 90 min 只编出 2 个 TU，cc1plus 只占 18% CPU）。CI 的 build job 不负责
+          # 调试，去 -g 后内存需求降到 cgroup 装得下；需要栈信息的场景在 asan job。
+          cmake -S . -B build-ci -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O2 -DNDEBUG -g0"
           cmake --build build-ci -j1 2>&1 | tee /tmp/cue-build.log
           # 0 warning 是硬口径：构建日志里出现 "warning:" 就算失败
           if grep -n "warning:" /tmp/cue-build.log; then
@@ -83,7 +88,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 配置（ASan+UBSan，自动关 -Werror）
-        run: cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCUE_SANITIZE=address,undefined
+        # -g1 而不是 -g：仍能报文件:行号，但调试信息量小一个量级——
+        # sanitizer 构建本来就吃内存，完整 -g 在 700M 的 cgroup 里会被节流到跑不完。
+        run: cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1" -DCUE_SANITIZE=address,undefined
 
       - name: 构建（-j1）
         run: cmake --build build-asan -j1
@@ -108,7 +115,7 @@ jobs:
             || echo "::warning::无 sudo 权限，未能下调 vm.mmap_rnd_bits；若 tsan 报 unexpected memory mapping，请以 root 执行 sysctl -w vm.mmap_rnd_bits=28"
 
       - name: 配置（TSan 单独一个构建目录）
-        run: cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCUE_SANITIZE=thread
+        run: cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1" -DCUE_SANITIZE=thread
 
       - name: 构建（-j1）
         run: cmake --build build-tsan -j1
@@ -129,7 +136,8 @@ jobs:
       - name: 构建
         run: |
           set -euo pipefail
-          cmake -S . -B build-e2e -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -S . -B build-e2e -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g0"
           cmake --build build-e2e -j1
 
       - name: 尝试构建 web/dist（失败不判红，但必须显式记录原因）
