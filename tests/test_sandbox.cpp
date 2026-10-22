@@ -16,6 +16,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -34,7 +35,8 @@ void check(bool cond, const char* what) {
   }
 }
 
-bool contains(const std::string& hay, const char* needle) {
+bool contains(const std::string& hay, const char* needle) { return hay.find(needle) != std::string::npos; }
+bool contains(const std::string& hay, const std::string& needle) {
   return hay.find(needle) != std::string::npos;
 }
 
@@ -189,29 +191,52 @@ void test_allowed_command_runs() {
   }
 }
 
-// 在 apply_landlock() 之后 fork 出来的子进程里验证写拒绝：
-//   exit 0  = 写 /tmp 被拒、/dev/null 可写（符合预期）
-//   exit 1  = 写 /tmp 竟然成功（landlock 没生效）
-//   exit 3  = /dev/null 打不开（例外规则漏了，会让正常命令的重定向失败）
+// 在 apply_landlock_plan() 之后 fork 出来的子进程里验证写白名单（FR-SANDBOX.2）：
+//   exit 0  = /tmp 与 runs/sandbox 可写、项目源码不可写、/dev/null 可写（符合预期）
+//   exit 1  = /tmp 写不进（临时目录没放行）
+//   exit 2  = runs/sandbox 写不进（FR-SANDBOX.2 的后半句没做到）
+//   exit 3  = 项目源码竟然可写（默认拒绝失效，最严重）
+//   exit 4  = /dev/null 打不开（例外规则漏了，会让正常命令的重定向失败）
+//   exit 5  = 写源码失败但不是 EACCES（例如路径写错，属于假绿，必须重跑）
 //   exit 42 = landlock 不可用（旧内核），跳过而不是假绿
-void test_landlock_write_denied() {
-  bool degraded = false;
-  std::string error;
-  // 先在当前进程之外的环境验证一次能力（不在测试进程里 restrict，否则后续用例全被限死）
+//
+// 为什么不用 shell 验证 `echo x > runs/id/f`：这一层的全部前提就是"不经过 shell"，
+// run_shell 也没有重定向语法（没有解释器）。用同一份 Limits 在子进程里 open() 等价，
+// 而且能精确区分"哪一条路径失败"。
+void test_landlock_write_paths() {
+  sb::Limits limits;  // 默认：ro=工作目录（项目根），rw=/tmp + runs/sandbox
+  auto plan = sb::build_landlock_plan(limits);
+  if (!plan.usable) {
+    std::printf("SKIP: landlock 不可用（%s），写路径未验证\n", plan.unavailable_reason.c_str());
+    return;
+  }
+  check(plan.rejected.empty(), "默认可写路径不应被策略拒绝");
+  check(plan.not_applied.empty(), "默认可写路径应当都生效（/tmp 与 runs/sandbox）");
+
   const pid_t pid = ::fork();
   if (pid == 0) {
+    char err[224] = {0};
     bool deg = false;
-    std::string err;
-    if (!sb::apply_landlock(deg, err)) ::_exit(42);
-    const std::string path = "/tmp/cue-ac11-write-" + std::to_string(::getpid());
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-      ::close(fd);
-      ::unlink(path.c_str());
-      ::_exit(1);
+    if (!sb::apply_landlock_plan(plan, err, sizeof(err), deg)) ::_exit(42);
+    const std::string tmp_path = "/tmp/cue-ac11-rw-" + std::to_string(::getpid());
+    const int t = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (t < 0) ::_exit(1);
+    ::close(t);
+    ::unlink(tmp_path.c_str());
+    const int rd = ::open("runs/sandbox/probe.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (rd < 0) ::_exit(2);
+    ::close(rd);
+    ::unlink("runs/sandbox/probe.txt");
+    // 项目源码只读：O_WRONLY 就够（landlock 先看 WRITE_FILE，不需要 O_TRUNC）。
+    // 必须断言 EACCES 而不是"open 失败就行"：路径不存在也会失败，那是假绿。
+    const int src = ::open("src/sandbox/sandbox.cpp", O_WRONLY);
+    if (src >= 0) {
+      ::close(src);
+      ::_exit(3);
     }
+    if (errno != EACCES) ::_exit(5);
     const int nfd = ::open("/dev/null", O_WRONLY);
-    if (nfd < 0) ::_exit(3);
+    if (nfd < 0) ::_exit(4);
     ::close(nfd);
     ::_exit(0);
   }
@@ -224,12 +249,152 @@ void test_landlock_write_denied() {
   }
   const int code = WEXITSTATUS(status);
   if (code == 42) {
-    std::printf("SKIP: landlock 不可用（降级路径），写拒绝未验证\n");
+    std::printf("SKIP: landlock 不可用（降级路径），写路径未验证\n");
     return;
   }
-  check(code == 0, "landlock 必须拒绝写 /tmp 且放行写 /dev/null");
-  (void)degraded;
-  (void)error;
+  if (code != 0) std::printf("landlock 子进程退出码 %d（1=/tmp 2=runs 3=源码可写 4=/dev/null 5=非权限失败）\n", code);
+  check(code == 0, "landlock 必须放行 /tmp 与 runs/<id>、拒绝项目源码、放行 /dev/null");
+}
+
+// 危险可写路径必须被**显式拒绝**（整个 run 不执行），而不是静默忽略：
+// 静默忽略会让调用方以为它拿到了写权限。
+void test_dangerous_rw_path_refused() {
+  const char* bad[] = {"/", "/etc", "/usr", "/tmp/..", "/proc"};
+  for (const char* p : bad) {
+    sb::Limits limits;
+    limits.rw_paths = {p};
+    const auto r = sb::run("echo", {"x"}, limits, nullptr);
+    check(!r.ran, "危险可写路径必须让 run 直接拒绝（不执行）");
+    check(contains(r.error, "可写路径被策略拒绝"), "拒绝原因必须写明是可写路径策略");
+    check(!r.paths_not_applied.empty(), "被拒绝的路径必须如实列在结果里（审计要用）");
+  }
+}
+
+// 不存在/建不出来的可写路径：不阻断执行，但必须如实上报（"以为能写"最难查）。
+void test_missing_rw_path_reported() {
+  // "建不出来"必须对 root 也成立：权限位挡不住 root（CAP_DAC_OVERRIDE），
+  // 但用普通文件当父目录会 ENOTDIR——这条与 uid 无关。
+  const std::string blocker = "/tmp/cue-ac11-blocker-" + std::to_string(::getpid());
+  {
+    std::ofstream out(blocker);
+    out << "not a directory\n";
+  }
+  sb::Limits limits;
+  limits.rw_paths = {"/tmp/cue-ac11-rw-ok-" + std::to_string(::getpid()), blocker + "/runs"};
+  const auto r = sb::run("echo", {"ok"}, limits, nullptr);
+  check(r.ran && r.exit_code == 0, "一条路径建不出来不应让命令不执行");
+  check(r.rw_paths_applied.size() == 1, "只有建得出来的那条路径应生效");
+  check(r.paths_not_applied.size() == 1, "建不出来的路径必须出现在 paths_not_applied 里");
+  if (!r.paths_not_applied.empty()) {
+    check(contains(r.paths_not_applied[0], blocker + "/runs"),
+          "未生效路径要带具体路径，便于审计定位");
+  }
+  // 该测试自己建的东西自己收掉（/tmp 不该因为跑过单测而积垃圾）
+  for (const auto& p : r.rw_paths_applied) ::rmdir(p.c_str());
+  ::unlink(blocker.c_str());
+}
+
+// FR-SANDBOX.4：root 下子进程必须降到 nobody；非 root 下必须显式记录 not_root。
+// 用 `id` 验证真实 uid（只看 Result 字段等于自证）。
+void test_privilege_drop() {
+  sb::Limits limits;
+  const auto r = sb::run("id", {}, limits, nullptr);
+  check(r.ran && r.exit_code == 0, "id 应执行成功");
+  std::printf("[privdrop] privilege=%s  id: %s", r.privilege_drop.c_str(), r.stdout_text.c_str());
+  check(!r.privilege_drop.empty(), "降权结果必须显式记录（不能静默）");
+  if (::geteuid() != 0) {
+    check(contains(r.privilege_drop, "not_root("), "非 root 时降权结果应为 not_root(uid=…)");
+    check(contains(r.stdout_text, "uid=" + std::to_string(::geteuid()) + "("),
+          "非 root 时子进程 uid 应当就是当前 uid（没有降权）");
+  } else {
+    check(contains(r.privilege_drop, "nobody("), "root 时降权结果应为 nobody(65534)");
+    check(contains(r.stdout_text, "uid=65534("), "root 启动时子进程 uid 必须是 nobody(65534)");
+    check(!contains(r.stdout_text, "uid=0("), "root 启动时子进程绝不能仍是 uid=0");
+  }
+}
+
+// FR-SANDBOX.8：docker 后端（本机镜像 alpine:latest，不 pull）。
+// 三条断言：命令跑得通 / --network=none 真的断网（按 IP，排除 DNS 干扰）/ 根只读。
+// 没有 docker（CI 容器里常见）时打印 SKIP，而不是假绿。
+void test_docker_backend() {
+  struct stat st {};
+  if (::stat("/usr/bin/docker", &st) != 0) {
+    std::printf("SKIP: 本机没有 /usr/bin/docker，docker 后端未验证\n");
+    return;
+  }
+  sb::Limits limits;
+  limits.backend = sb::Backend::Docker;
+  limits.docker_relax_whitelist = true;  // 只为验证容器侧隔离；模型可达的调用不走这条
+  limits.timeout_ms = 30000;
+
+  const auto r = sb::run("cat", {"/etc/hostname"}, limits, nullptr);
+  if (!r.ran) {
+    std::printf("SKIP: docker 后端跑不起来（%s）\n", r.error.c_str());
+    return;
+  }
+  check(r.exit_code == 0, "docker 后端应能执行 cat /etc/hostname");
+  check(!r.stdout_text.empty(), "docker 后端应拿到容器内的 /etc/hostname");
+  std::printf("[docker] cat /etc/hostname → exit=%d stdout=%s", r.exit_code,
+              r.stdout_text.c_str());
+  check(r.backend == "docker", "结果里必须标明实际后端是 docker");
+
+  // --network=none：用 IP 而不是域名，避免把"没有 DNS"误判成"没有网络"
+  const auto w = sb::run("wget", {"-q", "-O-", "http://1.1.1.1/"}, limits, nullptr);
+  check(w.ran, "wget 应进入容器执行");
+  check(w.exit_code != 0, "--network=none 下 wget 连外部地址必须失败");
+  std::printf("[docker] wget http://1.1.1.1/ → exit=%d stderr=%s", w.exit_code,
+              w.stderr_text.c_str());
+  check(contains(w.stderr_text, "unreachable") || contains(w.stderr_text, "Network"),
+        "失败原因应指向网络不可达（而不是参数/镜像问题）");
+
+  // --read-only：根文件系统不可写
+  const auto t = sb::run("touch", {"/tmp/cue-ac11-docker"}, limits, nullptr);
+  check(t.ran && t.exit_code != 0, "--read-only 下 touch 必须失败");
+  std::printf("[docker] touch /tmp/x → exit=%d stderr=%s", t.exit_code, t.stderr_text.c_str());
+  check(contains(t.stderr_text, "Read-only") || contains(t.stderr_text, "read-only"),
+        "失败原因应指向只读文件系统");
+
+  // 白名单仍然生效：不放宽时 docker 后端也不接受 wget
+  sb::Limits strict;
+  strict.backend = sb::Backend::Docker;
+  strict.timeout_ms = 30000;
+  const auto s2 = sb::run("wget", {"-q", "-O-", "http://1.1.1.1/"}, strict, nullptr);
+  check(!s2.ran && contains(s2.error, "白名单"),
+        "docker 后端默认不改白名单语义（越权命令仍被拒）");
+}
+
+
+// FR-SANDBOX.2 的端到端验收：**通过 run() 执行一条命令**去写 runs/<id>/，
+// 而不是只在测试里 fork+open。白名单里唯一能写文件的诊断命令是 `sort -o`：
+//   sort -o runs/sandbox/run_shell_write.txt /etc/hostname   → 必须成功
+//   sort -o src/sandbox/sandbox.cpp       /etc/hostname      → 必须 EACCES 且源码不变
+// 这比 `echo x > file` 更贴近实际：run_shell 不经 shell，重定向语法根本不存在。
+void test_write_via_command() {
+  sb::Limits limits;
+  const std::string ok_path = "runs/sandbox/run_shell_write.txt";
+  ::unlink(ok_path.c_str());
+  const auto ok = sb::run("sort", {"-o", ok_path, "/etc/hostname"}, limits, nullptr);
+  check(ok.ran && ok.exit_code == 0, "sort -o 写 runs/sandbox 应成功（可写路径放行）");
+  check(::access(ok_path.c_str(), F_OK) == 0, "run() 必须真的把文件写出来");
+  check(read_text(ok_path) == read_text("/etc/hostname"), "写入内容应与 /etc/hostname 一致");
+  ::unlink(ok_path.c_str());
+
+  const std::string src = "src/sandbox/sandbox.cpp";
+  const std::string before = read_text(src);
+  const auto bad = sb::run("sort", {"-o", src, "/etc/hostname"}, limits, nullptr);
+  check(bad.ran, "命令本身应被执行（拒绝来自 landlock，不是白名单）");
+  check(bad.exit_code != 0, "写项目源码必须失败");
+  check(contains(bad.stderr_text, "denied") || contains(bad.stderr_text, "Permission") ||
+            contains(bad.stderr_text, "权限"),
+        "失败原因应指向权限拒绝（landlock EACCES）");
+  check(read_text(src) == before, "源码文件绝不能被改写");
+
+  // 项目根本身不可写：这是「不允许把 /（项目根）设为可写」的运行期证据
+  const std::string repo_marker = "sandbox_should_not_write_here.txt";
+  ::unlink(repo_marker.c_str());
+  const auto bad2 = sb::run("sort", {"-o", repo_marker, "/etc/hostname"}, limits, nullptr);
+  check(bad2.exit_code != 0, "在项目根新建文件必须失败");
+  check(::access(repo_marker.c_str(), F_OK) != 0, "项目根不能被沙箱命令写入");
 }
 
 void test_timeout() {
@@ -289,10 +454,19 @@ int main() {
   test_whitelist();
   test_rejected_commands_never_run();
   test_allowed_command_runs();
-  test_landlock_write_denied();
+  test_landlock_write_paths();
+  test_dangerous_rw_path_refused();
+  test_missing_rw_path_reported();
+  test_privilege_drop();
+  test_docker_backend();
+  test_write_via_command();
   test_timeout();
   test_cancel();
   test_output_truncation();
+
+  // root 跑过之后 runs/sandbox 的属主已经被交给 nobody（沙箱用户），别把它留给
+  // 普通用户的后续运行。空目录才删得掉：本测试自己的产物都清过了。
+  if (::geteuid() == 0) ::rmdir("runs/sandbox");
 
   if (failures != 0) {
     std::printf("test_sandbox: %d 个断言失败\n", failures);

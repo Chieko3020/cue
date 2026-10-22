@@ -13,7 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "cue/eval/eval.h"
-#include "cue/pipeline/metrics.h"
+#include "cue/common/metrics.h"
 
 namespace eval = cue::eval;
 namespace pipeline = cue::pipeline;

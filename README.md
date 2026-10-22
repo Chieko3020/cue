@@ -77,7 +77,7 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 | 前端 | React 18 + Vite 6（控制台）；推流页原生 HTML + Canvas + WebCodecs |
 | 日志 | spdlog 1.12（系统包，异步 sink 8192 + 文件轮转）+ fmt 9.1；JSON 由 nlohmann 序列化 |
 | LLM 接入 | libcurl（OpenAI 兼容接口） |
-| 沙箱 | landlock + rlimit |
+| 沙箱 | landlock + rlimit + 降权（可选 docker 后端） |
 
 ## 快速开始
 
@@ -232,13 +232,16 @@ cassette 只覆盖 LLM 侧，不覆盖工具观测。所以：
 
 工具按风险分三级：`ReadOnly`（`query_metrics`、`fetch_observation`）、`Mutating`（`pipeline_set_param`）、`Dangerous`（`inject_fault`、`run_shell`）。审批模式 `Ask` 逐条等审批回调：控制台有审批队列，`cue run` 没接回调，非只读动作会被直接拒绝；`Auto` 自动批准但全量留痕，`Deny` 拒绝一切非只读动作。评测里 `Dangerous` 还受 case 的 `allowed_actions` 白名单约束。
 
-`run_shell` 是防御最深的一层：只允许 25 个只读诊断命令（`cat` / `ls` / `ps` / `ss` / `df` / `free` / `stat` / `grep` / `head` 等），按命令名精确匹配、不读 `PATH`、**不经 shell**（`execv` 直接启动，参数不拼接）；进入子进程后设 `RLIMIT_CPU=5s`、`RLIMIT_AS=256 MiB`、`RLIMIT_FSIZE=0`、`RLIMIT_NPROC=16`、`RLIMIT_NOFILE=64`，再用 landlock 只放行 `/usr`、`/lib`、`/lib64`（可读可执行）、`/etc`、`/proc`、`/sys`（只读）、工作目录（只读）与 `/dev/null`（可写）。每次调用——包括被白名单或审批拒绝的——都写一行审计 jsonl（`runs/audit.jsonl` 或 `runs/<run_id>/audit.jsonl`），带参数、退出码、耗时与截断标记。
+`run_shell` 是防御最深的一层：只允许 25 个只读诊断命令（`cat` / `ls` / `ps` / `ss` / `df` / `free` / `stat` / `grep` / `head` 等），按命令名精确匹配、不读 `PATH`、**不经 shell**（`execve` 直接启动，参数不拼接）；进入子进程后设 `RLIMIT_CPU=5s`、`RLIMIT_AS=256 MiB`、`RLIMIT_FSIZE=8 MiB`、`RLIMIT_NPROC=16`、`RLIMIT_NOFILE=64`，再用 landlock 放行 `/usr`、`/lib`、`/lib64`（可读可执行）、`/etc`、`/proc`、`/sys`（只读）、工作目录（只读）、`/dev/null`（可写），并且**只**给临时目录与本次 run 的目录（`runs/<run_id>/`）写权限。以 root 启动时，子进程在 `execve` 前 `setgid`/`setuid` 到 `nobody`（顺序是 rlimit → landlock → 降权：landlock 不需要特权，而降权之后就改不了规则集）；非 root 启动时结果与审计里显式记 `not_root(uid=…)`，不静默。要求可写 `/`、`/etc`、`~/.ssh`、项目根这类路径会被**直接拒绝执行**（不是静默忽略），建不出来的可写路径如实列进 `paths_not_applied`。每次调用——包括被白名单或审批拒绝的——都写一行审计 jsonl（`runs/audit.jsonl` 或 `runs/<run_id>/audit.jsonl`），带参数、退出码、耗时、实际后端、生效的可写路径、降权结果与截断标记。
+
+可选 `docker` 后端（`sandbox_backend = "docker"`，默认仍是 `landlock`）：命令跑在 `docker run --rm --network=none --read-only --cap-drop=ALL --memory=128m` 里，宿主侧白名单默认**仍然生效**（`docker_relax_whitelist` 只为验证容器侧隔离而存在，不是给模型用的开关）；当前用户不在 docker 组时走 `sudo -n`，需要密码时立即失败并回显 sudo 的错误，而不是把父进程挂在密码提示上。
 
 三条边界要说清楚：
 
 - landlock **不限制 `stat(2)`**：子进程能取到路径的元数据（存在性、大小、时间），只是读不到内容。
-- 工作目录是**只读放行**：为了让 `ls`、`du`、`stat` 这类命令可用，读被放宽；写仍然全禁（不在放行清单里）。
-- `RLIMIT_FSIZE=0` 只对普通文件生效：写管道、字符设备（如 `/dev/null`）不受它约束，拦截写入依赖的是 landlock 而不是这个 rlimit。
+- 默认后端防**误操作**，不防恶意代码：landlock 由被限制的进程自己在 `execve` 前施加，一个愿意自己再 exec 其它二进制的程序当然也能绕开白名单；要防恶意代码用 `docker` 后端。
+- `docker` 后端在容器内仍是 uid=0（`--read-only` + `--cap-drop=ALL` + `--network=none` 兜住可写面与网络，但没有 `--user`）；宿主上的 docker CLI 不套 `RLIMIT_AS`/`RLIMIT_NPROC`（Go 运行时需要大段虚拟地址空间，套了它自己会 panic），容器里的资源边界由 `--memory=128m` 与父进程超时负责。
+- `RLIMIT_FSIZE` 只对普通文件生效：写管道、字符设备（如 `/dev/null`）不受它约束，拦截写入依赖的是 landlock 而不是这个 rlimit。
 
 landlock 不可用时会降级（例如内核不支持），降级原因通过子进程状态通道回传给父进程并写进审计，不静默；白名单与「不经 shell」这两道与 landlock 是否可用无关。
 

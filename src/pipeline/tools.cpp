@@ -1,4 +1,4 @@
-#include "cue/pipeline/tools.h"
+#include "cue/tool/tools.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -207,7 +207,20 @@ bool append_audit(const std::string& path, const nlohmann::ordered_json& rec, st
   return true;
 }
 
-// run_shell 的完整语义：校验参数 → 白名单 → 沙箱执行 → 审计（含拒绝）→ 回灌文本。
+// 后端字符串 → 枚举。不认识的取值回退到 landlock（安全默认）并出声：
+// 安全选项"静默变成默认值"等于让调用方以为 docker 生效了。
+sandbox::Backend resolve_backend(const std::string& name) {
+  if (name == "landlock") return sandbox::Backend::Landlock;
+  if (name == "docker") return sandbox::Backend::Docker;
+  std::fprintf(stderr,
+               "[run_shell] sandbox_backend=\"%s\" 不认识（可选 landlock/docker），本次使用 "
+               "landlock\n",
+               name.c_str());
+  return sandbox::Backend::Landlock;
+}
+
+// run_shell 的完整语义：校验参数 → 白名单 → 沙箱执行（landlock/docker + 降权）→ 审计
+// （含拒绝）→ 回灌文本。
 tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
                                 const RealToolsOptions& opts) {
   const std::string cmd = a.at("cmd").get<std::string>();
@@ -249,6 +262,18 @@ tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
   } else {
     sandbox::Limits limits;
     limits.timeout_ms = timeout_ms;
+    limits.backend = resolve_backend(opts.sandbox_backend);
+    limits.docker_image = opts.docker_image;
+    // FR-SANDBOX.2：可写的只有临时目录与本 run 的目录（runs/<run_id>/）。
+    // 审计文件就落在那一层，因此从它推目录最不容易漂（换个 --out 也自动跟着走）。
+    std::vector<std::string> rw{"/tmp"};
+    std::string run_dir = "runs";
+    if (!opts.audit_log_path.empty()) {
+      const auto parent = std::filesystem::path(opts.audit_log_path).parent_path();
+      if (!parent.empty()) run_dir = parent.string();
+    }
+    rw.push_back(run_dir);
+    limits.rw_paths = std::move(rw);
     // cancel 一路透传：工具执行中也能被打断（AC-8）
     sr = sandbox::run(cmd, args, limits, opts.cancel);
     if (!sr.ran) {
@@ -287,6 +312,16 @@ tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
     rec["stderr_bytes"] = sr.stderr_bytes;
     rec["cancelled"] = sr.cancelled;
     rec["degraded"] = sr.degraded;
+    // FR-SANDBOX.6：沙箱的**决策**也要留痕，而不只是命令的结局。
+    // 这一条要能回答"它被允许写哪里""有没有降权""用的哪个后端"——
+    // 只记 exit/stderr 的话，一次因 landlock 而失败的写入看起来和"命令自己报错"一样。
+    nlohmann::ordered_json sb_rec;
+    sb_rec["backend"] = sr.backend.empty() ? std::string("none") : sr.backend;
+    sb_rec["rw_paths"] = sr.rw_paths_applied;
+    sb_rec["rw_not_applied"] = sr.paths_not_applied;
+    sb_rec["privilege"] = sr.privilege_drop;
+    sb_rec["landlock_degraded"] = sr.degraded;
+    rec["sandbox"] = std::move(sb_rec);
     if (!append_audit(opts.audit_log_path, rec, audit_err)) {
       // 审计写失败绝不能静默；但也不能因此丢掉工具结果（用户仍需要知道命令跑没跑）。
       std::fprintf(stderr, "[run_shell] 审计写入失败 path=%s err=%s\n",
@@ -313,6 +348,14 @@ tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
     if (sr.degraded) {
       text += "\n注意：landlock 不可用，本次仅 rlimit 生效（" + sr.degraded_reason +
               "）；白名单仍然生效";
+    }
+    if (!sr.privilege_drop.empty() && sr.privilege_drop.rfind("not_root", 0) == 0) {
+      text += "\n注意：以非 root 启动，无法降权（" + sr.privilege_drop +
+              "）；landlock 与 rlimit 仍然生效";
+    }
+    if (!sr.paths_not_applied.empty()) {
+      text += "\n注意：以下路径请求了但没生效（不可写）：";
+      for (const auto& p : sr.paths_not_applied) text += "\n  - " + p;
     }
     text += "\nstdout(" + std::to_string(sr.stdout_bytes) + " B" +
             (sr.stdout_truncated ? "，已截断" : "") + "):\n" + sr.stdout_text;

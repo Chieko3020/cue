@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "cue/pipeline/service_pipeline.h"
+#include "cue/common/service_pipeline.h"
 #include "cue/tool/tool.h"
 
 namespace cue::pipeline {
@@ -40,6 +40,13 @@ struct RealToolsOptions {
   // AC-8：工具执行中也要能被取消（run_shell 是唯一会长时间阻塞的工具，
   // 一次 30 秒的 shell 会顶穿「SIGTERM 后 5 秒退出」）。透传到 sandbox::run。
   const std::atomic<bool>* cancel = nullptr;
+  // FR-SANDBOX.8：run_shell 使用的沙箱后端（"landlock" 默认 / "docker"）。
+  // 这里用字符串而不是 sandbox::Backend：本头文件属于工具层，而枚举逼每个调用方
+  // include 沙箱头文件（工具层对沙箱实现保持零依赖）。非法值不会被静默当成默认值——
+  // 会打一行 stderr，并由审计里的实际后端字段兜底。
+  std::string sandbox_backend = "landlock";
+  // docker 后端镜像（本机已有：alpine:latest）。
+  std::string docker_image = "alpine:latest";
 };
 
 // 注册 8 个真实工具（FR-TOOL.1 的完整清单）：

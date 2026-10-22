@@ -1,6 +1,6 @@
 // 管线后端工厂：把「端点描述」落成具体实现。
 // 这里是唯一允许 new 具体后端的地方——工具层/评测层只拿 IServicePipeline。
-#include "cue/pipeline/service_pipeline.h"
+#include "cue/common/service_pipeline.h"
 
 #include <memory>
 #include <string>

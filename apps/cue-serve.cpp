@@ -59,7 +59,7 @@
 #include "cue/common/clock.h"
 #include "cue/common/log.h"
 #include "cue/pipeline/process_control.h"
-#include "cue/pipeline/tools.h"
+#include "cue/tool/tools.h"
 #include "cue/tool/tool.h"
 
 namespace beast = boost::beast;

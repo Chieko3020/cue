@@ -28,13 +28,13 @@
 #include <nlohmann/json.hpp>
 
 #include "cue/pipeline/control_channel.h"
-#include "cue/pipeline/metrics.h"
-#include "cue/pipeline/service_pipeline.h"
+#include "cue/common/metrics.h"
+#include "cue/common/service_pipeline.h"
 
 namespace cue::pipeline {
 
 // 观测数据模型（PipelineEvent / PipelineMetrics / kNoSample / has_sample）已搬到
-// cue/pipeline/metrics.h：所有管线后端共用一份口径，本头文件继续把它们带进来，
+// cue/common/metrics.h：所有管线后端共用一份口径，本头文件继续把它们带进来，
 // 所以原先只 include process_control.h 的代码不需要改动。
 
 class ProcessPipelineControl : public IServicePipeline {

@@ -45,7 +45,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "cue/pipeline/metrics.h"
+#include "cue/common/metrics.h"
 
 namespace beast = boost::beast;
 namespace http = beast::http;

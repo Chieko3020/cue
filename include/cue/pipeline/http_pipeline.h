@@ -26,7 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "cue/pipeline/service_pipeline.h"
+#include "cue/common/service_pipeline.h"
 
 namespace cue::pipeline {
 

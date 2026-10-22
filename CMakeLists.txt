@@ -117,17 +117,48 @@ if(NOT SPDLOG_FOUND)
   message(FATAL_ERROR "缺少 spdlog 开发包，执行：\n  sudo apt install -y libspdlog-dev libfmt-dev")
 endif()
 
+# ---- 分层 include 视图（SPEC §7.3 / FR-PIPE.15）----
+# 物理隔离的难点：头文件全在 include/cue/<层>/ 下，而 `-I` 只能按**目录**粒度限制。
+# 做法是在构建目录里生成"分层视图"：include-layers/<层>/cue/<子目录> 是指回真实头文件
+# 目录的符号链接，target 只拿到自己这层的视图。于是 `#include "cue/pipeline/..."`
+# 在 agent/tool/eval 的编译单元里根本不存在（编译期 No such file），而不是靠约定 +
+# 配置期扫描。视图在构建目录里生成，不进 git、不改仓库布局。
+function(cue_layer_include_root out_var layer)
+  set(_root ${CMAKE_BINARY_DIR}/include-layers/${layer})
+  file(MAKE_DIRECTORY ${_root}/cue)
+  foreach(_dir IN LISTS ARGN)
+    set(_link ${_root}/cue/${_dir})
+    if(EXISTS ${_link} OR IS_SYMLINK ${_link})
+      file(REMOVE ${_link})
+    endif()
+    file(CREATE_LINK ${CMAKE_CURRENT_SOURCE_DIR}/include/cue/${_dir} ${_link} SYMBOLIC)
+  endforeach()
+  set(${out_var} ${_root} PARENT_SCOPE)
+endfunction()
+
+# 「能看见全部头文件」的接口目标：可执行文件、测试、以及确实需要 media/ 的库显式链接它。
+# 只有这些目标允许看见 media/ 与 pipeline/——上层（agent/tool/eval）不能链接它。
+add_library(cue_headers_all INTERFACE)
+target_include_directories(cue_headers_all INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# 上层视图：agent / tool / eval / llm / cli 只允许 common 与彼此（+ 经 cue_proto 拿到的
+# proto）。不含 media、pipeline。
+cue_layer_include_root(CUE_UPPER_INCLUDE upper
+  common tool agent llm eval cli)
+# proto 是纯头文件层，只需要自己的目录；common 是跨层共享类型，一并给出。
+cue_layer_include_root(CUE_PROTO_INCLUDE proto common)
+
 # ---- proto：纯头文件，编解码规则集中在一处 ----
 add_library(cue_proto INTERFACE)
-target_include_directories(cue_proto INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(cue_proto INTERFACE ${CUE_PROTO_INCLUDE})
 
 # ---- media 侧可执行：WS 接收 → 重组 → UDP 发送 ----
 # media/jitter_buffer：cued 与 probe 共用同一份实现（两侧的「buffer」段口径必须一致，
 # 否则两张图上的抖动缓冲延迟没法互相对照）。
 add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp
   src/media/jitter_buffer.cpp)
-target_link_libraries(cued PRIVATE cue_proto cue_control Boost::system Threads::Threads
-  PkgConfig::FFMPEG)
+target_link_libraries(cued PRIVATE cue_proto cue_control cue_headers_all Boost::system
+  Threads::Threads PkgConfig::FFMPEG)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 
 # ---- cue-probe：下行接收端（UDP 重组 + H.264 软解 + 帧统计/端到端指标）----
@@ -135,7 +166,8 @@ target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 # cued 与 probe 两侧的行为必须一致，否则两边的"解码耗时"没法对照。
 add_executable(cue-probe apps/cue-probe.cpp src/media/h264_decoder.cpp
   src/media/jitter_buffer.cpp)
-target_link_libraries(cue-probe PRIVATE cue_proto Threads::Threads PkgConfig::FFMPEG)
+target_link_libraries(cue-probe PRIVATE cue_proto cue_headers_all Threads::Threads
+  PkgConfig::FFMPEG)
 target_compile_options(cue-probe PRIVATE -Wno-deprecated-declarations)
 
 # ---- 采集端（T-11 / FR-CAP.1–6）----
@@ -146,12 +178,14 @@ add_library(cue_capture STATIC
   src/media/audio_resampler.cpp
   src/media/opus_encoder.cpp)
 target_link_libraries(cue_capture PUBLIC cue_proto PkgConfig::FFMPEG PkgConfig::OPUS)
+target_link_libraries(cue_capture PRIVATE cue_headers_all)
 
 # cue-capture：三后端（lavfi / ffmpeg 子进程 / v4l2）+ 上行 WS 客户端。
 # 复用 media/encoder（X264Encoder）而不是再写一份 x264 封装——cued 的转码链与采集端
 # 对同一组 x264 参数必须得到同一个码流形状，两处各写一份迟早漂移。
 add_executable(cue-capture apps/cue-capture.cpp src/media/encoder.cpp)
-target_link_libraries(cue-capture PRIVATE cue_capture Boost::system Threads::Threads)
+target_link_libraries(cue-capture PRIVATE cue_capture cue_headers_all Boost::system
+  Threads::Threads)
 target_compile_options(cue-capture PRIVATE -Wno-deprecated-declarations)
 
 # ---- 静态资源目录（供本地 http server 使用）----
@@ -162,6 +196,7 @@ add_custom_target(web ALL SOURCES web/index.html web/app.js)
 # 不必为了测「写被拒」而把假管线搬进来。
 add_library(cue_sandbox STATIC src/sandbox/sandbox.cpp)
 target_link_libraries(cue_sandbox PUBLIC cue_proto Threads::Threads)
+target_link_libraries(cue_sandbox PRIVATE cue_headers_all)
 
 # ---- 控制通道（cued ⇄ cue 的 UDS 控制面，技术设计 §4.3）----
 # 独立成库：传输层（seqpacket/stream 分帧、64 KiB 上限、id 回填）与控制语义
@@ -172,6 +207,7 @@ add_library(cue_control STATIC
   src/pipeline/control_plane.cpp)
 target_link_libraries(cue_control PUBLIC
   cue_proto nlohmann_json::nlohmann_json Threads::Threads)
+target_link_libraries(cue_control PRIVATE cue_headers_all)
 
 # ---- 结构化日志（FR-OBS.1 / 技术设计 §12.1）----
 # 独立成库：spdlog 的头只出现在 src/common/log.cpp 一处，别处只 include cue/common/log.h。
@@ -179,11 +215,13 @@ target_link_libraries(cue_control PUBLIC
 add_library(cue_log STATIC src/common/log.cpp)
 target_link_libraries(cue_log PUBLIC
   cue_proto nlohmann_json::nlohmann_json PkgConfig::SPDLOG Threads::Threads)
+target_link_libraries(cue_log PRIVATE cue_headers_all)
 
 # ---- 配置文件（FR-OBS.5）----
 # 只有配置解析与校验：JSON 用 nlohmann（已是硬依赖），行号换算与合法范围都在这里。
 add_library(cue_config STATIC src/common/config.cpp)
 target_link_libraries(cue_config PUBLIC cue_log nlohmann_json::nlohmann_json)
+target_link_libraries(cue_config PRIVATE cue_headers_all)
 
 # ---- 分层静态库（SPEC §7.3）----
 # pipeline 只向下依赖 proto；agent 不认识 media/pipeline；eval 依赖两者。
@@ -198,7 +236,10 @@ target_link_libraries(cue_pipeline PUBLIC
   cue_proto cue_control nlohmann_json::nlohmann_json PkgConfig::CURL Threads::Threads)
 # run_shell 的实现依赖沙箱层；头文件不暴露 sandbox，故 PRIVATE
 target_link_libraries(cue_pipeline PRIVATE cue_sandbox)
+target_link_libraries(cue_pipeline PRIVATE cue_headers_all)
 
+# 上层（agent/tool/llm）：include 视图只有 upper 子目录，看不见 media/ 与 pipeline/。
+# 这不是注释约定——越界 include 在这里就是编译错误（见 ctest 的 layer_isolation）。
 add_library(cue_agent STATIC
   src/llm/client.cpp
   src/llm/cassette.cpp
@@ -207,54 +248,45 @@ add_library(cue_agent STATIC
   src/common/sha256.cpp)
 target_link_libraries(cue_agent PUBLIC
   cue_proto nlohmann_json::nlohmann_json PkgConfig::CURL Threads::Threads)
+target_include_directories(cue_agent PUBLIC ${CUE_UPPER_INCLUDE})
 
-# 已知分层债：include/cue/eval/eval.h 直接 include pipeline/process_control.h，
-# 修它需要 C++ 侧引入 IPipelineControl 接口，故 eval 只能同时依赖两层。
+# 评测层同样只拿 upper 视图：它经由 IServicePipeline / make_pipeline 使用管线，
+# 不再 include pipeline/process_control.h（那是 T-20 修掉的唯一一处越界）。
+# 链接 cue_pipeline 是**实现**依赖（工厂与工具层的 .cpp 在那里），不是头文件依赖。
 add_library(cue_eval STATIC
   src/eval/eval.cpp
   src/eval/generator.cpp
   src/eval/state.cpp
   src/eval/compare.cpp)
 target_link_libraries(cue_eval PUBLIC cue_agent cue_pipeline PkgConfig::CURL)
+target_include_directories(cue_eval PUBLIC ${CUE_UPPER_INCLUDE})
 
 # ---- CLI 选项（FR-OBS.5 的优先级规则在这里落地）----
 # 拆两个库是为了不让 cue-serve 被拖上 cue_eval：评测的选项结构体里有 RunConfig。
 add_library(cue_cli_serve STATIC src/cli/serve_options.cpp)
 target_link_libraries(cue_cli_serve PUBLIC cue_config)
+target_include_directories(cue_cli_serve PUBLIC ${CUE_UPPER_INCLUDE})
 
 add_library(cue_cli_eval STATIC src/cli/eval_options.cpp)
 target_link_libraries(cue_cli_eval PUBLIC cue_config cue_eval)
+target_include_directories(cue_cli_eval PUBLIC ${CUE_UPPER_INCLUDE})
 
-# SPEC §7.3：agent/tool/llm 不得 include media/ 或 pipeline 头文件。
-# include/ 目前共用一个根目录，无法靠 target_include_directories 物理隔离，
-# 所以在配置期扫描（eval 的分层债见上，暂不纳入）。
-set(CUE_UPPER_LAYER_FILES)
-file(GLOB_RECURSE CUE_UPPER_LAYER_FILES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/cue/agent/*.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/cue/tool/*.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/cue/llm/*.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/agent/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/tool/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/llm/*.cpp)
-foreach(_f IN LISTS CUE_UPPER_LAYER_FILES)
-  file(STRINGS "${_f}" _violation REGEX "#[ \t]*include[ \t]*[<\"]cue/(media|pipeline)/")
-  if(_violation)
-    message(FATAL_ERROR "分层违规：${_f} include 了 media/pipeline 头文件（SPEC §7.3）")
-  endif()
-endforeach()
+# SPEC §7.3 的越界检查不再靠"配置期扫源码文本"（那是约定），而是靠上面的
+# include 视图：agent/tool/eval 的编译单元里根本没有 cue/media 与 cue/pipeline。
+# 可执行判据是 ctest 的 layer_isolation（见文件末尾）。
 
 # ---- CLI ----
 add_executable(cue apps/cue.cpp)
-target_link_libraries(cue PRIVATE cue_agent cue_pipeline)
+target_link_libraries(cue PRIVATE cue_agent cue_pipeline cue_headers_all)
 
 add_executable(cue-eval apps/cue-eval.cpp)
-target_link_libraries(cue-eval PRIVATE cue_eval cue_cli_eval)
+target_link_libraries(cue-eval PRIVATE cue_eval cue_cli_eval cue_headers_all)
 
 # ---- M5 控制台后端 ----
 # 独立 target（而非 cue 的子命令）：serve 是长期驻留进程，信号/退出码语义与一次性 CLI 不同；
 # 它复用 cue_pipeline（事件源）与 cue_agent（Registry/工具/审批），不另起一套管线控制。
 add_executable(cue-serve apps/cue-serve.cpp)
-target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline cue_cli_serve
+target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline cue_cli_serve cue_headers_all
   Boost::system Threads::Threads)
 
 # ---- M7 假域服务（AC-16）----
@@ -330,6 +362,9 @@ set_tests_properties(probe PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_D
 add_executable(test_sandbox tests/test_sandbox.cpp)
 target_link_libraries(test_sandbox PRIVATE cue_sandbox)
 add_test(NAME sandbox COMMAND test_sandbox)
+# 沙箱用例用相对路径代表"项目根"（src/main.cpp 只读、runs/sandbox 可写），
+# 因此必须在仓库根下跑；ctest 的默认工作目录是构建目录，那里没有 src/main.cpp。
+set_tests_properties(sandbox PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # media/jitter_buffer（技术设计文档 §13.1）：乱序重排 / 缺帧等待预算 / 超时跳帧 / 深度自适应
 # + 关键帧保护。纯组件（无线程、不读时钟），所以直接链实现文件，不需要额外静态库。
@@ -385,6 +420,28 @@ target_link_libraries(test_metrics PRIVATE cue_pipeline cue_log
   nlohmann_json::nlohmann_json Threads::Threads)
 add_test(NAME metrics COMMAND test_metrics)
 set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ---- 测试的 include 视图 ----
+# 测试不属于任何一层：它们要能同时看见所有头文件（包括故意写错的越界组合，
+# 那是测试的职责）。统一在这里补全，避免 20 多个 target 各写一遍。
+set(CUE_TEST_TARGETS
+  test_wire test_agent test_context test_eval test_generator test_state test_compare
+  test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
+  test_control_channel test_tools test_delay_injector test_nack test_capture
+  test_config test_metrics)
+foreach(_t IN LISTS CUE_TEST_TARGETS)
+  target_link_libraries(${_t} PRIVATE cue_headers_all)
+endforeach()
+
+# 分层隔离的可执行判据（FR-PIPE.15 / SPEC §7.3）：用 cue_agent/cue_eval 实际拿到的
+# include 视图（只有 upper 子目录）编译两段 TU——正例必须过、越界 include 必须失败。
+# 这条测试的意义是"隔离真的存在"，而不是"配置里写了几个 -I"。
+add_test(NAME layer_isolation
+  COMMAND ${CMAKE_COMMAND}
+    -DCOMPILER=${CMAKE_CXX_COMPILER}
+    -DUPPER_ROOT=${CUE_UPPER_INCLUDE}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check-layer-isolation.cmake)
 
 # ---- Python 驱动的两个测试（T-17a / T-18a）----
 # python3 是仓库脚本的既有依赖（test-real-faults.sh、test-control-channel.py 都要它），

@@ -5,8 +5,12 @@
 //  - SLA 由 harness 重新测量，不信 agent 自报
 //
 // 分层（SPEC §7.3）：eval/ 不得 include media/、pipeline/。
-// 本头文件只认识指标 POD（Metrics）与管线档位 POD（PipelineConfig），
-// 与 pipeline 的转换全部封在 src/eval/eval.cpp 里。
+// 这条约束自 T-20 起是**物理的**：cue_eval 的 include 路径里只有
+// include/cue/{common,tool,agent,llm,eval,cli}（构建时生成的分层视图），
+// `#include "cue/pipeline/..."` 直接编译失败。
+// 本头文件只认识指标 POD（Metrics）与管线档位 POD（PipelineConfig）；
+// 与管线类型（PipelineEndpoint / IServicePipeline）的转换封在 src/eval/eval.cpp 里，
+// 具体后端由 pipeline 层的 make_pipeline 创建。
 #pragma once
 
 #include <atomic>

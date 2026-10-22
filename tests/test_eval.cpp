@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #include "cue/eval/eval.h"
-#include "cue/pipeline/recorded_pipeline.h"
+#include "cue/common/recorded_pipeline.h"
 
 namespace eval = cue::eval;
 namespace agent = cue::agent;

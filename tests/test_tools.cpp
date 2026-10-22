@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "cue/pipeline/tools.h"
+#include "cue/tool/tools.h"
 #include "cue/tool/tool.h"
 
 using json = nlohmann::json;

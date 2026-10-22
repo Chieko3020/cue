@@ -24,10 +24,9 @@
 #include "cue/eval/state.h"
 #include "cue/llm/cassette.h"
 #include "cue/llm/client.h"
-#include "cue/pipeline/process_control.h"
-#include "cue/pipeline/recorded_pipeline.h"
-#include "cue/pipeline/service_pipeline.h"
-#include "cue/pipeline/tools.h"
+#include "cue/common/recorded_pipeline.h"
+#include "cue/common/service_pipeline.h"
+#include "cue/tool/tools.h"
 
 namespace cue::eval {
 
@@ -885,8 +884,13 @@ namespace {
 
 // ---- pipeline → eval 的适配层（eval.h 不认识 pipeline，转换只在这里做）
 
-pipeline::ProcessPipelineControl::Config to_pipeline_config(const PipelineConfig& pc) {
-  pipeline::ProcessPipelineControl::Config out;
+// case 的管线档位 → 端点描述。评测层只认识 common 层的 PipelineEndpoint 与
+// IServicePipeline：具体后端由 pipeline 层的 make_pipeline 创建（IMPL 在
+// src/pipeline/service_pipeline.cpp）。这样 eval 不再 include pipeline/ 下任何头文件，
+// CMake 侧才可能把 include/cue/pipeline 从 cue_eval 的 include 路径里物理拿掉。
+pipeline::PipelineEndpoint to_endpoint(const PipelineConfig& pc) {
+  pipeline::PipelineEndpoint out;
+  out.kind = pipeline::PipelineEndpoint::Kind::Process;
   out.cued_bin = pc.cued_bin;
   out.probe_bin = pc.probe_bin;
   out.inject_drop = pc.inject_drop;
@@ -1271,7 +1275,11 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     }
   } else {
     // Process 分支：真实 cued 子进程（外部推流由验收脚本提供）
-    pipe = std::make_unique<pipeline::ProcessPipelineControl>(to_pipeline_config(pcfg));
+    pipe = pipeline::make_pipeline(to_endpoint(pcfg), err);
+    if (!pipe) {
+      o.error_kind = "pipeline_create_failed: " + err;
+      return o;
+    }
     std::fprintf(stderr,
                  "[eval][%s] 启动 cued（inject_drop=%.1f%% ingress=%.1f%% send_mbps=%.2f "
                  "queue_fps=%.1f bitrate=%d gop=%d preset=%s transcode=%d）\n",
@@ -1673,8 +1681,13 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     std::fprintf(stderr, "[eval][%s] 连接管线端点 %s（inject_drop=%.1f%%）\n", c.id.c_str(),
                  cfg_.endpoint.c_str(), pcfg.inject_drop);
   } else {
-    // Process 分支：唯一允许出现具体后端类型的地方（cued 的启动参数只有它认识）
-    pipe = std::make_unique<pipeline::ProcessPipelineControl>(to_pipeline_config(pcfg));
+    // Process 分支：cued 的启动参数原样进 PipelineEndpoint，由 pipeline 层的工厂
+    // 造出 ProcessPipelineControl（eval 不认识这个具体类型）。
+    pipe = pipeline::make_pipeline(to_endpoint(pcfg), err);
+    if (!pipe) {
+      o.error_kind = "pipeline_create_failed: " + err;
+      return;
+    }
     std::fprintf(stderr,
                  "[eval][%s] 启动 cued（inject_drop=%.1f%% ingress=%.1f%% send_mbps=%.2f "
                  "queue_fps=%.1f bitrate=%d gop=%d preset=%s transcode=%d）\n",

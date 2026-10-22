@@ -1,4 +1,4 @@
-#include "cue/pipeline/recorded_pipeline.h"
+#include "cue/common/recorded_pipeline.h"
 
 #include <algorithm>
 #include <cctype>

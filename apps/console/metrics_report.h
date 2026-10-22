@@ -32,7 +32,7 @@
 #include <nlohmann/json.hpp>
 
 #include "cue/common/clock.h"
-#include "cue/pipeline/metrics.h"
+#include "cue/common/metrics.h"
 
 namespace cue::console {
 

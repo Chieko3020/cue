@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "cue/pipeline/metrics.h"
+#include "cue/common/metrics.h"
 
 namespace cue::pipeline {
 
