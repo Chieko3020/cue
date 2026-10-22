@@ -1,7 +1,8 @@
-// 设备页：采集端能力 + 推流源/管线入口状态 + 启停。
-// "设备" 在本项目里有两层：服务器端 cued 管线（pid/端口/存活）与浏览器采集端
-// （WebCodecs 能力、摄像头数）。两者都只读本地/同源信息，不连任何外部服务。
-import { useEffect, useState } from 'react';
+// 设备页：接入的设备（cued 会话表）+ 采集端能力 + 推流源/管线入口状态 + 启停。
+// "设备" 在本项目里有两层：服务器端 cued 的**接入设备**（会话表：device_id/peer/租约）
+// 与**本浏览器**的采集能力（WebCodecs、摄像头数）。两张卡分开写是刻意的：
+// 把两者混在一起时，"本浏览器支持 H.264" 会被读成"下面那台设备支持 H.264"。
+import { useEffect, useRef, useState } from 'react';
 import { Card, Metric, ActionResult } from '../components/ui.jsx';
 import { num } from '../api.js';
 
@@ -46,6 +47,47 @@ function yesNo(v) {
   return v ? '支持' : '不支持';
 }
 
+// 能力单元格：没有能力上报时明确写"未上报"，不要留空白——
+// 空白会被读成"这台设备不支持"，而真相是"它没说"。
+function capsText(caps) {
+  if (!caps || !caps.declared) return '未上报';
+  const parts = [];
+  const max = caps.max || {};
+  const nat = caps.native || {};
+  if (max.width > 0 && max.height > 0) {
+    parts.push(`≤${max.width}×${max.height}${max.fps > 0 ? `@${max.fps}` : ''}`);
+  } else if (nat.width > 0 && nat.height > 0) {
+    parts.push(`原生 ${nat.width}×${nat.height}`);
+  }
+  if (caps.codec) parts.push(caps.codec);
+  if (caps.capture_path) parts.push(caps.capture_path);
+  // 不拼 caps.name：浏览器上报的名字缺省是 UA 全文，塞进单元格会把这一列撑成两行
+  // 而没有多一个信息量（设备身份看 device_id/peer 更直接）。
+  if (parts.length === 0) return '已上报（无可用字段）';
+  return parts.join(' · ');
+}
+
+// 租约倒计时：服务端给的是 expires_in_ms（"查询那一刻还剩多少毫秒"），不是绝对到期时刻，
+// 所以这里以"收到这份快照的本地时刻"为起点递减：跨机时钟偏移不影响结果（只用相对量 +
+// 本地流逝），误差只有轮询间隔/网络滞后（/api/state 每 1.5 s 一次，见 App.jsx）。
+function useLeaseBase(state) {
+  const base = useRef(Date.now());
+  const [, tick] = useState(0);
+  useEffect(() => {
+    base.current = Date.now();
+  }, [state]);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return base.current;
+}
+
+function leaseLeftMs(row, baseAt) {
+  if (!row || !Number.isFinite(row.expires_in_ms)) return null;
+  return row.expires_in_ms - (Date.now() - baseAt);
+}
+
 export default function Device({ state, runAction, busy, lastAction }) {
   const [caps, setCaps] = useState(null);
   useEffect(() => {
@@ -64,9 +106,108 @@ export default function Device({ state, runAction, busy, lastAction }) {
   const running = !!p.running;
   const active = (m.frames_in || 0) > 0;
 
+  // 设备表：/api/state 的 devices（cued 会话表原样透传）+ devices_summary（汇总）。
+  // devices_error 非空 = 取不到（后端没有会话表 / 控制通道降级），与"没有设备"分开呈现。
+  const devices = Array.isArray(state?.devices) ? state.devices : [];
+  const dsum = state?.devices_summary || {};
+  const devicesError = state?.devices_error || '';
+  const liveDevices = devices.filter((d) => d.state === 'live');
+  const closedDevices = devices.filter((d) => d.state !== 'live');
+  const leaseBase = useLeaseBase(state);
+  // 状态列只描述"当前接入"：已关闭的会话是历史，混进在线表会让"杀掉一路之后还是 2 行"
+  // 被读成"设备还连着"。它们仍在下面单独一行里列出（cued 的 session.list 带
+  // include_closed，用来排查"刚断开的是谁、为什么"）。
+  const leaseHint =
+    dsum.lease_ms > 0 ? `租约 ${(dsum.lease_ms / 1000).toFixed(0)}s` : '租约未知';
+
   return (
     <>
+      <Card
+        title="接入的设备"
+        sub={`cued 会话表 · 在线 ${liveDevices.length}${
+          dsum.max_sessions > 0 ? `/${dsum.max_sessions}` : ''
+        } · ${leaseHint}`}
+        testid="device-list-card"
+      >
+        {devicesError ? (
+          <div className="empty" data-testid="devices-error">
+            取不到设备表：{devicesError}
+          </div>
+        ) : null}
+        {!devicesError && liveDevices.length === 0 ? (
+          <div className="empty" data-testid="devices-empty">
+            还没有设备接入。用 <code>cue-capture --backend lavfi</code>（合成源，无需摄像头）或浏览器推流页
+            <code> web/index.html</code> 接入 cued。
+          </div>
+        ) : null}
+        {liveDevices.length > 0 ? (
+          <table>
+            <thead>
+              <tr>
+                <th>device_id</th>
+                <th>peer</th>
+                <th>状态</th>
+                <th>能力</th>
+                <th>租约剩余</th>
+              </tr>
+            </thead>
+            <tbody>
+              {liveDevices.map((d) => {
+                const left = leaseLeftMs(d, leaseBase);
+                // 租约耗尽但会话还在表里 = 已过期（cued 的回收线程每 100 ms 扫一次，
+                // 所以这个状态通常只可见 0～100 ms；真正到期后设备会移到下面的「最近断开」）。
+                const expired = left !== null && left <= 0;
+                return (
+                  <tr
+                    key={d.session_id}
+                    data-testid="device-row"
+                    data-device-id={d.device_id}
+                    data-state={d.state}
+                  >
+                    <td>{d.device_id ?? '—'}</td>
+                    <td className="muted">{d.peer ?? '—'}</td>
+                    <td>
+                      <span
+                        className={'badge ' + (expired ? 'bad' : 'ok')}
+                        data-testid="device-state"
+                      >
+                        {expired ? '已过期' : 'live'}
+                      </span>
+                    </td>
+                    <td className="small">{capsText(d.caps)}</td>
+                    <td
+                      className="num"
+                      data-testid="device-lease"
+                      title={`lease_ms=${d.lease_ms ?? '?'} expires_in_ms=${d.expires_in_ms ?? '?'}`}
+                    >
+                      {left === null ? '—' : left <= 0 ? '已过期' : `${(left / 1000).toFixed(1)}s`}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        ) : null}
+        {closedDevices.length > 0 ? (
+          <p className="small muted" data-testid="devices-closed-note" style={{ marginBottom: 0 }}>
+            最近断开 {closedDevices.length} 台：
+            {closedDevices
+              .map(
+                (d) =>
+                  `${d.device_id ?? '—'}（${
+                    d.state === 'closing' ? '断开中' : d.reason || '已关闭'
+                  }）`,
+              )
+              .join('、')}
+          </p>
+        ) : null}
+      </Card>
+
       <Card title="采集端（本浏览器）" sub="本地能力探测，不上传任何内容">
+        <p className="small muted" data-testid="caps-scope-note" style={{ marginTop: 0 }}>
+          这一卡探测的是<strong>打开这个页面的浏览器</strong>（WebCodecs / 摄像头），
+          与上面「接入的设备」是两回事：上面那些设备是 cued 的 WS 上行连接，各自有自己的能力上报。
+        </p>
         {caps ? (
           <table>
             <tbody>

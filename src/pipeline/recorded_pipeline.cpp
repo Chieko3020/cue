@@ -339,6 +339,12 @@ std::string RecordingPipeline::observation(const std::string& source, int tail,
   return text;
 }
 
+nlohmann::json RecordingPipeline::sessions_json(std::string& err) const {
+  // 不转问 inner_：转了就等于"录制时能看到设备、回放时看不到"，同一份录制在两次
+  // 运行里给出不同的设备表（回放的可复现性正是这个装饰器存在的理由）。
+  return no_session_table("recording", err);
+}
+
 // ---------------------------------------------------------------- ReplayPipeline
 
 ReplayPipeline::ReplayPipeline(std::string path) : path_(std::move(path)) {
@@ -720,6 +726,12 @@ std::string ReplayPipeline::observation(const std::string& source, int tail,
     return {};
   }
   return r.ret["text"].get<std::string>();
+}
+
+nlohmann::json ReplayPipeline::sessions_json(std::string& err) const {
+  // 会话表不是录制里的一种 op，所以这里没有「消费一条录制」的路径可走：
+  // 直接说明没有，而不是伪造一张"回放开始时的设备表"。
+  return no_session_table("replay", err);
 }
 
 }  // namespace cue::pipeline

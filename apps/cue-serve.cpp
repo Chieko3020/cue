@@ -11,7 +11,7 @@
 // 路由：
 //   GET  /               静态文件（默认 web/dist，回退 web/）
 //   GET  /events         SSE；支持 Last-Event-ID 补齐（SPEC §6 M5）
-//   GET  /api/state      全量快照：管线配置 + 指标 + 最近事件 + 待审批 + 工具表
+//   GET  /api/state      全量快照：管线配置 + 指标 + 设备会话表 + 最近事件 + 待审批 + 工具表
 //   GET  /api/runs       评测产物（runs/<id>/report.md）索引
 //   POST /api/action     控制动作：必须走 Registry::call_guarded（risk + 审批），不直接碰管线
 //   POST /api/approve    {id, allow} 决定一条待审批
@@ -171,6 +171,21 @@ class ConsoleApp {
                          {"height", cfg.height},
                          {"send_mbps", cfg.send_mbps}}}};
     out["metrics"] = pipeline::metrics_json(pipe_->latest(), cue::now_us());
+    // 设备表（FR-UI.1）：数据源是 cued 的 SessionRegistry（经控制通道 session.list），
+    // 这里只透传 sessions 数组 + 一份汇总。取不到时 devices 是空数组**并且**带
+    // devices_error——前端必须能区分「一台设备都没接入」与「设备表取不到」，
+    // 否则控制通道一降级，设备页会显示成"设备全掉线了"。
+    {
+      std::string dev_err;
+      const json dev = pipe_->sessions_json(dev_err);
+      out["devices"] = dev.value("sessions", json::array());
+      out["devices_summary"] = json{{"count", dev.value("count", 0)},
+                                    {"live", dev.value("live", 0)},
+                                    {"max_sessions", dev.value("max_sessions", 0)},
+                                    {"lease_ms", dev.value("lease_ms", 0)},
+                                    {"control_channel", dev.value("control_channel", "")}};
+      if (!dev_err.empty()) out["devices_error"] = dev_err;
+    }
     out["approvals"] = {{"mode", opt_.approval},
                         {"timeout_s", opt_.approval_timeout_s},
                         {"pending", pending_json()},

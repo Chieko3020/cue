@@ -285,6 +285,11 @@ void HttpServicePipeline::set_event_callback(std::function<void(const PipelineEv
   on_event_ = std::move(cb);
 }
 
+nlohmann::json HttpServicePipeline::sessions_json(std::string& err) const {
+  // 与 probe_latest() 同理：不是"忘了实现"，是这条后端上真的没有这张表。
+  return no_session_table("http", err);
+}
+
 std::vector<PipelineEvent> HttpServicePipeline::recent_events(std::size_t n) const {
   std::lock_guard<std::mutex> lk(mu_);
   const std::size_t want = (n == 0 || n >= events_.size()) ? events_.size() : n;

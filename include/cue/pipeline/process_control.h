@@ -82,6 +82,12 @@ class ProcessPipelineControl : public IServicePipeline {
   // 并在文本第一行写明"这一份走的是 stdout"，不让旧数据冒充实时快照。
   std::string observation(const std::string& source, int tail, std::string& err) const override;
 
+  // 设备会话表（FR-UI.1）：走**同一条** UDS 控制通道的 session.list（不另开 socket）。
+  // cued 的 SessionRegistry 是设备/能力/租约的唯一真相源，这里只透传（不缓存、不派生）：
+  // 缓存会在「设备刚断开」与「控制台还显示在线」之间造出一个看不见的窗口。
+  // 控制通道不可用 = 取不到：返回空表 + err，调用方据此写 devices_error。
+  nlohmann::json sessions_json(std::string& err) const override;
+
   // 不在 IServicePipeline 里：这是「子进程后端」的实现细节（HTTP/回放后端没有 cued 启动参数），
   // 工具层/评测层不得依赖它。按值返回：cfg_ 现在受 cfg_mu_ 保护（控制面会改它）。
   Config config() const;

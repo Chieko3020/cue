@@ -46,6 +46,10 @@ class HttpServicePipeline : public IServicePipeline {
   bool set_param(const std::string& key, const std::string& value, std::string& err) override;
   bool inject_fault(const std::string& kind, double value, std::string& err) override;
   std::string observation(const std::string& source, int tail, std::string& err) const override;
+  // 假域/远端 REST 服务没有设备会话表（会话只在 cued 的 SessionRegistry 里）。
+  // 这里不转调 /api/state 的某个字段去"凑"一份：远端服务若也跑 cued，它自己的控制台
+  // 才是设备表的权威视图，本进程转述一份只会掩盖「这台上看不到那些设备」这件事。
+  nlohmann::json sessions_json(std::string& err) const override;
 
  private:
   // 一次 HTTP 调用的结果：传输层错误与业务层 ok=false 分开表达（err 非空即失败）

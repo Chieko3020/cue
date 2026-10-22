@@ -1031,6 +1031,24 @@ bool ProcessPipelineControl::refresh_metrics(std::string& err) {
   return true;
 }
 
+nlohmann::json ProcessPipelineControl::sessions_json(std::string& err) const {
+  json result;
+  if (!control_call("session.list", json::object(), result, err)) {
+    // 取不到 ≠ 没有设备。err 由 control_call 写好（"控制连接不可用…"或 cued 的原文），
+    // 这里只补一句"设备表因此未知"，避免上游把空表当成"设备全掉线"。
+    if (!err.empty() && err.find("设备表") == std::string::npos) {
+      err += "；设备表因此未知（不是「没有设备」）";
+    }
+    return empty_session_table();
+  }
+  // 形状不对也不猜：cued 与控制台版本不匹配时，宁可报错也不要渲染一张假表。
+  if (!result.is_object() || !result.contains("sessions") || !result["sessions"].is_array()) {
+    err = "session.list 的响应里没有 sessions 数组（cued 版本与控制台不匹配？）";
+    return empty_session_table();
+  }
+  return result;
+}
+
 bool ProcessPipelineControl::set_param(const std::string& key, const std::string& value,
                                       std::string& err) {
   json result;

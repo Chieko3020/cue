@@ -9,6 +9,8 @@
 //  - set_param/inject_fault 的**生效方式**允许后端不同（子进程重启 vs HTTP 请求），
 //    但「成功/失败 + err 文案」必须如实反映真实结果，不能假装成功。
 //  - observation 的 source 枚举与返回文本由各后端自己实现，工具层只透传。
+//  - sessions_json 只对**能维护会话状态**的后端（Process → cued）有真实数据；
+//    其余后端必须返回空表 + err 说明原因（FR-UI.1 的「没有设备」与「取不到」由此区分）。
 #pragma once
 
 #include <cstdint>
@@ -16,6 +18,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "cue/common/metrics.h"
 
@@ -89,7 +93,28 @@ class IServicePipeline {
   // 默认 false 而不是回退 latest()：调用方要能区分「这份数是刚查的」与「这是 1 Hz 缓存」，
   // 而 latest() 被监控线程/SSE 高频调用，不能让它变成一次可能超时的网络往返。
   virtual bool refresh_metrics(std::string& err);
+
+  // 设备会话表（FR-UI.1 的数据源）。返回 SessionRegistry::sessions_json 的形状：
+  // {"sessions":[{session_id, device_id, peer, caps, state, lease_ms, expires_in_ms, ...}],
+  //  "count":N, "live":K, "max_sessions":M, "lease_ms":L}。
+  //
+  // 为什么带默认实现而不是纯虚：会话表是**新增**的观测口径，与 start/stop 那样的
+  // 核心生命周期不是一回事。若改成纯虚，每一个后端（含测试里的假后端）都要为
+  // 「我根本没有会话概念」这件事写一遍同样的空表，而漏掉一个就会编译不过；
+  // 默认实现让「没有会话表」成为显式默认，需要真数据的后端（Process）覆盖它。
+  // 默认实现**不假装成功**：返回空表的同时在 err 里写清「本后端没有会话表」，
+  // 调用方据此把 devices 标成「取不到」而不是「一台设备都没有」。
+  virtual nlohmann::json sessions_json(std::string& err) const;
 };
+
+// 空会话表的统一形状。三个「没有会话表」的后端共用它：形状不一致的话，
+// 前端每个字段都要写三份兜底，而漏掉的那份会显示成「0 台设备在线」。
+nlohmann::json empty_session_table();
+
+// 没有会话表的后端的统一出口：空表 + err 里写清是哪个后端、为什么不支持。
+// backend 用后端的短名（"http" / "recording" / "replay"），err 会被原样带到
+// /api/state 的 devices_error 与工具输出里，所以文案要能直接给人看。
+nlohmann::json no_session_table(const char* backend, std::string& err);
 
 // 默认实现（定义在 service_pipeline.cpp）：后端不支持主动查询时返回 false 并写原因。
 inline bool IServicePipeline::refresh_metrics(std::string& err) {

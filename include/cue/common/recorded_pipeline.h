@@ -80,6 +80,9 @@ class RecordingPipeline : public IServicePipeline {
   bool set_param(const std::string& key, const std::string& value, std::string& err) override;
   bool inject_fault(const std::string& kind, double value, std::string& err) override;
   std::string observation(const std::string& source, int tail, std::string& err) const override;
+  // 会话表不进录制格式：设备注册/租约是**实时**事实，录制里存一份"当时的设备"会让
+  // 回放把过期设备当成在线设备显示。所以录制与回放都如实报"没有会话表"。
+  nlohmann::json sessions_json(std::string& err) const override;
 
   // 录制文件打不开/写失败时非空。调用方必须把它当 run_error，不能「录没录上都算过」。
   const std::string& io_error() const { return io_error_; }
@@ -124,6 +127,9 @@ class ReplayPipeline : public IServicePipeline {
   bool set_param(const std::string& key, const std::string& value, std::string& err) override;
   bool inject_fault(const std::string& kind, double value, std::string& err) override;
   std::string observation(const std::string& source, int tail, std::string& err) const override;
+  // 回放绝不触碰真实后端：会话表也不转问被包住的后端（那会让"回放"里冒出真实设备，
+  // 而同一份录制在两台机器上会得到不同的设备列表——回放就不可复现了）。
+  nlohmann::json sessions_json(std::string& err) const override;
 
  private:
   struct Record {

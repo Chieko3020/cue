@@ -4,12 +4,20 @@
 // 例如租约期满只断了 socket 却没清表、同一 device_id 重连时旧会话没被顶掉、
 // 能力夹取把 1080p 原样发给只支持 720p 的设备。这些都是纯状态问题，
 // 用假时钟就能钉死，不必起真进程（真链路的行为由 integration 覆盖）。
+//
+// T-23（FR-UI.1）：会话表经 IServicePipeline::sessions_json 到达控制台的这一段也在这里钉。
+// 关键判据是「没有会话表的后端必须说没有」——返回空表却 err 为空，会让设备页把
+// 「这个后端根本没有设备概念」渲染成「一台设备都没接入」。
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
+#include "cue/common/recorded_pipeline.h"
+#include "cue/common/service_pipeline.h"
 #include "cue/pipeline/control_plane.h"
+#include "cue/pipeline/http_pipeline.h"
 #include "cue/pipeline/session_registry.h"
 
 namespace pipeline = cue::pipeline;
@@ -165,6 +173,52 @@ int main() {
 
     const auto agg = reg.aggregate(0);
     check(agg.is_object(), "aggregate 返回对象（设备页汇总用）");
+  }
+
+  // ---------------------------------------------------------------- 7) sessions_json 的接口约定
+  //
+  // 三个「没有会话表」的后端必须返回空表**并且**在 err 里说明原因：
+  // 空表 + 空 err 会被前端读成「一台设备都没有」，而真相是「这台后端取不到」。
+  // 这里只验纯函数行为，不连网络、不 spawn 进程（HTTP 后端的 sessions_json 不发请求）。
+  {
+    std::string err;
+
+    // 7.1 默认实现（假后端只实现生命周期，没覆盖 sessions_json）
+    struct MinimalPipeline : pipeline::IServicePipeline {
+      bool start(std::string&) override { return true; }
+      void stop() override {}
+      bool running() const override { return false; }
+      pipeline::PipelineMetrics latest() const override { return {}; }
+      pipeline::ProbeMetrics probe_latest() const override { return {}; }
+      void set_event_callback(std::function<void(const pipeline::PipelineEvent&)>) override {}
+      std::vector<pipeline::PipelineEvent> recent_events(std::size_t) const override { return {}; }
+      bool set_param(const std::string&, const std::string&, std::string&) override { return false; }
+      bool inject_fault(const std::string&, double, std::string&) override { return false; }
+      std::string observation(const std::string&, int, std::string&) const override { return {}; }
+    } minimal;
+    err.clear();
+    const auto def = minimal.sessions_json(err);
+    check(def["sessions"].is_array() && def["sessions"].empty(), "默认实现返回空会话表");
+    check(def["count"] == 0 && def["live"] == 0, "默认实现的 count/live 都是 0");
+    check(!err.empty(), "默认实现在 err 里说明「没有实现会话表」");
+
+    // 7.2 HTTP 后端（假域 / 远端 REST）
+    pipeline::PipelineEndpoint ep;
+    ep.kind = pipeline::PipelineEndpoint::Kind::Http;
+    ep.http_base = "http://127.0.0.1:1";  // 故意指向不可达地址：sessions_json 不该发请求
+    pipeline::HttpServicePipeline http(ep);
+    err.clear();
+    const auto hj = http.sessions_json(err);
+    check(hj["sessions"].is_array() && hj["sessions"].empty(), "HTTP 后端返回空会话表");
+    check(hj["count"] == 0, "HTTP 后端的 count 是 0");
+    check(err.find("http") != std::string::npos, "HTTP 后端的 err 指明是 http 后端");
+
+    // 7.3 回放后端（文件不存在时 load_error_ 非空，但会话表的答复与加载成败无关）
+    pipeline::ReplayPipeline replay("/nonexistent/cue-absent.tools.jsonl");
+    err.clear();
+    const auto rj = replay.sessions_json(err);
+    check(rj["sessions"].is_array() && rj["sessions"].empty(), "回放后端返回空会话表");
+    check(err.find("replay") != std::string::npos, "回放后端的 err 指明是 replay 后端");
   }
 
   if (failures == 0) {

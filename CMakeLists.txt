@@ -327,7 +327,11 @@ add_test(NAME session COMMAND test_session)
 add_executable(test_session_registry tests/test_session_registry.cpp)
 # session_registry.cpp 在 cue_control 里，而它的 include 是 PRIVATE（分层隔离的代价）。
 # 测试要看 cue/pipeline/ 的头，得显式链 cue_headers_all —— 与其它测试同一口径。
-target_link_libraries(test_session_registry PRIVATE cue_control cue_headers_all)
+# cue_pipeline 是为了 T-23 起的那组断言：会话表经 IServicePipeline::sessions_json
+# 到达控制台，而「HTTP/回放后端必须说没有」的实现在 cue_pipeline 里
+# （service_pipeline / http_pipeline / recorded_pipeline）。它不发请求、不起进程，
+# 所以这里仍是一秒内跑完的纯单测。
+target_link_libraries(test_session_registry PRIVATE cue_control cue_pipeline cue_headers_all)
 add_test(NAME session_registry COMMAND test_session_registry)
 
 add_executable(test_context tests/test_context.cpp)
