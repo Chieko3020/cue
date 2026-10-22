@@ -58,12 +58,15 @@ jobs:
       - name: 配置与构建（-j1 防 OOM）
         run: |
           set -euo pipefail
-          # 本机 2 vCPU / 1967 MB，runner 的 cgroup MemoryHigh=700M。带完整 -g 时
-          # cued.cpp（Boost+FFmpeg）单份 .o 就几十 MB，构建会一直贴着 MemoryHigh 被节流
-          # （实测 90 min 只编出 2 个 TU，cc1plus 只占 18% CPU）。CI 的 build job 不负责
-          # 调试，去 -g 后内存需求降到 cgroup 装得下；需要栈信息的场景在 asan job。
+          # 本机 2 vCPU / 1967 MB，runner 的 cgroup MemoryHigh=700M。构建被节流的根因
+          # 不是累积内存，而是**单个 TU 的编译峰值**就超过 700M：cued.cpp（Boost+FFmpeg
+          # 模板）一个 TU 就能吃掉 700M+，加什么 -g 级别都改不了这个数量级。
+          # 实测：-g0 让 .o 从 9.43 MB 降到 0.52 MB（18 倍），但 MemoryCurrent 仍贴 734M、
+          # 5 分钟只编 2 个 TU。所以这里进一步用 -O0：优化分析是编译期内存的另一个大户，
+          # build job 的职责是「编译 + 跑测试」，不是产出可发布二进制（性能场景在 bench）。
+          # 要栈信息看 asan job（-g1）；要真实优化级别，本地按 README 的 RelWithDebInfo 构建。
           cmake -S . -B build-ci -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O2 -DNDEBUG -g0"
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O0 -DNDEBUG -g0"
           cmake --build build-ci -j1 2>&1 | tee /tmp/cue-build.log
           # 0 warning 是硬口径：构建日志里出现 "warning:" 就算失败
           if grep -n "warning:" /tmp/cue-build.log; then
