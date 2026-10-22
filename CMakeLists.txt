@@ -236,6 +236,12 @@ add_executable(test_cassette tests/test_cassette.cpp)
 target_link_libraries(test_cassette PRIVATE cue_agent)
 add_test(NAME cassette COMMAND test_cassette)
 
+# T-02/T-03：ProbeMetrics 的无样本/有样本序列化（NaN ←→ null）与 SLA 字段向后兼容
+add_executable(test_probe tests/test_probe.cpp)
+target_link_libraries(test_probe PRIVATE cue_eval cue_pipeline nlohmann_json::nlohmann_json)
+add_test(NAME probe COMMAND test_probe)
+set_tests_properties(probe PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # AC-11 沙箱：白名单 / 真实执行 / landlock 写拒绝 / 超时 / 取消 / 输出截断
 add_executable(test_sandbox tests/test_sandbox.cpp)
 target_link_libraries(test_sandbox PRIVATE cue_sandbox)

@@ -73,7 +73,6 @@ port_busy_udp() { ss -H -lun "sport = :$1" 2>/dev/null | grep -q .; }
 port_busy_tcp "$WS_PORT" && fail "TCP :$WS_PORT 已被占用（cue-eval 的 cued 端口写死）"
 port_busy_udp "$PROBE_PORT" && fail "UDP :$PROBE_PORT 已被占用（cue-eval 的 probe 端口写死）"
 
-PROBE_PID=""
 PUSH_PID=""
 
 cleanup() {
@@ -84,7 +83,6 @@ cleanup() {
     kill -TERM -"$PUSH_PID" 2>/dev/null || true
     kill -TERM "$PUSH_PID" 2>/dev/null || true
   fi
-  if [ -n "$PROBE_PID" ]; then kill -TERM "$PROBE_PID" 2>/dev/null || true; fi
   wait 2>/dev/null || true
   exit "$rc"
 }
@@ -95,14 +93,9 @@ mkdir -p "$WORK"
 note "工作目录 $WORK（BUILD_DIR=$BUILD_DIR REPEAT=$REPEAT SUITE=$SUITE）"
 
 # ---- 合成推流：真 WS 帧 → cued 解码 → 指标里就有真实抖动 ----
-"$PROBE" --port "$PROBE_PORT" >"$WORK/probe.log" 2>&1 &
-PROBE_PID=$!
-for _ in $(seq 1 50); do
-  if port_busy_udp "$PROBE_PORT"; then break; fi
-  sleep 0.1
-done
-port_busy_udp "$PROBE_PORT" || fail "cue-probe 没在 :$PROBE_PORT 上监听（见 $WORK/probe.log）"
-
+# probe 不再由本脚本启动：T-02 起它由 harness（cue-eval 的 ProcessPipelineControl）
+# 自己托管——先起 probe 再起 cued，倒序停。这里只要求端口空闲，
+# 否则 harness 的 probe 绑不上，case 会明确报 run_error=probe_unavailable。
 setsid bash -c '
   while :; do
     timeout "$3" node "$1/scripts/test-client.mjs" "ws://127.0.0.1:$2/" "$3" >/dev/null 2>&1 || true

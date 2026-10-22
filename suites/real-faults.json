@@ -110,7 +110,9 @@
           "fetch_observation"
         ],
         "sla": {
-          "fps_min": 25
+          "fps_min": 25,
+          "lat_p99_ms": 100,
+          "lat_p50_ms": 30
         }
       },
       "budget": {
@@ -150,7 +152,8 @@
           "fetch_observation"
         ],
         "sla": {
-          "fps_min": 25
+          "fps_min": 25,
+          "lat_p99_ms": 100
         }
       },
       "budget": {

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -260,6 +261,16 @@ std::string num_text(double v, int prec = 2) {
   return o.str();
 }
 
+// 端到端列的文本口径：没样本写字面量 null（不是 n/a、更不是 0）。
+// 报告读者需要一眼区分"没测到端到端"与"端到端是 0 ms"，这两者的结论完全相反。
+std::string e2e_text(double v, int prec = 1) {
+  if (!has_value(v)) return "null";
+  std::ostringstream o;
+  o.precision(prec);
+  o << std::fixed << v;
+  return o.str();
+}
+
 std::string short_list(const std::vector<std::string>& v) {
   std::string out;
   for (std::size_t i = 0; i < v.size(); ++i) {
@@ -331,6 +342,24 @@ Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<O
   if (m.dropped > c.sla_dropped_max) s.sla = false;
   // 没有采样 = 无法证明达成，按不达标处理
   if (m.samples == 0) s.sla = false;
+
+  // 端到端阈值：判据只有 probe 的样本。探针不在（samples=0）时一律不达标——
+  // 「cued 的 fps 正常」不能证明端到端时延达标，用服务端自报顶替就是假绿灯。
+  if (has_value(c.sla_lat_p99_ms)) {
+    if (!has_value(m.probe.e2e.p99) || m.probe.e2e.p99 > c.sla_lat_p99_ms) s.sla = false;
+  }
+  if (has_value(c.sla_lat_p50_ms)) {
+    if (!has_value(m.probe.e2e.p50) || m.probe.e2e.p50 > c.sla_lat_p50_ms) s.sla = false;
+  }
+  if (has_value(c.sla_max_stall_ms)) {
+    if (!has_value(m.probe.max_stall_ms) || m.probe.max_stall_ms > c.sla_max_stall_ms) {
+      s.sla = false;
+    }
+  }
+  if (c.sla_stalls_max != UINT64_MAX) {
+    // 卡顿是累计量的窗口增量；没有探针样本就读不到增量，按不达标处理
+    if (m.probe.samples == 0 || m.probe.stalls > c.sla_stalls_max) s.sla = false;
+  }
   return s;
 }
 
@@ -656,7 +685,10 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
     if (!e["sla"].is_null()) {
       const auto& s = e["sla"];
       if (!s.is_object()) return std::unexpected("case " + c.id + ": expect.sla 必须是对象或 null");
-      if (!check_keys(s, {"fps_min", "usable_fps_min", "dropped_max", "frame_completion_min"},
+      // 旧字段（fps_min / usable_fps_min / dropped_max / frame_completion_min）保持原样，
+      // 新增端到端字段是可选的：不写 = 不检查，旧 suite 的行为完全不变。
+      if (!check_keys(s, {"fps_min", "usable_fps_min", "dropped_max", "frame_completion_min",
+                          "lat_p99_ms", "lat_p50_ms", "max_stall_ms", "stalls"},
                       "case.expect.sla", err)) {
         return std::unexpected("case " + c.id + ": " + err);
       }
@@ -666,12 +698,22 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
       const char* fps_key = s.contains("usable_fps_min") ? "usable_fps_min" : "fps_min";
       if (!get_double(s, fps_key, c.sla_fps_min, err) ||
           !get_u64(s, "dropped_max", c.sla_dropped_max, err) ||
-          !get_double(s, "frame_completion_min", c.sla_frame_completion_min, err)) {
+          !get_double(s, "frame_completion_min", c.sla_frame_completion_min, err) ||
+          !get_double(s, "lat_p99_ms", c.sla_lat_p99_ms, err) ||
+          !get_double(s, "lat_p50_ms", c.sla_lat_p50_ms, err) ||
+          !get_double(s, "max_stall_ms", c.sla_max_stall_ms, err) ||
+          !get_u64(s, "stalls", c.sla_stalls_max, err)) {
         return std::unexpected("case " + c.id + ": " + err);
       }
       if (c.sla_fps_min < 0.0) return std::unexpected("case " + c.id + ": fps 下限不能为负");
       if (c.sla_frame_completion_min < 0.0 || c.sla_frame_completion_min > 1.0) {
         return std::unexpected("case " + c.id + ": frame_completion_min 必须在 [0,1]");
+      }
+      // 端到端阈值是"上限"，负数没有意义（写负会让任何读数都"达标"，等于关掉判分）
+      if ((has_value(c.sla_lat_p99_ms) && c.sla_lat_p99_ms < 0.0) ||
+          (has_value(c.sla_lat_p50_ms) && c.sla_lat_p50_ms < 0.0) ||
+          (has_value(c.sla_max_stall_ms) && c.sla_max_stall_ms < 0.0)) {
+        return std::unexpected("case " + c.id + ": 端到端 SLA 阈值不能为负");
       }
     }
 
@@ -790,6 +832,17 @@ std::string Engine::config_hash() const {
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
   PipelineConfig pc;
   pc.cued_bin = cfg.cued_bin;
+  // 探针默认跟着 cued 走：显式 --probe 优先，否则取 cued 同目录的 cue-probe。
+  // 只认 "./build/cue-probe" 这种写死路径的话，--cued build-final/cued 就会配错探针，
+  // 表现为 probe_unavailable——那不是"探针没实现"，是我们指错了二进制。
+  if (!cfg.probe_bin.empty()) {
+    pc.probe_bin = cfg.probe_bin;
+  } else if (!cfg.cued_bin.empty()) {
+    const auto slash = cfg.cued_bin.find_last_of('/');
+    pc.probe_bin = (slash == std::string::npos ? std::string()
+                                              : cfg.cued_bin.substr(0, slash + 1)) +
+                   "cue-probe";
+  }
   // 注入档位只来自 case：agent 必须自己从指标里发现故障，评测器不能替它"制造"结论
   pc.inject_drop = (c.fault_kind == "drop") ? c.fault_value : 0.0;
   pc.inject_ingress_drop = (c.fault_kind == "ingress_drop") ? c.fault_value : 0.0;
@@ -827,6 +880,7 @@ namespace {
 pipeline::ProcessPipelineControl::Config to_pipeline_config(const PipelineConfig& pc) {
   pipeline::ProcessPipelineControl::Config out;
   out.cued_bin = pc.cued_bin;
+  out.probe_bin = pc.probe_bin;
   out.inject_drop = pc.inject_drop;
   out.inject_ingress_drop = pc.inject_ingress_drop;
   out.send_mbps = pc.send_mbps;
@@ -866,9 +920,43 @@ Metrics to_metrics(const pipeline::PipelineMetrics& m) {
   return out;
 }
 
+// pipeline::ProbeMetrics → 评测层 POD。NaN 一个都不补成 0：端到端的"没测到"
+// 与"测到 0 ms"在判分上是相反的结论（前者不可证明、后者是优秀）。
+ProbeSummary to_probe_summary(const pipeline::ProbeMetrics& p) {
+  ProbeSummary out;
+  out.alive = p.alive;
+  out.samples = p.samples;
+  out.fps = p.fps;
+  out.frames = p.frames;
+  out.decoded = p.decoded;
+  out.decode_errors = p.decode_errors;
+  out.stalls = p.stalls;
+  if (p.samples > 0) {
+    out.max_stall_ms = double(p.max_stall_us) / 1000.0;
+    out.e2e.p50 = p.lat_p50_ms;
+    out.e2e.p95 = p.lat_p95_ms;
+    out.e2e.p99 = p.lat_p99_ms;
+    out.recv_us.p50 = p.recv.p50;
+    out.recv_us.p99 = p.recv.p99;
+    out.reassembly_us.p50 = p.reassembly.p50;
+    out.reassembly_us.p99 = p.reassembly.p99;
+    out.buffer_us.p50 = p.buffer.p50;
+    out.buffer_us.p99 = p.buffer.p99;
+    out.decode_us.p50 = p.decode.p50;
+    out.decode_us.p99 = p.decode.p99;
+  }
+  out.synced = p.synced;
+  out.offset_us = p.offset_us;
+  out.unavailable_reason = p.unavailable_reason;
+  return out;
+}
+
 struct SamplePoint {
   int64_t t_us = 0;
   Metrics m;
+  // 同一时刻的探针快照：端到端读数与 cued 侧指标是两条独立的时间序列，
+  // 只在需要的地方各自取中位（不把探针的值塞进 cued 的字段）。
+  pipeline::ProbeMetrics probe;
 };
 
 // agent 运行期间持续采样：MTTR（注入 → 指标回到 SLA）必须靠时间序列，
@@ -899,11 +987,16 @@ class MetricMonitor {
  private:
   void loop() {
     uint64_t last = UINT64_MAX;
+    uint64_t last_probe = UINT64_MAX;
     while (!stop_.load()) {
       const auto m = pipe_.latest();
-      if (m.samples != 0 && m.samples != last) {
+      const auto pr = pipe_.probe_latest();
+      // 任一侧有新采样就落一个点：端到端序列不必等 cued 的那一秒（两者节奏不同）。
+      if ((m.samples != 0 && m.samples != last) ||
+          (pr.samples != 0 && pr.samples != last_probe)) {
         last = m.samples;
-        const SamplePoint p{now_us(), to_metrics(m)};
+        last_probe = pr.samples;
+        const SamplePoint p{now_us(), to_metrics(m), pr};
         std::lock_guard<std::mutex> lk(mu_);
         points_.push_back(p);
       }
@@ -921,10 +1014,86 @@ class MetricMonitor {
 
 // agent 结束后等 3 条新采样（cued 每秒一条），最多等 8 s
 constexpr int kRetestSamples = 3;
+// 等探针刷新一条新指标行的轮数（200 ms 一步 → 2 s）：探针每秒一条，
+// 2 s 还没刷新说明它不再上报（此时按 probe_unavailable 处理，而不是干等）
+constexpr int kProbeWaitSteps = 10;
 constexpr int kRetestWaitMs = 8000;
 constexpr int kSleepStepMs = 200;
 // 超过这个年龄的采样算"陈旧"（cued 只在有媒体流时打点，流断了就不会更新）
 constexpr int64_t kStaleSampleUs = 3'000'000;
+
+// 窗口内的端到端汇总：分位取中位、卡顿取增量、最长卡顿取窗口内最大。
+// stalls 是探针进程的累计量，跨窗口要差分；探针崩溃重启会让计数清零，
+// 遇到清零按 0 重新计（与 dropped 的窗口增量同一个处理，避免"重启即达标"）。
+ProbeSummary summarize_probe_window(const std::vector<SamplePoint>& pts) {
+  ProbeSummary out;
+  std::vector<double> p50, p95, p99, fps, max_stall;
+  const SamplePoint* first = nullptr;
+  const SamplePoint* last = nullptr;
+  for (const auto& s : pts) {
+    if (s.probe.samples == 0) continue;
+    const ProbeSummary one = to_probe_summary(s.probe);
+    if (first == nullptr) first = &s;
+    last = &s;
+    if (has_value(one.e2e.p50)) p50.push_back(one.e2e.p50);
+    if (has_value(one.e2e.p95)) p95.push_back(one.e2e.p95);
+    if (has_value(one.e2e.p99)) p99.push_back(one.e2e.p99);
+    if (has_value(one.max_stall_ms)) max_stall.push_back(one.max_stall_ms);
+    fps.push_back(one.fps);
+  }
+  if (last == nullptr) {
+    // 一条探针指标都没收到：字段保持 NaN，但**原因**必须带出去（探针没起/绑不上端口/
+    // 根本没上报），否则调用方只能看到"没有样本"，定位不到是哪一种。
+    if (!pts.empty()) out = to_probe_summary(pts.back().probe);
+    out.samples = 0;
+    return out;
+  }
+  out = to_probe_summary(last->probe);
+  out.e2e.p50 = median(p50);
+  out.e2e.p95 = median(p95);
+  out.e2e.p99 = median(p99);
+  out.fps = median(fps);
+  // 最长卡顿：探针报的是会话内累计最大，取窗口内最大即可（只会高估，不会漏报）
+  double worst = kNoValue;
+  for (double v : max_stall) worst = has_value(worst) ? std::max(worst, v) : v;
+  out.max_stall_ms = worst;
+  out.stalls = 0;
+  if (first != nullptr && last != first) {
+    out.stalls = last->probe.stalls >= first->probe.stalls
+                     ? last->probe.stalls - first->probe.stalls
+                     : last->probe.stalls;  // 探针重启清零：只算这一代
+  } else if (last != nullptr) {
+    // 窗口里只有一条探针采样：探针每次重启都从 0 开始计（修复动作本身就会重启它），
+    // 所以这一代的累计值就是窗口值。写 0 会被读成"这一秒没有卡顿"，那是编出来的。
+    out.stalls = last->probe.stalls;
+  }
+  return out;
+}
+
+// 某个时间窗口内端到端 p99 的中位；没有样本返回 NaN（报告写 null 并带原因）
+double window_probe_p99(const std::vector<SamplePoint>& pts, int64_t from_us, int64_t to_us) {
+  std::vector<double> v;
+  for (const auto& s : pts) {
+    if (s.t_us < from_us || s.t_us > to_us) continue;
+    if (s.probe.samples == 0) continue;
+    const ProbeSummary one = to_probe_summary(s.probe);
+    if (has_value(one.e2e.p99)) v.push_back(one.e2e.p99);
+  }
+  return median(v);
+}
+
+// 端到端字段为 null 的原因文案：报告不能只写 n/a 让人猜
+std::string e2e_null_reason_for(const ProbeSummary& probe, bool require_probe, bool has_before,
+                                bool has_fault) {
+  if (probe.samples == 0) {
+    if (!probe.unavailable_reason.empty()) return "探针不可用：" + probe.unavailable_reason;
+    return require_probe ? "探针没有上报任何指标样本" : "该后端没有探针（假域/回放）";
+  }
+  std::string why;
+  if (!has_before) why += "注入前窗口无探针样本（Process 后端的故障随 cued 启动即生效）";
+  if (!has_fault) why += (why.empty() ? "" : "；") + std::string("故障窗口无探针样本");
+  return why;
+}
 
 // 从观测原文里取出 key 的 value 的**逐字**片段（JSON 的 "k": v 或文本的 k=v）。
 // scripted+endpoint 的假 agent 用它在真实观测里挑证据；不做格式化/四舍五入——
@@ -953,6 +1122,28 @@ std::string observation_fragment(const std::string& text, const std::string& key
   }
   if (end == value_at) return {};
   return key + "=" + text.substr(value_at, end - value_at);
+}
+
+// 自检路径（scripted，无真管线）的探针读数：按 case 声明的阈值构造一份「刚好达标」的
+// 端到端数字。它的性质与这里把 root_cause 取自 expect 完全一样——这条路径证明的是
+// 「判分器 + 引擎」链路能被端到端 SLA 驱动，不是任何实测值（报告顶部有 scripted banner）。
+ProbeSummary simulated_probe(const Case& c) {
+  ProbeSummary p;
+  p.alive = true;
+  p.samples = 1;
+  p.fps = 30.0;
+  p.frames = 300;
+  p.decoded = 300;
+  p.synced = true;
+  p.e2e.p50 = has_value(c.sla_lat_p50_ms) ? c.sla_lat_p50_ms * 0.5 : 12.0;
+  p.e2e.p95 = 20.0;
+  p.e2e.p99 = has_value(c.sla_lat_p99_ms) ? c.sla_lat_p99_ms * 0.5 : 33.0;
+  p.max_stall_ms = has_value(c.sla_max_stall_ms) ? c.sla_max_stall_ms * 0.5 : 33.0;
+  p.stalls = c.sla_stalls_max != UINT64_MAX ? c.sla_stalls_max : 0;
+  p.recv_us.p50 = 30.0;
+  p.reassembly_us.p50 = 40.0;
+  p.decode_us.p50 = 900.0;
+  return p;
 }
 
 }  // namespace
@@ -1006,6 +1197,7 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   m.dropped = 0;
   m.injected = 59;
   m.decoded = 247;
+  m.probe = simulated_probe(c);
   o.score = judge_case(c, fake, obs, m);
   o.scored = true;
   o.turns = fake.turns;
@@ -1207,6 +1399,10 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     }
   }
 
+  // 故障窗口的端到端读数：注入后、修复前取一次探针快照。调用点是固定的（不按时间/
+  // 不按数值决定是否调用），所以录制与回放消费同一条记录，窗口口径可复现。
+  const ProbeSummary fault_probe = to_probe_summary(pipe->probe_latest());
+
   // 观测：真调 query_metrics（content 是 "metrics={...}" 原文）
   const auto q = reg.call("query_metrics", json::object());
   if (!q) {
@@ -1271,30 +1467,46 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   // harness 复测 SLA：直接调接口（与 real 路径同一口径，不信 agent 自报）。
   // 录制/回放路径先等一条修复后的新采样（修复会重启管线，立即读会拿到清零后的 0），
   // 再取 kRetestSamples 条——等待只按返回值终止，回放才能逐步复现同一串调用。
-  Metrics m;
+  // 重测窗口：cued 与探针两侧一起采（探针在 Process 后端是 harness 自己托管的，回放模式下
+  // 由录制提供）。调用序列必须与录制时逐次对齐，所以循环结构一个字都不改，只是每次多取
+  // 一份 probe_latest()。
+  const bool require_probe = cfg_.endpoint.empty() && !replay_tools;
+  std::vector<SamplePoint> post;
+  auto take_sample = [&]() {
+    const auto cued = pipe->latest();
+    post.push_back(SamplePoint{now_us(), to_metrics(cued), pipe->probe_latest()});
+    return cued;
+  };
   bool have_sample = false;
   if (replay_tools || record_tools) {
     for (int i = 0; i < kWaitAttempts; ++i) {
-      const auto pm = pipe->latest();
+      const auto pm = take_sample();
       if (pm.samples > 0) {
-        m = to_metrics(pm);
         have_sample = true;
         break;
       }
       if (!replay_tools) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     if (have_sample) {
+      // 第一条是"修复后刚重启"的过渡窗口：里面可能还有旧流残留的帧（跨重启的 pts），
+      // 端到端分位会被一两个离群样本拉爆。丢掉它，重测窗口只取重启之后的三个完整窗口。
+      post.clear();
+      // 探针的指标行每秒一条：三个"重测样本"若在同一秒内连读，端到端读数其实只刷新了
+      // 一次（甚至没刷新），重测窗口就退化成单点。这里按「探针样本号必须增长」推进，
+      // 停止条件只看返回值，所以回放会消费同样的条数、得到同一串数值。
       for (int i = 0; i < kRetestSamples; ++i) {
-        const auto pm = pipe->latest();
-        if (pm.samples == 0) continue;
-        m = to_metrics(pm);
+        const uint64_t want = post.empty() ? 0 : post.back().probe.samples + 1;
+        for (int w = 0; w < kProbeWaitSteps; ++w) {
+          if (pipe->probe_latest().samples >= want) break;  // 只为推进窗口，不落样本
+          if (!replay_tools) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        take_sample();
       }
     }
   } else {
     for (int i = 0; i < kRetestSamples; ++i) {
-      const auto pm = pipe->latest();
+      const auto pm = take_sample();
       if (pm.samples == 0) continue;
-      m = to_metrics(pm);
       have_sample = true;
     }
   }
@@ -1302,6 +1514,34 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     o.error_kind = "no_retest_sample";
     return o;
   }
+  // 取最后一条有 cued 采样的点（与旧实现同口径：m 是"重测窗口里最新的一次读数"）
+  Metrics m;
+  for (auto it = post.rbegin(); it != post.rend(); ++it) {
+    if (it->m.samples > 0) {
+      m = it->m;
+      break;
+    }
+  }
+  m.probe = summarize_probe_window(post);
+
+  // 探针不可用 = 明确失败，绝不静默退回 cued 指标：端到端 SLA 若拿 cued 的自报去判，
+  // "探针根本没起来"就会被读成"端到端达标"，这是本项目最不能接受的假绿灯。
+  // 假域/回放后端本来就没有探针，不在这条要求之内（它们的 SLA 只用 cued 侧字段）。
+  if (require_probe && m.probe.samples == 0) {
+    o.error_kind = "probe_unavailable: " +
+                   (m.probe.unavailable_reason.empty() ? std::string("探针没有上报任何指标样本")
+                                                       : m.probe.unavailable_reason);
+    // 指标快照也要留档：报告/state 里要能看到"探针为什么不可用"，而不是只有一行 error_kind
+    o.metrics = m;
+    o.e2e_null_reason = e2e_null_reason_for(m.probe, true, false, false);
+    return o;
+  }
+  o.p99_ms_after = m.probe.e2e.p99;
+  // 故障窗口 = 注入后、修复前的那个点；注入前窗口在 Process 后端不存在（故障随启动生效），
+  // 所以这里如实留 NaN，报告会说明原因。
+  if (fault_probe.samples > 0) o.p99_ms_fault = fault_probe.e2e.p99;
+  o.e2e_null_reason = e2e_null_reason_for(m.probe, require_probe, false,
+                                          has_value(o.p99_ms_fault));
 
   agent::RunResult fake;
   fake.final_stage = agent::Stage::Done;
@@ -1564,12 +1804,31 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   // Runner 每轮/每次 LLM 调用前检查，并把指针写进 ChatRequest.cancel 交给 curl 的中止回调。
   // 少了这一行，SIGTERM 后 agent 会一直卡到 LLM 超时（最坏 3 分钟），AC-8 的 5 秒失效。
   ac.cancel = cfg_.cancel;
-  // SPEC §7.5 的 verify→done 守卫：harness 重测，不信 agent 自报（事件里标 verify=measured）
+  // SPEC §7.5 的 verify→done 守卫：harness 重测，不信 agent 自报（事件里标 verify=measured）。
+  // 声明了端到端阈值的 case，守卫也必须看探针：只看 cued 的 fps 会让 agent 在"延迟还没降下来"
+  // 时就过 verify→done，把没修好的状态记成修好了。
   ac.verify_sla = [&pipe, &c](const agent::Diagnosis&) {
     const auto m = pipe->latest();
     if (m.samples == 0) return false;
     if (c.sla_fps_min > 0 && m.fps < c.sla_fps_min) return false;
     if (m.dropped > c.sla_dropped_max) return false;
+    const bool e2e_required = has_value(c.sla_lat_p99_ms) || has_value(c.sla_lat_p50_ms) ||
+                              has_value(c.sla_max_stall_ms) || c.sla_stalls_max != UINT64_MAX;
+    if (!e2e_required) return true;
+    const auto p = pipe->probe_latest();
+    if (p.samples == 0) return false;  // 探针没有样本 = 无法证明端到端达标
+    if (has_value(c.sla_lat_p99_ms) &&
+        (!has_value(p.lat_p99_ms) || p.lat_p99_ms > c.sla_lat_p99_ms)) {
+      return false;
+    }
+    if (has_value(c.sla_lat_p50_ms) &&
+        (!has_value(p.lat_p50_ms) || p.lat_p50_ms > c.sla_lat_p50_ms)) {
+      return false;
+    }
+    if (has_value(c.sla_max_stall_ms) &&
+        double(p.max_stall_us) / 1000.0 > c.sla_max_stall_ms) {
+      return false;
+    }
     return true;
   };
 
@@ -1605,8 +1864,9 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     constexpr int kWaitAttempts = 100;  // 录制时最多等 20 s；回放不睡
     for (int i = 0; i < kWaitAttempts && post.empty(); ++i) {
       const auto pm = pipe->latest();
+      const auto pr = pipe->probe_latest();
       if (pm.samples > 0) {
-        post.push_back(SamplePoint{now_us(), to_metrics(pm)});
+        post.push_back(SamplePoint{now_us(), to_metrics(pm), pr});
       } else if (!replay_tools) {
         std::this_thread::sleep_for(std::chrono::milliseconds(kSleepStepMs));
       }
@@ -1614,8 +1874,9 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     }
     for (int i = 0; i < kRetestSamples && !post.empty(); ++i) {
       const auto pm = pipe->latest();
+      const auto pr = pipe->probe_latest();
       if (pm.samples == 0) continue;
-      post.push_back(SamplePoint{now_us(), to_metrics(pm)});
+      post.push_back(SamplePoint{now_us(), to_metrics(pm), pr});
     }
   } else {
     const int64_t deadline_us = t_agent_end_us + int64_t(kRetestWaitMs) * 1000;
@@ -1680,11 +1941,40 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     std::fprintf(stderr, "[eval][%s] 重测无有效采样 → SLA 不可判定为达标\n", c.id.c_str());
   }
 
+  // 端到端（探针）读数与前后窗口。三个窗口的边界：
+  //   注入前 = [开始, t_inject_us)；故障窗口 = [t_inject_us, agent 结束]；修复后 = 重测窗口。
+  // Process 后端的故障随 cued 启动参数即生效，所以"注入前"窗口通常是空的——那不是
+  // 数据丢失，而是这条链路本来就没有故障前状态，报告里会写明原因。
+  const bool require_probe = cfg_.endpoint.empty() && !replay_tools;
+  m.probe = summarize_probe_window(post);
+  o.p99_ms_after = m.probe.e2e.p99;
+  if (mon != nullptr) {
+    const auto all = mon->snapshot();
+    o.p99_ms_before = window_probe_p99(all, std::numeric_limits<int64_t>::min(), t_inject_us - 1);
+    o.p99_ms_fault = window_probe_p99(all, t_inject_us, t_agent_end_us);
+  }
+  o.e2e_null_reason = e2e_null_reason_for(m.probe, require_probe, has_value(o.p99_ms_before),
+                                          has_value(o.p99_ms_fault));
+  if (require_probe && m.probe.samples == 0) {
+    // 探针不可用时必须显式失败：静默退回 cued 指标会让"端到端"这三个字变成服务端自报。
+    // 记成 run_error（不计入成功率分母），报告与 state.jsonl 里都留完整原因。
+    o.scored = false;
+    o.error_kind = "probe_unavailable: " +
+                   (m.probe.unavailable_reason.empty() ? std::string("探针没有上报任何指标样本")
+                                                       : m.probe.unavailable_reason);
+    o.metrics = m;
+    std::fprintf(stderr, "[eval][%s] 探针不可用 → 端到端 SLA 无法判定：%s\n", c.id.c_str(),
+                 o.error_kind.c_str());
+    return;
+  }
+
   // 6) MTTR：注入 → 指标首次回到 SLA（用整段时间序列，而不是只看最后一个点）。
   //    录制/回放模式没有后台时间序列，MTTR 记 n/a（不拿墙上时钟凑一个假数）。
   o.mttr_s = kNoValue;
-  const bool has_sla =
-      c.sla_fps_min > 0 || c.sla_dropped_max != UINT64_MAX || c.sla_frame_completion_min > 0;
+  const bool has_sla = c.sla_fps_min > 0 || c.sla_dropped_max != UINT64_MAX ||
+                       c.sla_frame_completion_min > 0 || has_value(c.sla_lat_p99_ms) ||
+                       has_value(c.sla_lat_p50_ms) || has_value(c.sla_max_stall_ms) ||
+                       c.sla_stalls_max != UINT64_MAX;
   if (has_sla && mon != nullptr) {
     const auto all = mon->snapshot();
     for (std::size_t i = 0; i < all.size(); ++i) {
@@ -1698,7 +1988,21 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
       }
       const bool fps_ok = c.sla_fps_min <= 0 || s.m.fps >= c.sla_fps_min;
       const bool drop_ok = delta <= c.sla_dropped_max;
-      if (fps_ok && drop_ok && s.m.samples > 0) {
+      // 端到端阈值也参与"什么时候算恢复"：只看 fps 会把"延迟还没降下来"记成已恢复。
+      // 卡顿次数是累计量，逐点判定"首次回到 SLA"要差分两次采样，MTTR 里只用分位口径；
+      // 卡顿阈值仍然由最终重测窗口判（见 judge_case）。
+      const bool e2e_ok =
+          s.probe.samples > 0 &&
+          (!has_value(c.sla_lat_p99_ms) ||
+           (has_value(s.probe.lat_p99_ms) && s.probe.lat_p99_ms <= c.sla_lat_p99_ms)) &&
+          (!has_value(c.sla_lat_p50_ms) ||
+           (has_value(s.probe.lat_p50_ms) && s.probe.lat_p50_ms <= c.sla_lat_p50_ms)) &&
+          (!has_value(c.sla_max_stall_ms) ||
+           (has_value(s.probe.max_stall_us) &&
+            s.probe.max_stall_us / 1000.0 <= c.sla_max_stall_ms));
+      const bool e2e_required = has_value(c.sla_lat_p99_ms) || has_value(c.sla_lat_p50_ms) ||
+                                has_value(c.sla_max_stall_ms) || c.sla_stalls_max != UINT64_MAX;
+      if (fps_ok && drop_ok && (!e2e_required || e2e_ok) && s.m.samples > 0) {
         o.mttr_s = double(s.t_us - t_inject_us) / 1'000'000.0;
         break;
       }
@@ -1887,6 +2191,35 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
     r.pass_k = double(pass_cases) / double(attempt_count.size());
   }
 
+  // 端到端 p99 的 run 级对比：各 case 的中位（只统计真正有探针样本的 case）。
+  // 没有任何样本时写 NaN + 原因，报告里渲染成 null——不用 0 冒充。
+  {
+    std::vector<double> before, after;
+    bool any_probe = false;
+    for (const auto& o : r.cases) {
+      if (!o.scored) continue;
+      if (o.metrics.probe.samples > 0) any_probe = true;
+      if (has_value(o.p99_ms_before)) before.push_back(o.p99_ms_before);
+      if (has_value(o.p99_ms_after)) after.push_back(o.p99_ms_after);
+    }
+    r.p99_ms_before = median(before);
+    r.p99_ms_after = median(after);
+    if (!cfg_.replay_tools_dir.empty()) {
+      r.probe_source = "probe 指标来自工具录制（--replay-tools）";
+    } else if (!cfg_.endpoint.empty()) {
+      r.probe_source = "无（HTTP 后端没有探针，端到端字段恒为 null）";
+    } else {
+      r.probe_source = "cue-probe（harness 托管，端到端）";
+    }
+    if (!any_probe) {
+      r.e2e_null_reason = cfg_.endpoint.empty() && cfg_.replay_tools_dir.empty()
+                              ? "该 run 没有任何探针样本（probe_unavailable 会记在 run_error 里）"
+                              : "该 run 的后端没有探针（假域/回放没有端到端数据）";
+    } else if (!has_value(r.p99_ms_before)) {
+      r.e2e_null_reason = "注入前窗口没有探针样本（故障随管线启动即生效），修复后 p99 见右侧";
+    }
+  }
+
   // 失败模式聚合：必须写清"期望 vs 实际"，否则 `root != <实际值>` 无法定位（P3#32）
   std::map<std::string, int> miss;
   for (const auto& o : r.cases) {
@@ -1910,10 +2243,33 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
           if (!want.empty()) want += "、";
           want += "dropped≤" + std::to_string(exp->sla_dropped_max);
         }
+        if (has_value(exp->sla_lat_p99_ms)) {
+          if (!want.empty()) want += "、";
+          want += "lat_p99≤" + num_text(exp->sla_lat_p99_ms, 0) + "ms";
+        }
+        if (has_value(exp->sla_lat_p50_ms)) {
+          if (!want.empty()) want += "、";
+          want += "lat_p50≤" + num_text(exp->sla_lat_p50_ms, 0) + "ms";
+        }
+        if (has_value(exp->sla_max_stall_ms)) {
+          if (!want.empty()) want += "、";
+          want += "max_stall≤" + num_text(exp->sla_max_stall_ms, 0) + "ms";
+        }
+        if (exp->sla_stalls_max != UINT64_MAX) {
+          if (!want.empty()) want += "、";
+          want += "stalls≤" + std::to_string(exp->sla_stalls_max);
+        }
       }
       if (want.empty()) want = "有采样";
+      const std::string e2e_measured =
+          has_value(o.metrics.probe.e2e.p99)
+              ? ("，e2e lat_p99=" + num_text(o.metrics.probe.e2e.p99, 0) + "ms")
+              : ("，e2e=不可用" +
+                 (o.metrics.probe.unavailable_reason.empty()
+                      ? std::string()
+                      : "（" + o.metrics.probe.unavailable_reason + "）"));
       miss["SLA: 未达成（期望 " + want + "；实测 fps=" + num_text(o.metrics.fps, 1) +
-           "，dropped(窗口)=" + std::to_string(o.metrics.dropped) + "）"]++;
+           "，dropped(窗口)=" + std::to_string(o.metrics.dropped) + e2e_measured + "）"]++;
     }
   }
   for (const auto& [k2, v] : miss) {
@@ -2011,6 +2367,41 @@ std::string Engine::render_markdown(const RunReport& r) const {
   }
   o << "\n";
 
+  // 端到端前后对比：这是 T-03 要的那张表。三列窗口的定义写在表头下的说明里，
+  // 因为「注入前」在 Process 后端通常不存在（故障随 cued 启动即生效），只给 before/after
+  // 会让读者以为数据缺了一半。
+  o << "## 端到端指标前后对比\n\n";
+  o << "> 数据源：" << md_escape(r.probe_source)
+    << "。端到端 = probe 收帧时刻（换算到 cued 时钟域）− 帧 PTS；只有探针样本能证明它，"
+       "cued 的 fps / 六段分位**不参与**这一节。\n";
+  o << "> 窗口：注入前 = 故障注入之前；故障窗口 = 注入后、修复前的 agent 观察期；"
+       "修复后 = harness 在 agent 结束后重测的窗口。单位 ms，`null` = 该窗口没有探针样本"
+       "（不是 0）。\n";
+  // run 级汇总放在这一节（而不是塞进"分层成功率"表）：那张表是成功率口径，
+  // 混入延迟数字会让控制台的 rate 面板把它当成一项"成功率"。
+  o << "\n- 端到端 p99 修复前（各 case 中位）: " << e2e_text(r.p99_ms_before) << "\n";
+  o << "- 端到端 p99 修复后（各 case 中位）: " << e2e_text(r.p99_ms_after) << "\n";
+  if (!r.e2e_null_reason.empty()) {
+    o << "- null 原因: " << md_escape(r.e2e_null_reason) << "\n";
+  }
+  o << "\n";
+  o << "| case | 注入前 p99 | 故障窗口 p99 | 修复后 p99 | 卡顿(窗口) | 最长卡顿 ms | 说明 |\n";
+  o << "|---|---|---|---|---|---|---|\n";
+  for (const auto& c : r.cases) {
+    if (!c.scored) {
+      o << "| " << md_escape(c.id)
+        << " | null | null | null | — | — | run_error: " << md_escape(short_text(c.error_kind))
+        << " |\n";
+      continue;
+    }
+    const auto& pr = c.metrics.probe;
+    o << "| " << md_escape(c.id) << " | " << e2e_text(c.p99_ms_before) << " | "
+      << e2e_text(c.p99_ms_fault) << " | " << e2e_text(c.p99_ms_after) << " | "
+      << (pr.samples > 0 ? std::to_string(pr.stalls) : std::string("null")) << " | "
+      << e2e_text(pr.max_stall_ms) << " | " << md_escape(c.e2e_null_reason) << " |\n";
+  }
+  o << "\n";
+
   o << "## 逐用例\n\n";
   o << "| case | root | evidence | sla | root_cause | turns | 成本¥ | fps | dropped(窗口) | MTTR s "
        "| decode p99 | op p99 | 采样 |\n";
@@ -2040,7 +2431,113 @@ std::string Engine::render_markdown(const RunReport& r) const {
        "dropped 取窗口增量而不是进程累计值（累计值随 cued 重启清零）。\n";
   o << "> 分位口径：数据源（cued 统计行）只采集 recv/buffer/decode/op/send 的部分分位，"
        "p95 与 encode 段写 n/a，不补 0。\n";
+  o << "> 端到端口径：`case.expect.sla` 的 lat_p50_ms / lat_p99_ms / max_stall_ms / stalls "
+       "由 harness 用探针（cue-probe）重测；探针不可用时该 case 记 "
+       "`run_error=probe_unavailable`，不会退回 cued 指标判分。\n";
+  o << "> 抖动缓冲段（buffer）目前为 null：cued 侧抖动缓冲尚未实现，接收端没有这一段可测。\n";
   return o.str();
+}
+
+std::string Engine::render_json(const RunReport& r) const {
+  // 与 render_markdown 同一份数据、同一套 null 口径：NaN（没测到）→ null，绝不写 0。
+  // 为什么单独给 report.json：report.md 是给人读的摘要，机器消费（回归脚本、看板）
+  // 需要稳定字段名，从 Markdown 里抠表格是注定要坏的耦合。
+  auto num = [](double v) { return has_value(v) ? json(v) : json(nullptr); };
+  auto lat = [&num](const Latency& l) {
+    return json{{"p50", num(l.p50)}, {"p95", num(l.p95)}, {"p99", num(l.p99)}};
+  };
+  json root{
+      {"run_id", r.run_id},
+      {"fatal_error", r.fatal_error.empty() ? json(nullptr) : json(r.fatal_error)},
+      {"suite", cfg_.suite_path},
+      {"agent_mode", cfg_.agent_mode},
+      {"llm_mode", cfg_.llm_mode},
+      {"repeat", r.repeat},
+      {"fingerprint", r.fingerprint},
+      {"cued_bin", cfg_.cued_bin},
+      {"planned", r.planned},
+      {"executed", r.executed},
+      {"scored", r.scored},
+      {"run_errors", r.run_errors},
+      {"gated", r.gated},
+      {"truncated", r.truncated},
+      {"root_rate", r.root_rate},
+      {"evidence_rate", r.evidence_rate},
+      {"sla_rate", r.sla_rate},
+      {"pass_k", r.pass_k},
+      {"cost_yuan", r.cost_yuan},
+      {"mttr_avg_s", num(r.mttr_avg_s)},
+      {"cassette_hits", r.cassette_hits},
+      {"cassette_misses", r.cassette_misses},
+      {"tool_hits", r.tool_hits},
+      {"tool_misses", r.tool_misses},
+      // 端到端前后对比（run 级中位）：null 时 e2e_null_reason 说明原因
+      {"p99_ms_before", num(r.p99_ms_before)},
+      {"p99_ms_after", num(r.p99_ms_after)},
+      {"e2e_null_reason", r.e2e_null_reason.empty() ? json(nullptr) : json(r.e2e_null_reason)},
+      {"probe_source", r.probe_source},
+      {"failure_modes", r.failure_modes},
+  };
+  json cases = json::array();
+  for (const auto& c : r.cases) {
+    json cj{
+        {"id", c.id},
+        {"scored", c.scored},
+        {"error_kind", c.error_kind},
+        {"turns", c.turns},
+        {"cost_yuan", c.cost_yuan},
+        {"root_cause", c.diagnosis.root_cause},
+        {"final_stage", c.final_stage},
+        {"final_fps", c.final_fps},
+        {"final_dropped", c.final_dropped},
+        {"final_samples", c.final_samples},
+        {"mttr_s", num(c.mttr_s)},
+        {"p99_ms_before", num(c.p99_ms_before)},
+        {"p99_ms_fault", num(c.p99_ms_fault)},
+        {"p99_ms_after", num(c.p99_ms_after)},
+        {"e2e_null_reason", c.e2e_null_reason.empty() ? json(nullptr) : json(c.e2e_null_reason)},
+    };
+    if (c.scored) {
+      cj["score"] = json{{"root", c.score.root},
+                         {"evidence", c.score.evidence},
+                         {"sla", c.score.sla}};
+    } else {
+      cj["score"] = nullptr;
+    }
+    cj["metrics"] = json{{"fps", c.metrics.fps},
+                         {"frames_in", c.metrics.frames_in},
+                         {"frames_out", c.metrics.frames_out},
+                         {"dropped", c.metrics.dropped},
+                         {"samples", c.metrics.samples},
+                         {"recv", lat(c.metrics.recv)},
+                         {"buffer", lat(c.metrics.buffer)},
+                         {"decode", lat(c.metrics.decode)},
+                         {"op", lat(c.metrics.op)},
+                         {"encode", lat(c.metrics.encode)},
+                         {"send", lat(c.metrics.send)}};
+    const auto& pr = c.metrics.probe;
+    cj["probe"] = json{{"alive", pr.alive},
+                       {"samples", pr.samples},
+                       {"fps", pr.fps},
+                       {"frames", pr.frames},
+                       {"decoded", pr.decoded},
+                       {"decode_errors", pr.decode_errors},
+                       {"stalls", pr.stalls},
+                       {"max_stall_ms", num(pr.max_stall_ms)},
+                       {"synced", pr.synced},
+                       {"offset_us", pr.offset_us},
+                       {"e2e", lat(pr.e2e)},
+                       {"recv_us", lat(pr.recv_us)},
+                       {"reassembly_us", lat(pr.reassembly_us)},
+                       {"buffer_us", lat(pr.buffer_us)},
+                       {"decode_us", lat(pr.decode_us)},
+                       {"unavailable_reason",
+                        pr.unavailable_reason.empty() ? json(nullptr)
+                                                      : json(pr.unavailable_reason)}};
+    cases.push_back(std::move(cj));
+  }
+  root["cases"] = std::move(cases);
+  return root.dump(2) + "\n";
 }
 
 RunReport Engine::run(const std::vector<Case>& cases) {

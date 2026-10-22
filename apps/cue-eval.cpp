@@ -39,7 +39,7 @@ int usage() {
       "cue-eval — Cue 评测 CLI\n"
       "\n"
       "  cue-eval --suite <path> [--mode scripted|real] [--repeat k] [--max-yuan N]\n"
-      "           [--out dir] [--warmup s] [--model name] [--cued path]\n"
+      "           [--out dir] [--warmup s] [--model name] [--cued path] [--probe path]\n"
       "           [--endpoint URL]\n"
       "           [--replay|--live] [--record] [--cassette-dir dir]\n"
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
@@ -50,6 +50,9 @@ int usage() {
       "  --record-tools DIR  把每个 case 的工具观测录到 DIR/<case_id>.tools.jsonl；\n"
   "  --replay-tools DIR  只回放该录制：不 spawn cued、不连 endpoint，miss 明确报错。\n"
   "                      两者互斥；--replay-tools 不能与 --endpoint 同时给。\n"
+      "  --probe path    cue-probe 二进制（默认与 --cued 同目录的 cue-probe）。探针由\n"
+      "                  harness 托管：起不来/没有样本时该 case 记 run_error=probe_unavailable，\n"
+      "                  端到端 SLA 绝不退回 cued 指标判分。\n"
   "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
       "  real 模式的 LLM 传输默认 replay：只读 cassette，零成本；缺录制直接报错\n"
       "  （run_error=cassette_miss，不静默走网络）。--live 才用真实网络（需 CUE_API_KEY /\n"
@@ -184,6 +187,8 @@ int main(int argc, char** argv) {
       cfg.model = next();
     } else if (a == "--cued") {
       cfg.cued_bin = next();
+    } else if (a == "--probe") {
+      cfg.probe_bin = next();
     } else if (a == "--endpoint") {
       cfg.endpoint = next();
       if (cfg.endpoint.rfind("http://", 0) != 0 && cfg.endpoint.rfind("https://", 0) != 0) {
@@ -382,6 +387,22 @@ int main(int argc, char** argv) {
     out.flush();
     if (!out) {
       std::fprintf(stderr, "写 %s 失败\n", report_path.c_str());
+      return 5;
+    }
+  }
+  // report.json：与 report.md 同一份数据（字段名稳定，给回归脚本/看板用）。
+  // 端到端字段没有样本时写 null + null 原因，不写 0。
+  const std::string json_path = cfg.out_dir + "/" + report.run_id + "/report.json";
+  {
+    std::ofstream out(json_path);
+    if (!out) {
+      std::fprintf(stderr, "无法写入 %s\n", json_path.c_str());
+      return 5;
+    }
+    out << engine.render_json(report);
+    out.flush();
+    if (!out) {
+      std::fprintf(stderr, "写 %s 失败\n", json_path.c_str());
       return 5;
     }
   }

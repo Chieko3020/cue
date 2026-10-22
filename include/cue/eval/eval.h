@@ -34,6 +34,29 @@ struct Latency {
   double p99 = kNoValue;
 };
 
+// 端到端观测（评测层视角的 POD）：由 src/eval/eval.cpp 从 pipeline::ProbeMetrics 转换，
+// eval.h 不认识 pipeline/ 的具体类型（SPEC §7.3 的分层约束：pipeline 的转换只在一处做）。
+// 与 Metrics 分开放在同一个字段里，是因为判分同时需要两侧：root/evidence 看 cued 工具面，
+// 端到端 SLA 只能看探针——混用就是拿服务端自报当端到端证据。
+struct ProbeSummary {
+  bool alive = false;
+  uint64_t samples = 0;  // 探针指标行数；0 = 端到端不可用
+  double fps = 0;
+  uint64_t frames = 0;
+  uint64_t decoded = 0;
+  uint64_t decode_errors = 0;
+  // 重测窗口内的卡顿增量（探针侧是进程累计值，跨窗口要差分；探针重启会清零，按 0 重计）
+  uint64_t stalls = 0;
+  double max_stall_ms = kNoValue;  // 窗口内最长卡顿（ms）；NaN = 无样本
+  Latency e2e;                     // 端到端 p50/p95/p99（ms）
+  // 四段分解（µs，只有 p50/p99 有值）；buffer 段在 cued 抖动缓冲实现前恒为 NaN
+  Latency recv_us, reassembly_us, buffer_us, decode_us;
+  bool synced = false;
+  int64_t offset_us = 0;
+  // 不可用原因（探针没起/起不来/没上报）。非空 = 端到端数据不存在，不是"读数为 0"。
+  std::string unavailable_reason;
+};
+
 // 六段延迟 + 帧统计的一次采样快照（评测层视角，字段与 pipeline 解耦）
 struct Metrics {
   double fps = 0;
@@ -51,6 +74,7 @@ struct Metrics {
   Latency send;
   int64_t updated_us = 0;
   uint64_t samples = 0;
+  ProbeSummary probe;  // 端到端（探针）读数，与上面 cued 侧的字段互不代替
 };
 
 struct Case {
@@ -104,6 +128,14 @@ struct Case {
   uint64_t sla_dropped_max = UINT64_MAX;
   // 帧完成率下限（frames_out / frames_in）；0 表示不检查
   double sla_frame_completion_min = 0.0;
+  // ---- 端到端 SLA（probe 侧；旧 suite 不写这些字段，行为完全不变）----
+  // NaN = 不检查。声明了就必须由探针样本证明：没有探针样本按"无法证明达成"判不达标，
+  // 绝不退回 cued 的 fps/分位（那是服务端自报，不是端到端）。
+  double sla_lat_p99_ms = kNoValue;
+  double sla_lat_p50_ms = kNoValue;
+  double sla_max_stall_ms = kNoValue;
+  // 窗口内允许的卡顿次数上限（UINT64_MAX = 不检查）
+  uint64_t sla_stalls_max = UINT64_MAX;
   // 该 case 只能人工复现（如 FEC 幽灵帧这类不在 agent 根因枚举内的问题）。
   // real 模式遇到时跳过并记 skipped，不计入成功率分母。
   bool manual_only = false;
@@ -137,6 +169,7 @@ Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<O
 // case 声明的管线档位（评测层 POD；real 模式由 eval.cpp 转成 pipeline::Config）
 struct PipelineConfig {
   std::string cued_bin;
+  std::string probe_bin;
   bool transcode = false;
   int width = 0;
   int height = 0;
@@ -175,6 +208,14 @@ struct CaseOutcome {
   // 六段分位与注入→达标耗时（报告 p50/p95/p99 与 MTTR 的数据源；取不到为 NaN）
   Metrics metrics;
   double mttr_s = kNoValue;
+  // 端到端 p99（ms）的前后对比：注入前窗口 / 故障窗口（注入后、修复前）/ 修复后窗口。
+  // 为什么三个都要：Process 后端的故障是随 cued 启动参数生效的，"注入前"窗口根本不存在，
+  // 只报 before/after 会让报告看起来缺一半数据；把故障窗口也留下才看得出"前后差多少"。
+  double p99_ms_before = kNoValue;
+  double p99_ms_fault = kNoValue;
+  double p99_ms_after = kNoValue;
+  // 上面三个里任何一个为 null 的原因（写进报告，不能只留 n/a 让人猜）
+  std::string e2e_null_reason;
   // agent 实际看到的观测（落进 state.jsonl，出争议时可离线复核证据是否成立）
   std::vector<Observation> observations;
   // replay 模式的 cassette 命中/未命中次数（miss 会变成 run_error=cassette_miss）
@@ -195,6 +236,9 @@ struct RunConfig {
   // M4b
   std::string resume_run_id;            // 非空 = 续跑该 run（复用已完成 case）
   std::string cued_bin = "./build/cued";
+  // cue-probe 二进制。空 = 自动取 cued 同目录的 cue-probe（--cued 换了目录时不会指错）。
+  // 探针由 harness 托管：它是端到端指标的唯一来源，没有它就不能判端到端 SLA。
+  std::string probe_bin;
   // M7 / AC-16：非空 = 被测管线是一个实现了 REST 控制协议的 HTTP 服务（例如
   // apps/cue-mock-svc.cpp），而不是本机子进程。空 = 现有子进程路径，行为完全不变。
   std::string endpoint;
@@ -244,6 +288,13 @@ struct RunReport {
   std::size_t tool_misses = 0;
   // 平均 MTTR（秒）：只统计「有 SLA 阈值且测到达标」的 case；取不到为 NaN
   double mttr_avg_s = kNoValue;
+  // run 级的端到端 p99 前后对比（各 case 的中位；NaN = 没有可用样本）
+  double p99_ms_before = kNoValue;
+  double p99_ms_after = kNoValue;
+  // 为 null 的原因（探针不可用 / 没有修复前窗口 / 该 suite 没声明端到端 SLA ...）
+  std::string e2e_null_reason;
+  // 端到端 SLA 判定用的是探针还是别的来源：报告里写清，避免把 cued 自报读成端到端
+  std::string probe_source = "none";
   std::vector<std::string> failure_modes;  // "root: 期望 X 实际 Y" 之类的聚合
 };
 
@@ -258,6 +309,9 @@ class Engine {
   explicit Engine(RunConfig cfg) : cfg_(std::move(cfg)) {}
   RunReport run(const std::vector<Case>& cases);
   std::string render_markdown(const RunReport& r) const;
+  // 机器可读的报告（report.json）：与 render_markdown 同一份数据，字段名稳定。
+  // 端到端字段没有样本时写 null 并带 null 原因，不写 0（0 是合法读数）。
+  std::string render_json(const RunReport& r) const;
   // 生效配置指纹：模式/repeat/成本闸门/模型/cued 二进制内容。
   // 不含它时「换 SUT、换 model、换 mode」指纹相同，续跑会跨配置复用缓存（实测）。
   std::string config_hash() const;

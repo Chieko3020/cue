@@ -55,6 +55,58 @@ Latency latency_from_json(const json& j) {
   return l;
 }
 
+// 端到端（探针）快照：NaN 一律落 null，回读还原 NaN。state.jsonl 是续跑的缓存，
+// 少了这一块，续跑出来的报告会缺少端到端字段（看起来"这次没测"）。
+json probe_to_json(const ProbeSummary& p) {
+  return json{{"alive", p.alive},
+              {"samples", p.samples},
+              {"fps", p.fps},
+              {"frames", p.frames},
+              {"decoded", p.decoded},
+              {"decode_errors", p.decode_errors},
+              {"stalls", p.stalls},
+              {"max_stall_ms", num_or_null(p.max_stall_ms)},
+              {"synced", p.synced},
+              {"offset_us", p.offset_us},
+              {"e2e", latency_to_json(p.e2e)},
+              {"recv_us", latency_to_json(p.recv_us)},
+              {"reassembly_us", latency_to_json(p.reassembly_us)},
+              {"buffer_us", latency_to_json(p.buffer_us)},
+              {"decode_us", latency_to_json(p.decode_us)},
+              {"unavailable_reason",
+               p.unavailable_reason.empty() ? json(nullptr) : json(p.unavailable_reason)}};
+}
+
+ProbeSummary probe_from_json(const json& j) {
+  ProbeSummary p;
+  if (!j.is_object()) return p;
+  p.alive = j.value("alive", false);
+  p.synced = j.value("synced", false);
+  p.fps = read_num(j, "fps", 0.0);
+  const auto u64 = [&j](const char* k) -> uint64_t {
+    if (!j.contains(k) || !j[k].is_number_integer()) return 0;
+    return j[k].get<uint64_t>();
+  };
+  p.samples = u64("samples");
+  p.frames = u64("frames");
+  p.decoded = u64("decoded");
+  p.decode_errors = u64("decode_errors");
+  p.stalls = u64("stalls");
+  p.max_stall_ms = read_num(j, "max_stall_ms", kNoValue);
+  if (j.contains("offset_us") && j["offset_us"].is_number_integer()) {
+    p.offset_us = j["offset_us"].get<int64_t>();
+  }
+  if (j.contains("e2e")) p.e2e = latency_from_json(j["e2e"]);
+  if (j.contains("recv_us")) p.recv_us = latency_from_json(j["recv_us"]);
+  if (j.contains("reassembly_us")) p.reassembly_us = latency_from_json(j["reassembly_us"]);
+  if (j.contains("buffer_us")) p.buffer_us = latency_from_json(j["buffer_us"]);
+  if (j.contains("decode_us")) p.decode_us = latency_from_json(j["decode_us"]);
+  if (j.contains("unavailable_reason") && j["unavailable_reason"].is_string()) {
+    p.unavailable_reason = j["unavailable_reason"].get<std::string>();
+  }
+  return p;
+}
+
 json metrics_to_json(const Metrics& m) {
   return json{{"fps", m.fps},
               {"frames_in", m.frames_in},
@@ -70,7 +122,8 @@ json metrics_to_json(const Metrics& m) {
               {"encode", latency_to_json(m.encode)},
               {"send", latency_to_json(m.send)},
               {"updated_us", m.updated_us},
-              {"samples", m.samples}};
+              {"samples", m.samples},
+              {"probe", probe_to_json(m.probe)}};
 }
 
 // 全字段 is_* 校验：state 行被手改/写坏时给结构化错误，而不是 nlohmann 类型异常
@@ -117,6 +170,7 @@ Metrics metrics_from_json(const json& j, std::string& err) {
   if (j.contains("op")) m.op = latency_from_json(j["op"]);
   if (j.contains("encode")) m.encode = latency_from_json(j["encode"]);
   if (j.contains("send")) m.send = latency_from_json(j["send"]);
+  if (j.contains("probe")) m.probe = probe_from_json(j["probe"]);
   return m;
 }
 
@@ -184,6 +238,11 @@ json outcome_to_json(const CaseOutcome& o) {
               {"final_samples", o.final_samples},
               {"metrics", metrics_to_json(o.metrics)},
               {"mttr_s", num_or_null(o.mttr_s)},
+              {"p99_ms_before", num_or_null(o.p99_ms_before)},
+              {"p99_ms_fault", num_or_null(o.p99_ms_fault)},
+              {"p99_ms_after", num_or_null(o.p99_ms_after)},
+              {"e2e_null_reason", o.e2e_null_reason.empty() ? json(nullptr)
+                                                            : json(o.e2e_null_reason)},
               {"cassette_hits", o.cassette_hits},
               {"cassette_misses", o.cassette_misses},
               {"observations", observations_to_json(o.observations)}};
@@ -252,6 +311,12 @@ std::expected<CaseOutcome, std::string> outcome_from_json(const json& j) {
       if (!merr.empty()) return std::unexpected(merr);
     }
     o.mttr_s = read_num(j, "mttr_s", kNoValue);
+    o.p99_ms_before = read_num(j, "p99_ms_before", kNoValue);
+    o.p99_ms_fault = read_num(j, "p99_ms_fault", kNoValue);
+    o.p99_ms_after = read_num(j, "p99_ms_after", kNoValue);
+    if (j.contains("e2e_null_reason") && j["e2e_null_reason"].is_string()) {
+      o.e2e_null_reason = j["e2e_null_reason"].get<std::string>();
+    }
     if (j.contains("observations") && j["observations"].is_array()) {
       for (const auto& x : j["observations"]) {
         if (!x.is_object()) continue;
