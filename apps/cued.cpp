@@ -372,6 +372,8 @@ struct Counters {
   // 迟到帧丢弃（实时流不追赶积压）。旧实现在编码器慢下来时会把 WS 上行积压一路读完，
   // 恢复后以 100+ fps 追帧，端到端延迟要好几秒才回来——实时流宁可丢帧也不排队。
   uint64_t ingress_late = 0;
+  // 关键帧请求的抑制计数（FR-PIPE.11）：冷却窗口内或同 frame_id 的重复请求只计数不落事件。
+  uint64_t kf_req_suppressed = 0;
   // 音频只计数：上行 type=0x02 的包被接收、被计数、出现在指标行里，但不进解码、
   // 不写下行。audio_decoded 恒 false 是这条链路的真实状态（原因见 METRICS 行的
   // audio_decode_reason 与处理分支处注释），不是没填的占位值。
@@ -674,6 +676,7 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
                                   : json(nullptr)},
          {"fb_rtt_ms", have_fb ? json(fb.rtt_ms.load(std::memory_order_relaxed)) : json(nullptr)},
          {"ingress_late", c.ingress_late},
+         {"kf_req_suppressed", c.kf_req_suppressed},
          {"audio_frames_in", c.audio_frames_in},
          {"audio_bytes_in", c.audio_bytes_in},
          {"audio_multi_frag", c.audio_multi_frag},
@@ -1509,6 +1512,16 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
     if (!send_settled) stage_push(5, cue::now_us() - t_send0);
   };
 
+  // 关键帧请求的冷却与在途合并状态（FR-PIPE.11）。必须在 for(;;) **外面**：
+  // 写在循环体内的话每个包都会重置，抑制等于没做。
+  // 每个会话一份（这个 for 循环就是一个会话的生命周期），两个设备互不影响。
+  // 500 ms 的取法：一次 NACK 往返通常 <50 ms，客户端丢包后连发几条是常态；
+  // 比这更密的请求只是同一件事的重复，落进事件流只会把控制台刷满。
+  constexpr int64_t kKeyframeReqCooldownUs = 500'000;
+  int64_t last_kf_req_us = 0;
+  uint32_t last_kf_req_frame = 0;
+  bool have_kf_req = false;
+
   for (;;) {
     beast::flat_buffer buf;
     ws.read(buf, ec);
@@ -1605,6 +1618,25 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
     if (h->type == static_cast<uint8_t>(cue::proto::MediaType::KeyframeReq)) {
       // 只落事件流（M5 控制台可见"谁在请求关键帧"），暂不强制下发：
       // 强制 IDR 是编码侧（浏览器）的职责，cued 没有编码控制权。
+      //
+      // 但**必须去重**（FR-PIPE.11）：丢包后客户端连发 KeyframeReq 是常态，
+      // 原样全落事件会让事件流被同一请求刷满，控制台上看到的是噪声而不是信号。
+      // 两种抑制：①冷却窗口内（距上次请求 < kKeyframeReqCooldownUs）；
+      //           ②同一 frame_id 的重复（在途合并——它请求的就是同一帧，合并成一次）。
+      const int64_t now_kf = cue::now_us();
+      const bool same_frame = have_kf_req && h->frame_id == last_kf_req_frame;
+      const bool cooling = have_kf_req && (now_kf - last_kf_req_us) < kKeyframeReqCooldownUs;
+      if (same_frame || cooling) {
+        ++c.kf_req_suppressed;
+        emit_event("keyframe.request_suppressed",
+                   json{{"stream_id", h->stream_id},
+                        {"frame_id", h->frame_id},
+                        {"reason", same_frame ? "same_frame" : "cooldown"}});
+        continue;
+      }
+      last_kf_req_us = now_kf;
+      last_kf_req_frame = h->frame_id;
+      have_kf_req = true;
       emit_event("keyframe.request", json{{"stream_id", h->stream_id},
                                           {"frame_id", h->frame_id},
                                           {"pts_us", h->pts_us}});
