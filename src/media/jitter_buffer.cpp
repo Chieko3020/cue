@@ -66,14 +66,14 @@ void JitterBuffer::count_hole(uint64_t pts_us) {
   window_skipped_ += static_cast<std::size_t>(holes);
 }
 
-void JitterBuffer::observe_arrival(uint64_t pts_us, int64_t now_us) {
+void JitterBuffer::observe_arrival(uint64_t pts_us, int64_t jitter_arrival_us) {
   if (have_last_pushed_) {
     const int64_t dpts = static_cast<int64_t>(pts_us) - static_cast<int64_t>(last_pushed_pts_);
     // 只吃「按网格到达」的样本：空洞处（dpts 是间隔的整数倍）的增量会把间隔估计越推越大，
     // 那样真实丢包会越来越难被判定成空洞（自我掩盖）。
     if (dpts > 0 && dpts <= (interval_est_us_ * 3) / 2) {
       interval_est_us_ = clamp_interval(interval_est_us_ + (dpts - interval_est_us_) / 16);
-      const int64_t darr = now_us - last_pushed_arrival_us_;
+      const int64_t darr = jitter_arrival_us - last_pushed_arrival_us_;
       // 只把「晚到」算成抖动，不看「早到」：
       //  · darr > dpts = 这一帧比上一帧更晚到（真实网络抖动/排队），缓冲能等后续帧对齐，有价值；
       //  · darr < dpts = 帧成批到达（发送端或上游积压后一次放出来），此时延迟已经发生且不可逆，
@@ -85,7 +85,7 @@ void JitterBuffer::observe_arrival(uint64_t pts_us, int64_t now_us) {
     }
   }
   last_pushed_pts_ = pts_us;
-  last_pushed_arrival_us_ = now_us;
+  last_pushed_arrival_us_ = jitter_arrival_us;
   have_last_pushed_ = true;
 }
 
@@ -213,7 +213,13 @@ std::vector<JitterFrame> JitterBuffer::push(JitterFrame frame, int64_t now_us) {
     return {};
   }
 
-  observe_arrival(frame.pts_us, now_us);
+  // 抖动估计用哪个时刻：见 JitterBasis 的注释。first_arrival_us 为 0（单分片帧、或调用方
+  // 没提供）时退回组装完成时刻——两者在这种情况下本来就相等，不会引入偏差。
+  const int64_t jitter_arrival =
+      (cfg_.basis == JitterBasis::FirstFragment && frame.first_arrival_us > 0)
+          ? frame.first_arrival_us
+          : now_us;
+  observe_arrival(frame.pts_us, jitter_arrival);
 
   // 插入位置：PTS 主序、到达次序次之。seq 单调递增，所以「插在第一个 PTS 更大的元素之前」
   // 天然把同 PTS 的帧按到达顺序排在后面。

@@ -588,6 +588,9 @@ int main(int argc, char** argv) {
   // 120 ms 的取法：本机往返 <1 ms、跨机局域网通常 <10 ms，留足余量但仍远小于
   // "追赶积压"造成的秒级延迟。设 0 = 关闭联动（退化成只等 budget）。
   long long nack_wait_ms = 120;
+  // 抖动估计的基准：first（默认，首片到达）| done（组装完成，本改动前行为）。
+  // 留 done 是为了能 A/B 量化"帧在途耗时污染抖动估计"的幅度。
+  std::string jitter_basis = "first";
   // 标称帧率只用于「卡顿阈值」的推断（阈值 = stall_factor × 1/fps），不是测量值。
   // 30 是这个项目的默认推流帧率（cued 的 --fps 默认 30）。
   long long nominal_fps = 30;
@@ -653,6 +656,10 @@ int main(int argc, char** argv) {
     } else if (a == "--nack-delay-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 5000, nack_delay_ms)) bad(a, val);
+    } else if (a == "--jitter-basis") {
+      const auto val = next();
+      if (val != "first" && val != "done") bad(a, val);
+      jitter_basis = std::string(val);
     } else if (a == "--nack-wait-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 2000, nack_wait_ms)) bad(a, val);
@@ -662,7 +669,8 @@ int main(int argc, char** argv) {
     } else if (a == "--help") {
       std::printf(
           "cue-probe --port 9001 [--bind 0.0.0.0] [--nack on|off] [--nack-delay-ms 15]\n"
-          "          [--nack-interval-ms 125] [--nack-wait-ms 120] [--fps 30] [--stall-factor 1.5]\n"
+          "          [--nack-interval-ms 125] [--nack-wait-ms 120] [--jitter-basis first|done]\n"
+          "          [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..3]\n"
           "          [--report-addrs host:port[,host:port]]\n"
@@ -694,6 +702,8 @@ int main(int argc, char** argv) {
   jb_cfg.nominal_interval_us = frame_interval_us;
   jb_cfg.budget_us = jitter_budget_ms * 1000;
   jb_cfg.nack_wait_us = nack_wait_ms * 1000;  // 0 = 不联动（只有 budget 生效）
+  jb_cfg.basis = (jitter_basis == "done") ? cue::media::JitterBasis::AssemblyDone
+                                          : cue::media::JitterBasis::FirstFragment;  // 0 = 不联动（只有 budget 生效）
 
   net::io_context ioc;
   boost::system::error_code ec;
@@ -1052,6 +1062,10 @@ int main(int argc, char** argv) {
     jf.frame_id = fid;
     jf.frag_count = fa.count;
     jf.codec = fa.codec;
+    // 抖动基准（见 JitterBasis）：首片到达时刻，不是 now_done。
+    // now_done 含"整帧在途耗时 ≈ 帧字节数/带宽"，那是吞吐伪影；IDR 帧是 P 帧的十几倍大，
+    // 用 now_done 会让每个 GOP 都把抖动估计顶穿。reassembly 段已经把这段单独度量了。
+    jf.first_arrival_us = fa.first_seen_us;
     jf.payload = assemble(fa);
     pending.erase(fid);
     for (const auto& ready : jb.push(std::move(jf), now_done)) deliver(ready);
@@ -1279,6 +1293,11 @@ int main(int argc, char** argv) {
           // jb_skipped/jb_late 是累计计数。深度本身进 jb_depth。
           {"jb_depth", jb.stats().depth},
           {"jb_level", jb.stats().level},
+          // 抖动估计本身必须可观测：否则"基准点用错"这种问题没有证据可查。
+          // 单位是帧间隔（1.0 = 半个档位），与 jitter_up_frames 同量纲。
+          {"jb_jitter_frames", jb.stats().jitter_frames},
+          {"jb_loss_rate", jb.stats().loss_rate},
+          {"jb_basis", jitter_basis == "done" ? "assembly_done" : "first_fragment"},
           {"jb_switches", jb.stats().switches},
           {"jb_target_frames", jb.stats().target_frames},
           {"jb_skipped", jb.stats().skipped},

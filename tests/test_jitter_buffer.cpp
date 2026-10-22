@@ -264,6 +264,40 @@ int main() {
     }
   }
 
+  // ---------------------------------------------------------------- 4c) 抖动基准
+  // 组装完成时刻里混着"整帧在途耗时 ≈ 帧字节数/带宽"。IDR 帧是 P 帧的十几倍大，
+  // 于是每次 IDR 都会让组装完成时刻突然后移一大截——那是吞吐伪影，不是网络抖动。
+  // 这里用「首片准点、组装完成在第 4 帧阶跃 200 ms」复现它：
+  //  · AssemblyDone：这次阶跃被算成抖动（jitter_frames 抬起来）
+  //  · FirstFragment：首片一直准点，抖动估计应该接近 0
+  {
+    auto run = [](cue::media::JitterBasis basis) {
+      JitterBufferConfig c;
+      c.target_frames = 1;      // 零驻留，放行不干扰观察
+      c.adaptive = true;        // jitter_frames 只在 adaptive 下结算
+      c.min_level = 0;
+      c.max_level = 0;          // 档位锁死，只看抖动统计
+      c.window_frames = 3;
+      c.nominal_interval_us = kInterval;
+      c.basis = basis;
+      JitterBuffer jb(c);
+      for (int i = 0; i < 9; ++i) {
+        JitterFrame f;
+        f.pts_us = static_cast<uint64_t>(i) * kInterval;
+        f.first_arrival_us = static_cast<int64_t>(i) * kInterval;  // 首片始终准点
+        const int64_t assembly_delay = (i >= 4) ? 200'000 : 0;     // 第 4 帧起组装晚 200 ms
+        jb.push(std::move(f), static_cast<int64_t>(i) * kInterval + assembly_delay);
+      }
+      return jb.stats().jitter_frames;
+    };
+
+    const double j_first = run(cue::media::JitterBasis::FirstFragment);
+    const double j_done = run(cue::media::JitterBasis::AssemblyDone);
+    check(j_first < 0.1, "抖动基准：首片准点时，组装阶跃不该被算成抖动");
+    check(j_done > 1.0, "抖动基准：用组装完成时刻时，同一次阶跃被算成抖动（这就是污染）");
+    check(j_done > j_first, "抖动基准：两种基准的结论必须不同，否则开关没接线");
+  }
+
   // ---------------------------------------------------------------- 5) 关键帧保护
   // 队列超容量时必须挤掉非关键帧，而不是把 IDR 扔掉——IDR 一丢，后面整个 GOP 的 P 帧全废。
   {

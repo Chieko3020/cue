@@ -47,10 +47,24 @@ struct JitterFrame {
   uint8_t codec = 0;         // 下行 codec 标记（probe 侧据此决定解不解）
   std::vector<uint8_t> payload;
 
+  // 首片到达时刻（**调用方填**）。抖动的测量基准必须是它，而不是"组装完成"：
+  // 组装完成时刻里混进了"整帧在途耗时 ≈ 帧字节数 ÷ 带宽"，而帧大小是自己的编码参数
+  // 决定的，与网络质量无关。IDR 帧是 P 帧的 10~20 倍大，用组装完成时刻会让每个 GOP
+  // 都把抖动估计顶穿到最高档——档位跟着 GOP 周期锯齿，而不是跟着网络质量。
+  // 0 = 调用方没提供（例如单分片帧），退回用组装完成时刻。
+  int64_t first_arrival_us = 0;
+
   // 下面两个字段由 JitterBuffer 填写，调用方只读：
-  int64_t arrival_us = 0;  // 进队时刻（调用方的单调时钟）
+  int64_t arrival_us = 0;  // 进队（= 组装完成）时刻（调用方的单调时钟）
   int64_t wait_us = 0;     // 实际等待时长 = 放行时刻 − arrival_us（buffer 段埋点的值）
 };
+
+// 抖动的测量基准。
+//  · FirstFragment（默认）：用首片到达时刻。衡量的是"包进入网络后多久到达"，
+//    这才是 transit time variation 的定义；
+//  · AssemblyDone：用组装完成时刻（本改动前的行为）。它把"整帧在途耗时"也算进来，
+//    在低带宽 / 大 IDR 帧的链路上会系统性高估抖动。留这个选项是为了能 A/B 量化污染。
+enum class JitterBasis { FirstFragment, AssemblyDone };
 
 struct JitterBufferConfig {
   // 关掉时 push 原样立即放行（wait_us=0）。给 A/B 对比与"抖动缓冲是否值得"留出开关，
@@ -68,6 +82,10 @@ struct JitterBufferConfig {
 
   // 标称帧间隔（µs），hold 与空洞判定的起点；之后由 PTS 增量的 EWMA 慢慢跟踪真实帧率。
   int64_t nominal_interval_us = 33'333;
+
+  // 抖动估计的基准（只影响 observe_arrival / 升降档；wait_us 与 hold 恒用组装完成时刻，
+  // 因为"帧没齐就是不可用"这件事与抖动是两回事）。
+  JitterBasis basis = JitterBasis::FirstFragment;
 
   // ---- 与 NACK 联动（FR-PROBE.2 / FR-PROBE.4 的交界处）----
   // 空洞时默认只等 budget_us 就放弃。但若那个缺失的帧**正在被重传**，多等一次 RTT
