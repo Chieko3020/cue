@@ -271,15 +271,6 @@ std::string e2e_text(double v, int prec = 1) {
   return o.str();
 }
 
-std::string short_list(const std::vector<std::string>& v) {
-  std::string out;
-  for (std::size_t i = 0; i < v.size(); ++i) {
-    if (i != 0) out += "/";
-    out += v[i];
-  }
-  return out.empty() ? "（未声明）" : out;
-}
-
 double median(std::vector<double> v) {
   if (v.empty()) return kNoValue;
   std::sort(v.begin(), v.end());
@@ -2123,8 +2114,6 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   std::printf("[eval] run_id=%s state=%s fingerprint=%s\n", r.run_id.c_str(), state_path.c_str(),
               r.fingerprint.c_str());
 
-  std::map<std::string, const Case*> by_id;
-  for (const auto& c : cases) by_id[c.id] = &c;
   std::map<std::string, int> pass_count;   // case_id -> 全成功次数
   std::map<std::string, int> attempt_count;
   bool stop = false;
@@ -2136,14 +2125,14 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
     for (int k = 0; k < cfg_.repeat; ++k) {
       if (cancelled()) {
         r.gated = true;
-        r.failure_modes.push_back("cancel: 收到 SIGINT/SIGTERM，停止后续 case（已完成部分已落盘）");
+        r.run_notes.push_back("cancel: 收到 SIGINT/SIGTERM，停止后续 case（已完成部分已落盘）");
         stop = true;
         break;
       }
       // manual_only：不在 agent 根因枚举内、只能人工复现的 case，real 模式直接跳过，
       // 不进入成功率分母（否则会被当成"答错"污染统计）
       if (c.manual_only && cfg_.agent_mode == "real") {
-        if (k == 0) r.failure_modes.push_back("skipped manual_only: " + c.id);
+        if (k == 0) r.run_notes.push_back("skipped manual_only: " + c.id);
         ++skipped_manual;
         continue;
       }
@@ -2164,9 +2153,11 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
         if (auto w = append_state(state_path, static_cast<int>(ci), k, o, fp); !w) {
           // state 写失败必须显式记账：静默丢行会让"续跑不重复计费"失效（P2#28）
           ++r.io_errors;
-          r.failure_modes.push_back("state 写入失败：" + w.error());
+          r.run_notes.push_back("state 写入失败：" + w.error());
         }
       }
+      // 轮次只在这里赋值：复用缓存时 outcome 来自 state，里面没有轮次（stability 需要它）
+      o.attempt = k;
       ++r.executed;
 
       r.cost_yuan += o.cost_yuan;
@@ -2179,7 +2170,7 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
       r.cases.push_back(std::move(o));
 
       if (r.cost_yuan > cfg_.max_yuan) {
-        r.failure_modes.push_back("cost gate triggered at " + std::to_string(r.cost_yuan));
+        r.run_notes.push_back("cost gate triggered at " + std::to_string(r.cost_yuan));
         r.gated = true;
         stop = true;
         break;
@@ -2189,15 +2180,14 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   // 截断 = 闸门/取消导致没跑完计划数（manual_only 跳过不算截断）
   r.truncated = cancelled() || (r.executed + skipped_manual < r.planned);
   if (r.truncated) {
-    r.failure_modes.push_back("truncated: 计划 " + std::to_string(r.planned) + " 次，实际执行 " +
-                              std::to_string(r.executed) + " 次");
+    r.run_notes.push_back("truncated: 计划 " + std::to_string(r.planned) + " 次，实际执行 " +
+                          std::to_string(r.executed) + " 次");
   }
 
   // 汇总
   for (const auto& o : r.cases) {
     if (!o.scored) {
       ++r.run_errors;
-      r.failure_modes.push_back("run_error[" + o.id + "]: " + short_text(o.error_kind));
       continue;
     }
     ++r.scored;
@@ -2258,61 +2248,130 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
     }
   }
 
-  // 失败模式聚合：必须写清"期望 vs 实际"，否则 `root != <实际值>` 无法定位（P3#32）
-  std::map<std::string, int> miss;
-  for (const auto& o : r.cases) {
-    if (!o.scored) continue;
-    const Case* exp = nullptr;
+  // 失败模式分布（§8.4）：按 expect.root_cause 归组。运行状态已经进 run_notes，
+  // 这里只剩"哪一类根因判分没命中"，与"这次 run 有没有跑完"是两件事。
+  r.failure_modes = summarize_failure_modes(cases, r.cases);
+  // 稳定性（§8.4）：按 repeat 轮聚合三级率与逐轮通过率；少于 2 轮有样本时
+  // informative()=false，报告里必须标注"无稳定性信息"，不能让 0 方差看起来像"很稳"。
+  r.stability = compute_stability(r.cases, cfg_.repeat);
+}
+
+std::vector<FailureMode> summarize_failure_modes(const std::vector<Case>& cases,
+                                                 const std::vector<CaseOutcome>& outcomes) {
+  std::map<std::string, const Case*> by_id;
+  for (const auto& c : cases) by_id[c.id] = &c;
+
+  struct Acc {
+    int miss = 0;
+    std::vector<std::string> examples;
+  };
+  std::map<std::string, Acc> groups;
+
+  const auto add_example = [](Acc& a, const std::string& ex) {
+    if (a.examples.size() < kMaxFailureExamples) a.examples.push_back(ex);
+  };
+
+  for (const auto& o : outcomes) {
+    if (!o.scored) {
+      // run_error = 没有判分结果，不是"答错"。单独一组，语义上不能并进某个根因。
+      auto& a = groups[kRunErrorGroup];
+      ++a.miss;
+      add_example(a, o.id + "(run_error)");
+      continue;
+    }
+    std::vector<std::string> layers;
+    if (!o.score.root) layers.push_back("root");
+    if (!o.score.evidence) layers.push_back("evidence");
+    if (!o.score.sla) layers.push_back("sla");
+    // 三维全中 = 这一条没过判分；一次尝试只计 1 次 miss（不是按层计 3 次）：
+    // 失败模式分布问的是"这类故障失败了几次"，按层计数会让失败率超过尝试数。
+    if (layers.empty()) continue;
     const auto it = by_id.find(o.id);
-    if (it != by_id.end()) exp = it->second;
-    if (!o.score.root) {
-      miss["root: 期望 " + (exp ? exp->expect_root_cause : std::string("?")) + "，实际 " +
-           (o.diagnosis.root_cause.empty() ? std::string("（空）") : o.diagnosis.root_cause)]++;
-    }
-    if (!o.score.evidence) {
-      miss["evidence: 未在真实观测里成立（候选 " +
-           (exp ? short_list(exp->evidence_candidates) : std::string("?")) + "）"]++;
-    }
-    if (!o.score.sla) {
-      std::string want;
-      if (exp) {
-        if (exp->sla_fps_min > 0) want += "fps≥" + num_text(exp->sla_fps_min, 1);
-        if (exp->sla_dropped_max != UINT64_MAX) {
-          if (!want.empty()) want += "、";
-          want += "dropped≤" + std::to_string(exp->sla_dropped_max);
-        }
-        if (has_value(exp->sla_lat_p99_ms)) {
-          if (!want.empty()) want += "、";
-          want += "lat_p99≤" + num_text(exp->sla_lat_p99_ms, 0) + "ms";
-        }
-        if (has_value(exp->sla_lat_p50_ms)) {
-          if (!want.empty()) want += "、";
-          want += "lat_p50≤" + num_text(exp->sla_lat_p50_ms, 0) + "ms";
-        }
-        if (has_value(exp->sla_max_stall_ms)) {
-          if (!want.empty()) want += "、";
-          want += "max_stall≤" + num_text(exp->sla_max_stall_ms, 0) + "ms";
-        }
-        if (exp->sla_stalls_max != UINT64_MAX) {
-          if (!want.empty()) want += "、";
-          want += "stalls≤" + std::to_string(exp->sla_stalls_max);
-        }
-      }
-      if (want.empty()) want = "有采样";
-      const std::string e2e_measured =
-          has_value(o.metrics.probe.e2e.p99)
-              ? ("，e2e lat_p99=" + num_text(o.metrics.probe.e2e.p99, 0) + "ms")
-              : ("，e2e=不可用" +
-                 (o.metrics.probe.unavailable_reason.empty()
-                      ? std::string()
-                      : "（" + o.metrics.probe.unavailable_reason + "）"));
-      miss["SLA: 未达成（期望 " + want + "；实测 fps=" + num_text(o.metrics.fps, 1) +
-           "，dropped(窗口)=" + std::to_string(o.metrics.dropped) + e2e_measured + "）"]++;
-    }
+    const std::string key = (it != by_id.end() && !it->second->expect_root_cause.empty())
+                                ? it->second->expect_root_cause
+                                : std::string(kUnknownRootGroup);
+    auto& a = groups[key];
+    ++a.miss;
+    std::string ex = o.id + "(";
+    for (std::size_t i = 0; i < layers.size(); ++i) ex += (i == 0 ? "" : ",") + layers[i];
+    ex += ")";
+    add_example(a, ex);
   }
-  for (const auto& [k2, v] : miss) {
-    if (v > 0) r.failure_modes.push_back(k2 + " (" + std::to_string(v) + " 次)");
+
+  std::vector<FailureMode> out;
+  for (auto& [root, a] : groups) {
+    FailureMode fm;
+    fm.root_cause = root;
+    fm.miss_count = a.miss;
+    fm.examples = std::move(a.examples);
+    out.push_back(std::move(fm));
   }
+  // 降序：报告 TOP3 与 JSON 都按这个顺序读，出现并列时按根因名字稳定排序
+  std::sort(out.begin(), out.end(), [](const FailureMode& x, const FailureMode& y) {
+    if (x.miss_count != y.miss_count) return x.miss_count > y.miss_count;
+    return x.root_cause < y.root_cause;
+  });
+  return out;
+}
+
+Stability compute_stability(const std::vector<CaseOutcome>& outcomes, int repeat) {
+  Stability s;
+  s.repeat = repeat > 0 ? repeat : 1;
+
+  struct Round {
+    int scored = 0;
+    int root = 0, evidence = 0, sla = 0, all = 0;
+  };
+  std::map<int, Round> rounds;
+  for (const auto& o : outcomes) {
+    if (!o.scored) continue;  // run_error 不计入分母，也不占轮次样本
+    auto& rd = rounds[o.attempt];
+    ++rd.scored;
+    if (o.score.root) ++rd.root;
+    if (o.score.evidence) ++rd.evidence;
+    if (o.score.sla) ++rd.sla;
+    if (o.score.all()) ++rd.all;
+  }
+
+  // 每一轮一个率；没有 scored 样本的轮（整轮 run_error / 被截断）不计入，
+  // 否则会把"没测到"当成"0% 通过"，与不拿 0 冒充实测值的口径矛盾。
+  std::vector<double> root, evidence, sla, pass;
+  for (const auto& [k, rd] : rounds) {
+    (void)k;
+    if (rd.scored == 0) continue;
+    const double n = double(rd.scored);
+    root.push_back(double(rd.root) / n);
+    evidence.push_back(double(rd.evidence) / n);
+    sla.push_back(double(rd.sla) / n);
+    pass.push_back(double(rd.all) / n);
+  }
+
+  // 总体标准差（除以 n）：本轮这几轮就是全部观测，不做总体推断；repeat=3 时除以 n-1
+  // 会把离散度放大 1.41 倍，读起来比实际抖。repeat=1 时 n=1 → stddev 恒为 0。
+  const auto stats = [](const std::vector<double>& v) {
+    StabilityStats st;
+    if (v.empty()) return st;  // 全 NaN：没有跨轮样本
+    double sum = 0, lo = v[0], hi = v[0];
+    for (double x : v) {
+      sum += x;
+      lo = std::min(lo, x);
+      hi = std::max(hi, x);
+    }
+    const double mean = sum / double(v.size());
+    double var = 0;
+    for (double x : v) var += (x - mean) * (x - mean);
+    st.mean = mean;
+    st.stddev = std::sqrt(var / double(v.size()));
+    st.min = lo;
+    st.max = hi;
+    return st;
+  };
+  s.rounds = static_cast<int>(root.size());
+  s.root_rate = stats(root);
+  s.evidence_rate = stats(evidence);
+  s.sla_rate = stats(sla);
+  s.pass_k = stats(pass);
+  return s;
 }
 
 std::string Engine::render_markdown(const RunReport& r) const {
@@ -2380,6 +2439,30 @@ std::string Engine::render_markdown(const RunReport& r) const {
   }
   o << "| 平均 MTTR | " << (has_value(r.mttr_avg_s) ? num_text(r.mttr_avg_s, 2) + " s" : "n/a")
     << " |\n\n";
+
+  // 稳定性（§8.4）：repeat>1 时给每级的 mean/stddev/min/max；repeat=1 时必须明说
+  // "无稳定性信息"——1 次运行的 stddev 恒为 0，那个 0 不是"稳定"，是"没测"。
+  {
+    const auto& st = r.stability;
+    o << "- 稳定性: repeat=" << st.repeat;
+    if (!st.informative()) {
+      o << "，**无稳定性信息**（只有 " << st.rounds
+        << " 轮有可计分样本，跨轮离散度不存在；stddev 记 0 不代表稳定）\n";
+    } else {
+      const auto stat_text = [](const StabilityStats& s2) {
+        if (!has_value(s2.mean)) return std::string("n/a（该轮没有可计分样本）");
+        return "mean " + num_text(s2.mean, 3) + "，stddev " + num_text(s2.stddev, 3) + "，min " +
+               num_text(s2.min, 3) + "，max " + num_text(s2.max, 3);
+      };
+      o << "（总体标准差 = 除以轮数 n，不是样本标准差的 n−1）\n";
+      o << "  - root_rate: " << stat_text(st.root_rate) << "\n";
+      o << "  - evidence_rate: " << stat_text(st.evidence_rate) << "\n";
+      o << "  - sla_rate: " << stat_text(st.sla_rate) << "\n";
+      o << "  - 逐轮通过率（该轮三级全过的 case 占比；与 pass^" << r.repeat
+        << " 不是同一个量）: " << stat_text(st.pass_k) << "\n";
+    }
+    o << "\n";
+  }
 
   // 六段延迟分位（各 case 中位；数据源没有的段写 n/a）
   struct SegRow {
@@ -2458,9 +2541,74 @@ std::string Engine::render_markdown(const RunReport& r) const {
       << num_text(c.metrics.decode.p99) << " | " << num_text(c.metrics.op.p99) << " | "
       << c.metrics.samples << " |\n";
   }
-  if (!r.failure_modes.empty()) {
-    o << "\n## 失败模式\n\n";
-    for (const auto& f : r.failure_modes) o << "- " << f << "\n";
+  // 失败模式 TOP3（§8.9 ③）：按 miss_count 降序取前三，每类附 examples 里的 1 个具体 case。
+  // 运行状态（run_notes）在下面单独列：把"这次没跑完"混进失败分布，图会看起来像模型答错。
+  o << "\n## 失败模式 TOP3\n\n";
+  o << "> 口径：一次 case 尝试里 root / evidence / sla 任一未命中即计 1 次 miss"
+       "（三维全中不计；一次尝试只计 1，不按层计 3 次），按 case 的 `expect.root_cause` 归组；"
+       "`__run__` = 没有判分结果（run_error），它不是答错，单列以便与判分未命中区分。"
+       "examples 括号内是该次尝试未命中的层。\n\n";
+  if (r.failure_modes.empty()) {
+    o << "本次没有判分未命中，也没有 run_error：失败模式为空。\n";
+  } else {
+    const std::size_t top = std::min<std::size_t>(3, r.failure_modes.size());
+    o << "| # | 根因 | miss | 例子 |\n|---|---|---|---|\n";
+    for (std::size_t i = 0; i < top; ++i) {
+      const auto& f = r.failure_modes[i];
+      std::string name = f.root_cause.empty() ? std::string(kRunErrorGroup) : f.root_cause;
+      if (name == kRunErrorGroup) name += "（运行错误，未判分）";
+      const std::string ex = f.examples.empty() ? std::string("—") : f.examples.front();
+      o << "| " << (i + 1) << " | " << md_escape(name) << " | " << f.miss_count << " | `"
+        << md_escape(ex) << "` |\n";
+    }
+    if (r.failure_modes.size() > top) {
+      o << "\n共 " << r.failure_modes.size() << " 类失败模式，此处只列前 " << top
+        << " 类（完整分布见 report.json 的 `failure_modes`）。\n";
+    }
+  }
+  if (!r.run_notes.empty()) {
+    o << "\n**运行状态备注（不是失败模式，不计入上面任何一类）**：\n\n";
+    for (const auto& n : r.run_notes) o << "- " << md_escape(n) << "\n";
+  }
+
+  // 回归清单（§8.9 ④）：没有 baseline 时明确写"跳过"，不留空小节——
+  // 空小节会被读成"没有回归"，而实际是"没比过"。
+  o << "\n## 回归清单\n\n";
+  const auto& g = r.regression;
+  if (!g.present) {
+    o << "本次没有 baseline，跳过（同一个 suite 只跑过这一次时属正常）；"
+         "要对比可加 `--baseline <run_id>` 指定对照 run，或先跑一次同 suite 的 run。\n";
+  } else {
+    o << "> baseline: `" << g.baseline_run_id << "`（来源："
+      << (g.source == "explicit" ? "显式 `--baseline`" : "自动发现上次同 suite / mode / repeat 的 run")
+      << "）\n";
+    o << "> 口径：run_error 不是失败，单列「不可判定」不计入新增失败；"
+         "指纹/suite/mode/repeat 不同时差异不可归因，先对齐配置再比。\n";
+    if (!g.comparable) {
+      o << "\n> **两次 run 不可比**：差异不能归因于被测对象的改动。\n";
+      for (const auto& w : g.warnings) o << "> - " << md_escape(w) << "\n";
+    }
+    o << "\n- 新增失败 " << g.new_failures.size() << "，已修复 " << g.fixed.size() << "，仍失败 "
+      << g.still_failing.size() << "，仍通过 " << g.still_passing << "，不可判定 " << g.inconclusive;
+    if (g.only_a > 0 || g.only_b > 0) {
+      o << "，仅 baseline 有 " << g.only_a << "，仅本次有 " << g.only_b;
+    }
+    o << "\n";
+    const auto list = [&o](const char* title, const std::vector<RegressionEntry>& v) {
+      if (v.empty()) return;
+      o << "\n### " << title << "\n\n";
+      for (const auto& e : v) o << "- `" << md_escape(e.id) << "`：" << md_escape(e.detail) << "\n";
+    };
+    list("新增失败（回归）", g.new_failures);
+    list("已修复", g.fixed);
+    list("仍失败", g.still_failing);
+    if (g.new_failures.empty() && g.fixed.empty() && g.still_failing.empty()) {
+      o << "\n本次相对 baseline 没有新增失败、没有已修复、没有仍失败。\n";
+    }
+    if (g.only_a > 0 || g.only_b > 0) {
+      o << "\n> case 集有变动（仅 baseline 有 " << g.only_a << "，仅本次有 " << g.only_b
+        << "）：suite 改名/增删会让公共部分的 diff 失去意义。\n";
+    }
   }
   o << "\n> 说明：延迟与成功率均为本机实测；跨机场景下的端到端延迟为相对量，不含最小网络传播时间。\n";
   o << "> 判分口径：SLA 由 harness 在 agent 结束后重测（不采信 agent 自报）；"
@@ -2484,6 +2632,42 @@ std::string Engine::render_json(const RunReport& r) const {
   auto lat = [&num](const Latency& l) {
     return json{{"p50", num(l.p50)}, {"p95", num(l.p95)}, {"p99", num(l.p99)}};
   };
+  const auto stat_json = [&num](const StabilityStats& s) {
+    return json{{"mean", num(s.mean)},
+                {"stddev", num(s.stddev)},
+                {"min", num(s.min)},
+                {"max", num(s.max)}};
+  };
+  // 失败模式：对象数组（§8.4），不再是字符串数组——字符串数组没法机器消费。
+  json failure_modes = json::array();
+  for (const auto& f : r.failure_modes) {
+    failure_modes.push_back(json{{"root_cause", f.root_cause},
+                                 {"miss_count", f.miss_count},
+                                 {"examples", f.examples}});
+  }
+  json regression = json{{"present", r.regression.present},
+                         {"baseline_run_id",
+                          r.regression.baseline_run_id.empty() ? json(nullptr)
+                                                               : json(r.regression.baseline_run_id)},
+                         {"source", r.regression.source},
+                         {"comparable", r.regression.comparable},
+                         {"warnings", r.regression.warnings},
+                         {"new_failures", json::array()},
+                         {"fixed", json::array()},
+                         {"still_failing", json::array()},
+                         {"still_passing", r.regression.still_passing},
+                         {"inconclusive", r.regression.inconclusive},
+                         {"only_a", r.regression.only_a},
+                         {"only_b", r.regression.only_b}};
+  for (const auto& e : r.regression.new_failures) {
+    regression["new_failures"].push_back(json{{"id", e.id}, {"detail", e.detail}});
+  }
+  for (const auto& e : r.regression.fixed) {
+    regression["fixed"].push_back(json{{"id", e.id}, {"detail", e.detail}});
+  }
+  for (const auto& e : r.regression.still_failing) {
+    regression["still_failing"].push_back(json{{"id", e.id}, {"detail", e.detail}});
+  }
   json root{
       {"run_id", r.run_id},
       {"fatal_error", r.fatal_error.empty() ? json(nullptr) : json(r.fatal_error)},
@@ -2514,7 +2698,20 @@ std::string Engine::render_json(const RunReport& r) const {
       {"p99_ms_after", num(r.p99_ms_after)},
       {"e2e_null_reason", r.e2e_null_reason.empty() ? json(nullptr) : json(r.e2e_null_reason)},
       {"probe_source", r.probe_source},
-      {"failure_modes", r.failure_modes},
+      // 稳定性（§8.4）：repeat=1 时 stddev=0 且 informative=false，consumer 不能被 0 骗
+      {"stability", json{{"repeat", r.stability.repeat},
+                         {"rounds", r.stability.rounds},
+                         {"informative", r.stability.informative()},
+                         {"stddev_kind", "population"},
+                         {"root_rate", stat_json(r.stability.root_rate)},
+                         {"evidence_rate", stat_json(r.stability.evidence_rate)},
+                         {"sla_rate", stat_json(r.stability.sla_rate)},
+                         {"pass_k", stat_json(r.stability.pass_k)}}},
+      // 运行状态与失败模式分属两个字段（§8.4）：混在一起会让失败分布失真
+      {"failure_modes", failure_modes},
+      {"run_notes", r.run_notes},
+      // 回归清单（§8.9 ④）：present=false 时其余字段留空，consumer 不必猜
+      {"regression", regression},
   };
   json cases = json::array();
   for (const auto& c : r.cases) {
@@ -2576,6 +2773,57 @@ std::string Engine::render_json(const RunReport& r) const {
   }
   root["cases"] = std::move(cases);
   return root.dump(2) + "\n";
+}
+
+// 终端摘要（FR-EVAL.10）：cue-eval 结束后的 10-15 行。纯函数——只读 RunReport 与 cfg_，
+// 不碰文件系统，所以可以快照测试（"摘要里到底写了什么"不该靠跑一次真管线来验证）。
+std::string Engine::render_terminal_summary(const RunReport& r) const {
+  const auto fmt = [](double v, int prec) {
+    return has_value(v) ? num_text(v, prec) : std::string("n/a");
+  };
+  std::ostringstream o;
+  o << "==================== Cue 评测摘要 ====================\n";
+  o << "run_id  : " << r.run_id << "\n";
+  o << "suite   : " << cfg_.suite_path << "\n";
+  o << "模式    : " << cfg_.agent_mode;
+  if (cfg_.agent_mode == "real") o << "（LLM=" << cfg_.llm_mode << "）";
+  o << "，repeat=" << r.repeat << "\n";
+  if (!r.fatal_error.empty()) {
+    // 没有产出结果时也走摘要：先让终端读者看到"这次没结果"，再给原因
+    o << "结果    : **未产出**（" << r.fatal_error << "）\n";
+    o << "报告    : 未写入（失败不覆盖已有 report.md）\n";
+    o << "=====================================================\n";
+    return o.str();
+  }
+  o << "用例    : 执行 " << r.executed << " / 计划 " << r.planned << "，计分 " << r.scored
+    << "，run_error " << r.run_errors << (r.truncated ? "，已截断" : "") << "\n";
+  o << "成功率  : 根因 " << fmt(r.root_rate * 100, 1) << "% | 证据 " << fmt(r.evidence_rate * 100, 1)
+    << "% | SLA " << fmt(r.sla_rate * 100, 1) << "%\n";
+  o << "pass^" << r.repeat << "  : " << fmt(r.pass_k * 100, 1) << "%\n";
+  o << "稳定性  : ";
+  if (!r.stability.informative()) {
+    // stddev 恒为 0：写出来会被读成"很稳"，这里必须说清是"没测"
+    o << "repeat=" << r.stability.repeat << "，只有 " << r.stability.rounds
+      << " 轮有样本，无稳定性信息";
+  } else {
+    const auto& st = r.stability;
+    o << "root " << fmt(st.root_rate.mean, 3) << "±" << fmt(st.root_rate.stddev, 3) << "，evidence "
+      << fmt(st.evidence_rate.mean, 3) << "±" << fmt(st.evidence_rate.stddev, 3) << "，sla "
+      << fmt(st.sla_rate.mean, 3) << "±" << fmt(st.sla_rate.stddev, 3) << "（总体标准差）";
+  }
+  o << "\n";
+  o << "成本    : ¥" << fmt(r.cost_yuan, 4) << "（闸门 ¥" << fmt(cfg_.max_yuan, 2) << "，单价 ¥"
+    << fmt(cfg_.yuan_per_mtok, 2) << "/Mtok 估算）\n";
+  o << "MTTR    : " << (has_value(r.mttr_avg_s) ? fmt(r.mttr_avg_s, 2) + " s" : std::string("n/a"))
+    << "\n";
+  // 指纹前 12 位：够人眼比对、又不至于把终端刷爆（完整值在 report.md / report.json 里）
+  o << "指纹    : " << (r.fingerprint.size() > 12 ? r.fingerprint.substr(0, 12) : r.fingerprint)
+    << "\n";
+  o << "报告    : " << (r.report_path.empty() ? std::string("(未落盘)") : r.report_path);
+  if (!r.report_json_path.empty()) o << "（JSON: " << r.report_json_path << "）";
+  o << "\n";
+  o << "=====================================================\n";
+  return o.str();
 }
 
 RunReport Engine::run(const std::vector<Case>& cases) {

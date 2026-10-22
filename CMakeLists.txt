@@ -247,6 +247,14 @@ target_link_libraries(test_compare PRIVATE cue_eval)
 add_test(NAME compare COMMAND test_compare)
 set_tests_properties(compare PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# T-08 报告字段：失败模式分布 / run_notes 分离、稳定性（总体标准差）、report.md 两节、
+# 终端摘要。全是纯函数（summarize_failure_modes / compute_stability / render_*），
+# 不读磁盘、不起 cued，所以能在 ctest 里毫秒级跑完。
+add_executable(test_report tests/test_report.cpp)
+target_link_libraries(test_report PRIVATE cue_eval)
+add_test(NAME report COMMAND test_report)
+set_tests_properties(report PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # M5 控制台纯逻辑（SSE hub / 审批队列 / report.md 解析）
 add_executable(test_console tests/test_console.cpp)
 target_include_directories(test_console PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)

@@ -197,6 +197,9 @@ std::expected<std::vector<Case>, std::string> load_suite(const std::string& path
 
 struct CaseOutcome {
   std::string id;
+  // 这是第几次 repeat 轮（0-based）。stability 要按轮聚合每级的率：
+  // 只有记住轮次，repeat=3 的"同一指标试了 3 次"才能算均值/离散度。
+  int attempt = 0;
   bool scored = false;       // false = run_error（超时/崩溃/输出不合规），不计入成功率分母
   std::string error_kind;
   Score score;
@@ -269,6 +272,70 @@ struct RunConfig {
   const std::atomic<bool>* cancel = nullptr;
 };
 
+// ---------------------------------------------------------------- 报告字段（技术设计文档 §8.4/§8.9）
+
+// 失败模式分布（§8.4）：按 case 的 expect.root_cause 分组的一次判分未命中。
+// 注意：这不是"运行状态"。截断/成本闸门/取消/manual_only 跳过/state 写失败属于 run_notes，
+// 混在一张表里会让读者分不清「模型答错」和「这次没跑完」。
+struct FailureMode {
+  // 期望的根因；空 = 没有判分结果（run_error 等），归到 kRunErrorGroup。
+  std::string root_cause;
+  int miss_count = 0;
+  // 最多 kMaxFailureExamples 个 "case_id(未命中的层)"，例如 netloss-uplink-50pct(root,sla)。
+  // 带层是必要的：只知道"这条没过"看不出是答错根因、证据不成立还是 SLA 没达标。
+  std::vector<std::string> examples;
+};
+inline constexpr const char* kRunErrorGroup = "__run__";
+inline constexpr const char* kUnknownRootGroup = "__unknown__";
+inline constexpr std::size_t kMaxFailureExamples = 3;
+
+// 稳定性统计。NaN = 没有样本（写 null，不拿 0 冒充"完全稳定"）。
+struct StabilityStats {
+  double mean = kNoValue;
+  double stddev = kNoValue;
+  double min = kNoValue;
+  double max = kNoValue;
+};
+
+// 按 repeat 轮聚合的稳定性（§8.4）。
+// 标准差用**总体标准差**（除以 n）：这里只有本轮这几轮观测，不是从某个总体抽样做推断；
+// 且 repeat 通常只有 3，样本标准差要除以 n-1，会把 3 轮的离散度放大 50%，读起来像"抖得多"。
+struct Stability {
+  int repeat = 1;
+  // 实际有 scored 样本的轮数。截断/整轮 run_error 会让它小于 repeat——只有 1 轮有样本时
+  // stddev 同样恒为 0，不能因为 repeat>1 就把它读成"稳定"。
+  int rounds = 0;
+  StabilityStats root_rate;
+  StabilityStats evidence_rate;
+  StabilityStats sla_rate;
+  // 逐轮 pass_k = 该轮里三级全过的 case 占比；与 run 级 pass^k（k 轮都过）不是同一个量，
+  // 报告里必须分开写，否则 repeat=3 的"每轮都 80%"会被读成"80% 的 case 三轮全过"。
+  StabilityStats pass_k;
+  // 少于 2 轮有样本时没有任何跨轮离散度可言：stddev 恒为 0，且不得被读成"稳定"。
+  bool informative() const { return rounds > 1; }
+};
+
+// 回归清单的一条（case 级）。detail 是给人看的 "A 3/3 过 → B 1/3 过" 形式。
+struct RegressionEntry {
+  std::string id;
+  std::string detail;
+};
+
+// 回归清单：本次 run 与 baseline 的 case 级对比（compare.h 的 DiffReport 的投影）。
+// 为什么不直接塞 DiffReport：compare.h 依赖 state.h，而 state.h 依赖本头文件，
+// 直接引用会成环；报告渲染只需要这几项，投影成轻量 POD 就够。
+struct RegressionList {
+  bool present = false;      // false = 本次没有 baseline（报告写"跳过"，不留空小节）
+  std::string baseline_run_id;
+  std::string source;        // "auto" = 自动发现上次同 suite 的 run；"explicit" = --baseline
+  bool comparable = true;    // false = 指纹/suite/mode/repeat 有差异，差异不可归因
+  std::vector<std::string> warnings;
+  std::vector<RegressionEntry> new_failures;
+  std::vector<RegressionEntry> fixed;
+  std::vector<RegressionEntry> still_failing;
+  int still_passing = 0, inconclusive = 0, only_a = 0, only_b = 0;
+};
+
 struct RunReport {
   std::string run_id;
   std::string fingerprint;  // 二进制 ⊕ git ⊕ 生效配置 ⊕ suite（SPEC §7.7/AC-9）
@@ -305,8 +372,30 @@ struct RunReport {
   std::string e2e_null_reason;
   // 端到端 SLA 判定用的是探针还是别的来源：报告里写清，避免把 cued 自报读成端到端
   std::string probe_source = "none";
-  std::vector<std::string> failure_modes;  // "root: 期望 X 实际 Y" 之类的聚合
+  // 失败模式分布（§8.4）：按 expect.root_cause 分组，按 miss_count 降序
+  std::vector<FailureMode> failure_modes;
+  // 运行状态：截断 / 成本闸门 / 取消 / manual_only 跳过 / state 写失败。
+  // 与 failure_modes 分开：这些是"这次 run 没按计划跑完"，不是"模型答错了哪一类"。
+  std::vector<std::string> run_notes;
+  // 跨 repeat 轮的稳定性（§8.4）；repeat=1 时 informative()=false
+  Stability stability;
+  // 回归清单（§8.9 ④）：由 CLI 在渲染前填充；present=false = 没有 baseline
+  RegressionList regression;
+  // report.md / report.json 的落点（CLI 填；终端摘要要打印它）
+  std::string report_path;
+  std::string report_json_path;
 };
+
+// 失败模式分布（纯函数，可单测）：按 expect.root_cause 分组，一次 case 尝试里
+// root/evidence/sla 任一未命中就计 1 次 miss（三维全中不计、不做三维分别计数——
+// "这条 case 失败了几次"才是分布，三维各算一次会把一条 case 的失败记成三次）。
+// 没有判分结果（run_error）归到 kRunErrorGroup，examples 标注 (run_error)。
+std::vector<FailureMode> summarize_failure_modes(const std::vector<Case>& cases,
+                                                 const std::vector<CaseOutcome>& outcomes);
+
+// 稳定性（纯函数，可单测）：按 attempt 轮聚合每级的率，只统计 scored 的尝试。
+// 没有任何 scored 样本的那一轮不计入（不能拿 1 个样本的轮冒充稳定）。
+Stability compute_stability(const std::vector<CaseOutcome>& outcomes, int repeat);
 
 // real 模式：case → 管线配置（注入档位只来自 case；评测器不替 agent 造结论）
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg);
@@ -322,6 +411,9 @@ class Engine {
   // 机器可读的报告（report.json）：与 render_markdown 同一份数据，字段名稳定。
   // 端到端字段没有样本时写 null 并带 null 原因，不写 0（0 是合法读数）。
   std::string render_json(const RunReport& r) const;
+  // 终端摘要（FR-EVAL.10）：纯函数，输入 RunReport 输出约 10-15 行文本。
+  // 纯函数的意义是可快照测试——不能靠"跑一次看看"验证摘要字段。
+  std::string render_terminal_summary(const RunReport& r) const;
   // 生效配置指纹：模式/repeat/成本闸门/模型/cued 二进制内容。
   // 不含它时「换 SUT、换 model、换 mode」指纹相同，续跑会跨配置复用缓存（实测）。
   std::string config_hash() const;

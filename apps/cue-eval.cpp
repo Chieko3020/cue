@@ -52,6 +52,10 @@ int usage() {
       "\n"
       "  --endpoint URL 被测管线改为 HTTP 服务（实现 GET /api/state + POST /api/action），\n"
       "                 不再起 cued；warmup 等待也跳过（假域无需等外部推流）。\n"
+      "  --baseline <run_id>  指定回归清单的对照 run（report.md 的「回归清单」节）。\n"
+      "                 默认自动找 --out 下同 suite / mode / repeat 的最近一个 run；\n"
+      "                 找不到就写「本次没有 baseline，跳过」，绝不拿别的 run 冒充。\n"
+      "  --no-baseline  关闭自动 baseline 发现（只跑本次、不做对比）。\n"
       "  --record-tools DIR  把每个 case 的工具观测录到 DIR/<case_id>.tools.jsonl；\n"
   "  --replay-tools DIR  只回放该录制：不 spawn cued、不连 endpoint，miss 明确报错。\n"
   "                      两者互斥；--replay-tools 不能与 --endpoint 同时给。\n"
@@ -79,6 +83,104 @@ std::string header_str(const nlohmann::json& h, const char* key) {
 int header_int(const nlohmann::json& h, const char* key, int fallback) {
   if (!h.is_object() || !h.contains(key) || !h[key].is_number_integer()) return fallback;
   return h[key].get<int>();
+}
+
+// 回归清单里一条 case 的文字口径（与 compare.cpp 的 agg_text 同一套语义）
+std::string case_agg_text(const eval::CaseAgg& g) {
+  if (g.attempts == 0) return "—";
+  std::string s = std::to_string(g.passes) + "/" + std::to_string(g.attempts) + " 过";
+  if (g.run_errors > 0) s += "，run_error " + std::to_string(g.run_errors) + "（不计分母）";
+  return s;
+}
+
+// 自动 baseline：--out 下同 suite / mode / repeat 的最近一个 run（按 header 的 created_us）。
+// 为什么要对齐这三项：suite 换了比的就不是同一组 case；mode 换了（scripted vs real）
+// 成功率没有可比性；repeat 换了 pass^k 口径不同——三种情况拿来比都会得出错误结论。
+std::string find_previous_run(const std::string& out_dir, const std::string& cur_run_id,
+                              const std::string& suite, const std::string& mode, int repeat) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::string best;
+  std::int64_t best_created = -1;
+  for (const auto& de :
+       fs::directory_iterator(out_dir, fs::directory_options::skip_permission_denied, ec)) {
+    std::error_code ec2;
+    if (!de.is_directory(ec2)) continue;
+    const std::string id = de.path().filename().string();
+    if (id == cur_run_id || id.rfind("run-", 0) != 0) continue;
+    auto hdr = eval::read_state_header((de.path() / "state.jsonl").string());
+    if (!hdr) continue;
+    if (header_str(*hdr, "suite") != suite) continue;
+    if (header_str(*hdr, "mode") != mode) continue;
+    if (header_int(*hdr, "repeat", 1) != repeat) continue;
+    std::int64_t created = 0;
+    if (hdr->contains("created_us") && (*hdr)["created_us"].is_number_integer()) {
+      created = (*hdr)["created_us"].get<std::int64_t>();
+    }
+    if (created > best_created) {
+      best_created = created;
+      best = id;
+    }
+  }
+  return best;
+}
+
+// 把两个 run 的 case 级差异投影成报告里的回归清单。判定复用 compare.h 的 diff_runs，
+// 与 --diff 的输出同一套口径（run_error 单列、不可比先说明），不另写一套判据。
+// present=false 表示读不到 baseline 的 state/header——调用方决定是报错还是当作没有 baseline。
+eval::RegressionList build_regression(const std::string& out_dir, const eval::RunReport& cur,
+                                      const std::string& baseline_id,
+                                      const std::string& source) {
+  eval::RegressionList reg;
+  reg.baseline_run_id = baseline_id;
+  reg.source = source;
+  const std::string pa = out_dir + "/" + baseline_id + "/state.jsonl";
+  const std::string pb = out_dir + "/" + cur.run_id + "/state.jsonl";
+  auto hdr_a = eval::read_state_header(pa);
+  auto hdr_b = eval::read_state_header(pb);
+  if (!hdr_a || !hdr_b) return reg;
+  auto state_a = eval::load_state(pa);
+  auto state_b = eval::load_state(pb);
+  if (!state_a || !state_b) return reg;
+
+  eval::RunInfo ia;
+  eval::RunInfo ib;
+  ia.run_id = baseline_id;
+  ib.run_id = cur.run_id;
+  ia.fingerprint = header_str(*hdr_a, "fingerprint");
+  ib.fingerprint = header_str(*hdr_b, "fingerprint");
+  ia.suite = header_str(*hdr_a, "suite");
+  ib.suite = header_str(*hdr_b, "suite");
+  ia.mode = header_str(*hdr_a, "mode");
+  ib.mode = header_str(*hdr_b, "mode");
+  ia.repeat = header_int(*hdr_a, "repeat", 1);
+  ib.repeat = header_int(*hdr_b, "repeat", 1);
+
+  const auto d = eval::diff_runs(ia, *state_a, ib, *state_b);
+  reg.present = true;
+  reg.comparable = d.comparable;
+  reg.warnings = d.warnings;
+  reg.still_passing = d.still_passing;
+  reg.inconclusive = d.inconclusive;
+  reg.only_a = d.only_a;
+  reg.only_b = d.only_b;
+  for (const auto& c : d.cases) {
+    switch (c.cls) {
+      case eval::DiffClass::NewFailure:
+        reg.new_failures.push_back(
+            eval::RegressionEntry{c.id, "A " + case_agg_text(c.a) + " → B " + case_agg_text(c.b)});
+        break;
+      case eval::DiffClass::Fixed:
+        reg.fixed.push_back(
+            eval::RegressionEntry{c.id, "A " + case_agg_text(c.a) + " → B " + case_agg_text(c.b)});
+        break;
+      case eval::DiffClass::StillFailing:
+        reg.still_failing.push_back(eval::RegressionEntry{c.id, case_agg_text(c.b)});
+        break;
+      default: break;
+    }
+  }
+  return reg;
 }
 
 int do_diff(const std::string& run_a, const std::string& run_b, const std::string& out_dir) {
@@ -150,6 +252,8 @@ int main(int argc, char** argv) {
   eval::RunConfig cfg;
   std::string diff_a, diff_b;
   std::string gen_path;
+  std::string baseline_id;  // --baseline：显式对照 run
+  bool no_baseline = false;
   bool out_set = false;
   bool suite_set = false;
   bool mode_set = false;
@@ -184,6 +288,14 @@ int main(int argc, char** argv) {
     } else if (a == "--repeat") {
       cfg.repeat = std::max(1, std::atoi(next().c_str()));
       repeat_set = true;
+    } else if (a == "--baseline") {
+      baseline_id = next();
+      if (baseline_id.empty()) {
+        std::fprintf(stderr, "--baseline 需要 run_id\n");
+        return 2;
+      }
+    } else if (a == "--no-baseline") {
+      no_baseline = true;
     } else if (a == "--max-yuan") {
       cfg.max_yuan = std::atof(next().c_str());
     } else if (a == "--gen") {
@@ -240,6 +352,28 @@ int main(int argc, char** argv) {
 
   // FR-EVAL.5：--gen 是独立模式（只展开矩阵、写 suite，不跑 case）。
   // 与 --diff/--resume 同给会让"这次到底产出了什么"不可解释，直接拒绝。
+  if (!baseline_id.empty() && no_baseline) {
+    std::fprintf(stderr, "--baseline 与 --no-baseline 互斥\n");
+    return 2;
+  }
+  if (!baseline_id.empty() || no_baseline) {
+    if (!diff_a.empty() || !diff_b.empty() || !gen_path.empty()) {
+      std::fprintf(stderr, "--baseline / --no-baseline 只影响评测报告的回归清单，"
+                           "不能与 --diff / --gen 同时使用\n");
+      return 2;
+    }
+  }
+  // 显式 baseline 在跑之前就要校验：real 模式每个 case 约 11 s，跑完一轮才发现
+  // "对照 run 写错了"是纯浪费（而且此时报告已经写不出来，终端只看到一条错误）。
+  if (!baseline_id.empty()) {
+    const std::string bp = cfg.out_dir + "/" + baseline_id + "/state.jsonl";
+    auto hdr = eval::read_state_header(bp);
+    if (!hdr) {
+      std::fprintf(stderr, "--baseline %s：读不出 %s 的 header（%s）\n", baseline_id.c_str(),
+                   bp.c_str(), hdr.error().c_str());
+      return 2;
+    }
+  }
   if (!gen_path.empty()) {
     if (!diff_a.empty() || !diff_b.empty() || !cfg.resume_run_id.empty()) {
       std::fprintf(stderr, "--gen 不能与 --diff / --resume 同时使用\n");
@@ -453,17 +587,47 @@ int main(int argc, char** argv) {
 
   cfg.cancel = &g_cancel;
   eval::Engine engine(cfg);
-  const auto report = engine.run(*cases);
+  auto report = engine.run(*cases);
   if (!report.fatal_error.empty()) {
     // 不能写 report.md：resume 失败时会把原 run 的报告覆盖成 0 分（review-eval.md #8）
     std::fprintf(stderr, "[eval] 未产出结果：%s\n", report.fatal_error.c_str());
+    // 终端摘要照样给（走 fatal 分支）：读者要知道"这次没有结果"，而不是只看到一行 stderr
+    std::printf("%s", engine.render_terminal_summary(report).c_str());
     return 2;
   }
-  const std::string md = engine.render_markdown(report);
 
   std::error_code ec;
   std::filesystem::create_directories(cfg.out_dir + "/" + report.run_id, ec);
   const std::string report_path = cfg.out_dir + "/" + report.run_id + "/report.md";
+  const std::string json_path = cfg.out_dir + "/" + report.run_id + "/report.json";
+  report.report_path = report_path;
+  report.report_json_path = json_path;
+
+  // 回归清单（§8.9 ④）：显式 --baseline 优先，否则自动找同 suite / mode / repeat 的上一次 run。
+  // 找不到时 present 保持 false —— 报告写"本次没有 baseline，跳过"，而不是留空小节，
+  // 更不能拿别的 suite 的 run 冒充（那会把无关差异读成回归）。
+  if (!no_baseline) {
+    std::string bid = baseline_id;
+    std::string src = "explicit";
+    if (bid.empty()) {
+      bid = find_previous_run(cfg.out_dir, report.run_id, cfg.suite_path, cfg.agent_mode,
+                              cfg.repeat);
+      src = "auto";
+    }
+    if (!bid.empty()) {
+      auto reg = build_regression(cfg.out_dir, report, bid, src);
+      if (reg.present) {
+        report.regression = std::move(reg);
+      } else if (!baseline_id.empty()) {
+        // 显式指定却读不出来：不能静默当作"没有 baseline"（那会看起来像比过了）
+        std::fprintf(stderr, "--baseline %s：读不出 %s/%s/state.jsonl 的 header 或行\n",
+                     baseline_id.c_str(), cfg.out_dir.c_str(), baseline_id.c_str());
+        return 2;
+      }
+    }
+  }
+
+  const std::string md = engine.render_markdown(report);
   {
     std::ofstream out(report_path);
     if (!out) {
@@ -479,7 +643,6 @@ int main(int argc, char** argv) {
   }
   // report.json：与 report.md 同一份数据（字段名稳定，给回归脚本/看板用）。
   // 端到端字段没有样本时写 null + null 原因，不写 0。
-  const std::string json_path = cfg.out_dir + "/" + report.run_id + "/report.json";
   {
     std::ofstream out(json_path);
     if (!out) {
@@ -494,6 +657,8 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("%s\n", md.c_str());
+  // 终端摘要（FR-EVAL.10）：走 stdout（报告正文也在 stdout），stderr 只留告警与错误。
+  std::printf("%s", engine.render_terminal_summary(report).c_str());
   if (g_cancel.load()) {
     std::fprintf(stderr, "[eval] 已按信号取消（已完成部分已落盘，可 --resume）\n");
     return 130;
