@@ -9,7 +9,11 @@
 #
 # 环境变量：BIND（静态页与 cued 的监听地址，默认 127.0.0.1）、WS_PORT、PROBE_PORT、HTTP_PORT、JOBS、
 #           BUILD_DIR（构建目录，默认 build）、CXX（默认 g++-14，找不到时退回 g++）、
-#           REPORT_DIR（demo 报告目录，默认 runs）
+#           REPORT_DIR（demo 报告目录，默认 runs）、
+#           CUE_PRODUCER（采集源：auto | capture | node | page，默认 auto：
+#                         有 cue-capture 就用它的 lavfi 后端，没有则回退 Node 模拟端；
+#                         page = 不自动产帧，由浏览器页面推流）、
+#           CAPTURE_SIZE / CAPTURE_BITRATE / CAPTURE_AUDIO（cue-capture 参数）
 #
 # 安全口径（如实说明）：cued 有 --bind 参数，默认 127.0.0.1（仅本机）；
 # 本脚本把 BIND 同时传给静态页与 cued，跨机演示时 BIND=0.0.0.0 才会对可达网络开放。
@@ -137,11 +141,61 @@ for spec in "probe:$PROBE_PID" "cued:$MEDIA_PID" "http:$HTTP_PID"; do
 done
 
 HOST_FOR_URL="${BIND/0.0.0.0/127.0.0.1}"
+
+# ---- 采集源（T-11 / FR-CAP.3）----
+# 默认用 cue-capture 的 lavfi 后端：零采购真实源（testsrc2 画面 + sine 音频），
+# 而且走的是与浏览器**同一套**上行协议——demo-min 因此也能证明"协议不分叉"。
+# 没有该二进制时回退到 Node 模拟端（旧行为，向后兼容）；两者都没有就只起管线。
+PRODUCER="${CUE_PRODUCER:-auto}"
+CAPTURE_PID=""
+PRODUCER_NOTE=""
+case "$PRODUCER" in
+  auto | capture | node | page) ;;
+  *)
+    echo "[cue] CUE_PRODUCER=$PRODUCER 不认识（可用 auto|capture|node|page）" >&2
+    exit 2
+    ;;
+esac
+if [[ "$PRODUCER" == "page" ]]; then
+  PRODUCER_NOTE="浏览器页面（不自动产帧）"
+elif [[ "$PRODUCER" == "capture" || "$PRODUCER" == "auto" ]] && [[ -x "$BUILD_DIR/cue-capture" ]]; then
+  "$BUILD_DIR/cue-capture" --backend lavfi \
+    --ws "ws://${HOST_FOR_URL}:${WS_PORT}/" \
+    --size "${CAPTURE_SIZE:-640x360}" --bitrate "${CAPTURE_BITRATE:-1200}" \
+    --audio "${CAPTURE_AUDIO:-on}" --duration 0 &
+  CAPTURE_PID=$!
+  PIDS+=("$CAPTURE_PID")
+  PRODUCER_NOTE="cue-capture（backend=lavfi：testsrc2 + sine）"
+elif [[ "$PRODUCER" != "capture" ]] && command -v node >/dev/null 2>&1 && [[ -f scripts/test-client.mjs ]]; then
+  # 86400 s：demo 期间一直产帧，Ctrl-C 时由 cleanup 收掉（test-client 自己按秒数退出）
+  node scripts/test-client.mjs "ws://${HOST_FOR_URL}:${WS_PORT}/" 86400 &
+  CAPTURE_PID=$!
+  PIDS+=("$CAPTURE_PID")
+  PRODUCER_NOTE="scripts/test-client.mjs（Node 模拟浏览器上行；未找到 cue-capture 的向后兼容回退）"
+elif [[ "$PRODUCER" == "capture" ]]; then
+  echo "[cue] CUE_PRODUCER=capture 但 $BUILD_DIR/cue-capture 不存在；先构建：" >&2
+  echo "[cue]   cmake --build $BUILD_DIR --target cue-capture -j$JOBS" >&2
+  exit 1
+else
+  PRODUCER_NOTE="无（打开下方页面点「开始推流」，或先构建 cue-capture）"
+fi
+echo "[cue] 采集源：$PRODUCER_NOTE"
+if [[ -n "$CAPTURE_PID" ]] && ! kill -0 "$CAPTURE_PID" 2>/dev/null; then
+  echo "[cue] 采集端启动失败（cue-capture / test-client 立刻退出）" >&2
+  exit 1
+fi
+if [[ -n "$CAPTURE_PID" ]]; then
+  PRODUCER_HINT="  点「开始推流」也可以，但 cued 一次只接一个客户端：当前连接已被采集端占用，"
+  PRODUCER_HINT+=$'\n'"  要用浏览器推流页请 CUE_PRODUCER=page ./scripts/run.sh demo-min"
+else
+  PRODUCER_HINT="  点「开始推流」，观察终端里的 probe 指标"
+fi
 cat <<EOF
 
 ────────────────────────────────────────────────────────
-  打开  http://${HOST_FOR_URL}:${HTTP_PORT}/?ws_port=${WS_PORT}
-  点「开始推流」，观察终端里的 probe 指标
+  采集源：${PRODUCER_NOTE}
+  Web 页：http://${HOST_FOR_URL}:${HTTP_PORT}/?ws_port=${WS_PORT}
+${PRODUCER_HINT}
   Ctrl-C 结束
 ────────────────────────────────────────────────────────
 EOF

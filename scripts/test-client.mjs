@@ -7,11 +7,13 @@
 // 不含编码器、不测 WebCodecs（那部分由 web/app.js + e2e-browser.cjs 覆盖），
 // 也不覆盖多分片重组（该帧 < 16 KiB 分片上限）。
 
+// 分片/打包逻辑与协议对照脚本共用 scripts/lib/upstream-wire.mjs：
+// 同一份实现才谈得上"浏览器模拟端与原生采集端逐字节一致"。
+import { packMediaPackets, TYPE_VIDEO, CODEC_H264 } from './lib/upstream-wire.mjs';
+
 const url = process.argv[2] || `ws://127.0.0.1:${process.env.WS_PORT || 9000}/`;
 const seconds = Number(process.argv[3] || 5);
 const FPS = 30;
-const HEADER = 32;
-const MAX_FRAG = 16 * 1024;
 
 // ffmpeg -f lavfi -i color=c=blue:s=64x64:d=0.04 -frames:v 1 -c:v libx264 \
 //   -profile:v baseline -pix_fmt yuv420p -x264-params keyint=1:min-keyint=1:scenecut=0 -f h264
@@ -22,9 +24,6 @@ const IDR_ANNEXB = Buffer.from(
 
 const ws = new WebSocket(url);
 ws.binaryType = 'arraybuffer';
-
-function u32(dv, off, v) { dv.setUint32(off, v >>> 0, true); }
-function u64(dv, off, v) { dv.setBigUint64(off, BigInt(v), true); }
 
 ws.onopen = async () => {
   console.log('[test-client] connected', url);
@@ -62,25 +61,11 @@ ws.onopen = async () => {
 
   const timer = setInterval(() => {
     const pts = Math.max(0, Math.round(performance.now() * 1000 + offset));
-    const fragCount = Math.max(1, Math.ceil(IDR_ANNEXB.length / MAX_FRAG));
-    for (let i = 0; i < fragCount; i++) {
-      const off = i * MAX_FRAG;
-      const len = Math.min(MAX_FRAG, IDR_ANNEXB.length - off);
-      const pkt = new Uint8Array(HEADER + len);
-      const dv = new DataView(pkt.buffer);
-      pkt[0] = 0xc1;
-      pkt[1] = 0x01; // video
-      pkt[2] = 0x01; // h264
-      pkt[3] = 0x01 | (i === fragCount - 1 ? 0x04 : 0); // keyframe | last_frag
-      u32(dv, 4, 1);        // stream_id
-      u32(dv, 8, frameId);
-      u32(dv, 12, i);       // frag_index
-      u32(dv, 16, fragCount);
-      u64(dv, 20, pts);
-      u32(dv, 28, len);
-      pkt.set(IDR_ANNEXB.subarray(off, off + len), HEADER);
-      ws.send(pkt);
-    }
+    const packets = packMediaPackets(
+      { type: TYPE_VIDEO, codec: CODEC_H264, streamId: 1, frameId, keyframe: true, ptsUs: pts },
+      IDR_ANNEXB,
+    );
+    for (const pkt of packets) ws.send(pkt);
     frameId = (frameId + 1) >>> 0;
     sent++;
   }, 1000 / FPS);

@@ -118,12 +118,13 @@ ctest --test-dir build --output-on-failure
 | `cue-eval` | 评测 CLI：suite、模式、repeat、成本闸门、断点续跑、回归对比 | 取决于 `--live` / 后端 |
 | `cued` | 媒体管线进程（WS 进、UDP 出） | 起管线 |
 | `cue-probe` | 下行接收端：重组、NACK、FEC、帧率与端到端分位 | 起管线 |
+| `cue-capture` | 原生采集端：`lavfi` / `ffmpeg`（dshow·avfoundation）/ V4L2 三后端，上行 WS 协议与浏览器同一套 | 起管线（`demo-min` 的默认采集源） |
 | `cue-serve` | 控制台后端：HTTP + SSE + 静态托管 + 审批队列 | 起控制台 |
 | `cue-mock-svc` | 确定性假域服务，实现同一套 REST 控制协议 | 起假域 |
 
 `cue demo` 的变体：`--http URL [--record DIR]` 走 OpenAI 兼容端点并录制 cassette；`--replay DIR` 从 cassette 回放。`cue run` 的 `--approval ask|auto|deny`、`--allow-dangerous NAMES|none` 控制审批；`CUE_RECORD=1` 把成功调用录进 `CUE_CASSETTE_DIR`。
 
-`run.sh` 不带参数（或 `demo-min`）会起「`cue-probe` + `cued` + 静态页」，在终端打印 `http://127.0.0.1:8080/?ws_port=9000`，打开页面点「开始推流」。`cued` 默认只监听 `127.0.0.1`；跨机演示用 `BIND=0.0.0.0` 并自行限制 9000/TCP 与 9001/UDP。改过 `WS_PORT` 也能对上。
+`run.sh` 不带参数（或 `demo-min`）会起「`cue-probe` + `cued` + 采集源 + 静态页」，在终端打印 `http://127.0.0.1:8080/?ws_port=9000`。采集源默认是 `cue-capture --backend lavfi`（`testsrc2` 画面 + `sine` 音频，零采购真实源；走与浏览器同一套上行协议）；没有该二进制时回退到 `scripts/test-client.mjs`（Node 模拟浏览器）。`CUE_PRODUCER=page` 则不自动产帧，改由页面点「开始推流」——`cued` 一次只接一个客户端，采集端跑着时页面连不上，这是预期行为。`cued` 默认只监听 `127.0.0.1`；跨机演示用 `BIND=0.0.0.0` 并自行限制 9000/TCP 与 9001/UDP。改过 `WS_PORT` 也能对上。
 
 控制台（可选）：`./scripts/serve.sh` 会先构建 `web/console`（首次需要 Node 与 npm，会联网装前端依赖），再起 `cue-serve`，默认 `http://127.0.0.1:8080/`、审批模式 `ask`。
 
@@ -216,7 +217,7 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 ## 目录
 
 ```
-apps/          cue · cued · cue-probe · cue-eval · cue-serve · cue-mock-svc（+ console 渲染辅助）
+apps/          cue · cued · cue-probe · cue-capture · cue-eval · cue-serve · cue-mock-svc（+ console 渲染辅助）
 include/cue/   proto · media · pipeline · agent · tool · llm · eval · common · sandbox
 src/           与 include 分层对应的实现
 web/           推流页（Canvas + WebCodecs + WS）；web/console 是 React 控制台
