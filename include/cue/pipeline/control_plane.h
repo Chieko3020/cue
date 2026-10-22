@@ -137,6 +137,14 @@ class ControlPlane {
     std::function<void(const std::string& ev, const nlohmann::json& data)> emit;
     // pipeline.stop：响应写出去之后才允许停（cued 用它优雅退出）
     std::function<void()> on_stop;
+    // session.list：设备会话表（FR-PIPE.12 / T-22）的数据源。返回
+    // {"sessions":[...],"count":N,"live":k}——形状由 SessionRegistry 决定，
+    // 控制面原样透传（设备页与控制面读同一份，不各写一遍字段）。
+    std::function<nlohmann::json(int64_t now_us)> sessions;
+    // session.kill：立即断开一路会话。false + err = 会话不存在/已被回收。
+    // 语义是"立即断"而不是优雅排空：踢掉一个坏设备时等它把积压发完，就是让它继续
+    // 占着发送队列和带宽；需要优雅的在 cued 侧是 pipeline.stop（整机退出）。
+    std::function<bool(uint32_t session_id, std::string& err)> session_kill;
   };
 
   ControlPlane(ParamStore& store, Providers providers);
@@ -173,6 +181,8 @@ class ControlPlane {
   nlohmann::json op_fault(const nlohmann::json& args, std::int64_t id);
   nlohmann::json op_subscribe(const nlohmann::json& args, ControlSession& session,
                               std::int64_t id);
+  nlohmann::json op_session_list(std::int64_t id);
+  nlohmann::json op_session_kill(const nlohmann::json& args, std::int64_t id);
   std::string tail_of_logs(int tail) const;
   std::string tail_of_events(int tail) const;
 

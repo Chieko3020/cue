@@ -755,6 +755,10 @@ int main(int argc, char** argv) {
        json{{"pid", ::getpid()},
             {"port", port},
             {"bind", bind_host},
+            // 多设备会话（T-22）：一个探针实例只听**一路**（cued 的槽位 i → 端口
+            // --probe-port+i）。这里把自己的端口写进事件流，会话号在首包到达后
+            // 由 probe.metric 的 session_id 报出来，两边的映射因此可查。
+            {"scope", "per_session_port"},
             {"nack", nack_enabled ? "on" : "off"},
             {"nack_interval_ms", nack_interval_ms},
             // 限速上限写进事件流：报告里说"8 包/秒"时这里能对得上，不必看命令行。
@@ -1193,10 +1197,10 @@ int main(int argc, char** argv) {
       const double fps_rx = double(df) / dt;
       const double fps_dec = double(dd) / dt;
       std::printf(
-          "[probe] fps=%.1f frames=%llu lost=%llu pend=%zu pkts=%llu nack=%llu sup=%llu "
-          "pm=%llums mode=%s pause=%llu fec_rec=%llu fec_unrec=%llu rej=%llu loss=%.1f%% "
-          "MB=%.2f fb=%llu  ",
-          fps_rx, static_cast<unsigned long long>(frames),
+          "[probe] session=%u fps=%.1f frames=%llu lost=%llu pend=%zu pkts=%llu nack=%llu "
+          "sup=%llu pm=%llums mode=%s pause=%llu fec_rec=%llu fec_unrec=%llu rej=%llu "
+          "loss=%.1f%% MB=%.2f fb=%llu  ",
+          session_seen, fps_rx, static_cast<unsigned long long>(frames),
           static_cast<unsigned long long>(lost_frames), pending.size(),
           static_cast<unsigned long long>(packets),
           static_cast<unsigned long long>(nack_sent_now),
@@ -1245,6 +1249,10 @@ int main(int argc, char** argv) {
       const bool have_lat = clk.have && lat.size() > 0;
       auto pct_or_null = [&](double v) { return have_lat ? json(v) : json(nullptr); };
       json metric{
+          // 这一秒跟的是哪一路会话（服务端分配的会话号）。多设备部署时探针的端口与
+          // cued 的 device.registered.probe_port 一一对应，这里再写一次会话号，
+          // 两边的映射不必靠人脑记端口（T-22）。
+          {"session_id", session_seen},
           {"fps", fps_dec},          // 解码帧率：分母是解码出的帧，不是收包数
           {"fps_rx", fps_rx},        // 收包侧的帧率，仅供对照
           {"frames", frames},
@@ -1365,6 +1373,35 @@ int main(int argc, char** argv) {
     const bool new_stream = have_peer && !same_peer &&
                             h->type == static_cast<uint8_t>(cue::proto::DownType::Video) &&
                             h->frame_id == 0;
+    // 换一代流（对端换了 / 同一端口上换了会话）要重置的东西**完全一样**：
+    // 重组表、frame_id 水位、解码器参数集与参考帧、抖动缓冲、feedback 的链路读数。
+    // 抽成一个 lambda，两处调用，避免"只改了一边"这种最典型的回归。
+    const auto reset_stream = [&](const char* reason) {
+      const uint32_t old_max = max_completed;
+      pending.clear();
+      max_completed = 0;
+      have_completed = false;
+      dec.params = ParamSets{};
+      dec.reset();
+      // 抖动缓冲同样要清：上一代的 PTS 基线还在的话，新流前几帧会被判成"迟到"丢掉，
+      // 那些帧里往往正好包含新编码器的 IDR/SPS。
+      jb.reset();
+      // feedback 的速率/抖动/RTT 都是「针对上一代对端」的读数，不能带进新会话：
+      // 否则新 cued 的第一个 200 ms 会收到一条基于旧链路的反馈。
+      fb_bytes_prev = static_cast<int64_t>(bytes);
+      fb_t_prev = 0;
+      last_rtt_us = -1;
+      last_rtt_at_us = 0;
+      rtt_ping_echo = 0;
+      jitter_us = -1.0;
+      last_transit_us = -1;
+      emit("probe.stream_reset",
+           json{{"reason", reason},
+                {"old_max_frame", old_max},
+                {"frames", frames},
+                {"decoded", fs.decoded},
+                {"old_session", session_seen}});
+    };
     if (!have_peer) {
       peer = from;
       have_peer = true;
@@ -1382,39 +1419,26 @@ int main(int argc, char** argv) {
         stats_burst_left = kStatsBurst;
         next_stats_us = 0;  // 立刻重开一批：新 cued 的回包延迟特性与旧代无关
         clk.begin_batch();
-        // 新的一代 cued 从 frame_id=0 重新计数，而 max_completed 还是上一代的大值：
-        // 不重置的话新流的前 max_completed 帧全被当成"迟到分片"，探针会瞎掉好几秒
-        // （这正是"probe 不跟随 cued 重启"之后必须一起修的地方）。
-        // 解码器同样要重置：新编码器的 SPS/PPS 可能变了，旧参数集不能沿用。
-        const uint32_t old_max = max_completed;
-        pending.clear();
-        max_completed = 0;
-        have_completed = false;
-        dec.params = ParamSets{};
-        dec.reset();
-        // 抖动缓冲同样要清：上一代的 PTS 基线还在的话，新流前几帧会被判成"迟到"丢掉，
-        // 那些帧里往往正好包含新编码器的 IDR/SPS。
-        jb.reset();
-        // feedback 的速率/抖动/RTT 都是「针对上一代对端」的读数，不能带进新会话：
-        // 否则新 cued 的第一个 200 ms 会收到一条基于旧链路的反馈。
-        fb_bytes_prev = static_cast<int64_t>(bytes);
-        fb_t_prev = 0;
-        last_rtt_us = -1;
-        last_rtt_at_us = 0;
-        rtt_ping_echo = 0;
-        jitter_us = -1.0;
-        last_transit_us = -1;
-        emit("probe.stream_reset",
-             json{{"reason", new_stream ? "new_stream" : "peer_switch"},
-                  {"old_max_frame", old_max},
-                  {"frames", frames},
-                  {"decoded", fs.decoded}});
+        reset_stream(new_stream ? "new_stream" : "peer_switch");
+        session_seen = h->session_id;
       } else {
         ++rejected;
         continue;
       }
     } else {
       t_last_peer_us = now_tick;
+    }
+
+    // 会话换代（T-22 / FR-PIPE.12）：cued 的一个会话号对应**一路设备**，同一时刻只有
+    // 一个会话占着一个下行端口。同一端口上会话号变了 = 上一路断了、槽位分配给了新设备
+    // （或同一台设备重连）。不重置的话，新会话的 frame_id 从 0 开始，会被
+    // `h->frame_id <= max_completed` 当成"迟到分片"整段丢掉——探针会瞎到 frame_id
+    // 追上旧水位为止（旧实现只处理 cued 进程重启，不处理"同一 cued 换会话"）。
+    if (h->session_id != 0 && session_seen != 0 && h->session_id != session_seen) {
+      std::fprintf(stderr, "[probe] 会话切换：%u -> %u（同一 cued 的另一个会话）\n",
+                   session_seen, h->session_id);
+      reset_stream("session_switch");
+      session_seen = h->session_id;
     }
 
     if (h->type == static_cast<uint8_t>(cue::proto::DownType::StatsReq)) {
@@ -1501,7 +1525,7 @@ int main(int argc, char** argv) {
     }
     if (h->type != static_cast<uint8_t>(cue::proto::DownType::Video)) continue;
 
-    session_seen = h->session_id;
+    session_seen = h->session_id;  // 视频包：与上面两处换代判定同源，幂等
     bytes += static_cast<std::size_t>(n);
     // 迟到的重传分片不得为已完成的帧重建槽位（M0 幽灵帧教训）。
     // 首帧（还没有任何已完成帧）不适用这条：frame_id 从 0 开始，初值 0 会把 IDR 挡掉。

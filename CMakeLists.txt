@@ -211,7 +211,10 @@ target_link_libraries(cue_sandbox PRIVATE cue_headers_all)
 # cued 与 cue_pipeline 共用同一份实现——两端各写一份，迟早有一边漏掉上限。
 add_library(cue_control STATIC
   src/pipeline/control_channel.cpp
-  src/pipeline/control_plane.cpp)
+  src/pipeline/control_plane.cpp
+  # T-22 / FR-PIPE.12：设备会话表（注册/能力协商/租约/多设备）。放在这一层是因为
+  # cued 与 cue_pipeline 都要用它，而它不依赖 FFmpeg/Beast——单测能毫秒级跑完。
+  src/pipeline/session_registry.cpp)
 target_link_libraries(cue_control PUBLIC
   cue_proto nlohmann_json::nlohmann_json Threads::Threads)
 target_link_libraries(cue_control PRIVATE cue_headers_all)

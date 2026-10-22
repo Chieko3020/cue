@@ -1,5 +1,7 @@
 #include "cue/pipeline/control_plane.h"
 
+#include "cue/common/clock.h"
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -466,11 +468,11 @@ json ControlPlane::handle(const json& request, ControlSession& session) {
     if (op == "obs.fetch") return op_obs(args, id);
     if (op == "fault.set") return op_fault(args, id);
     if (op == "subscribe") return op_subscribe(args, session, id);
-    // 这两个 op 依赖多设备会话（本批不做）：必须回明确的 not implemented，
-    // 不能假装成功，也不能静默不回包（客户端会一直等到超时）。
-    if (op == "session.list" || op == "session.kill") {
-      return make_error(id, "not implemented: " + op + "（依赖多设备会话，本批未实现）");
-    }
+    // T-22 / FR-PIPE.12：多设备会话的两个 op。实现由后端提供（cued 的 SessionRegistry）；
+    // 没有提供方的后端（假域/回放/HTTP）必须回明确的 not implemented，不能假装成功，
+    // 也不能静默不回包（客户端会一直等到超时）。
+    if (op == "session.list") return op_session_list(id);
+    if (op == "session.kill") return op_session_kill(args, id);
   } catch (const std::exception& e) {
     // 客户端可以发任何形态的 args：一条坏请求换来一条 ok:false，进程不能倒。
     return make_error(id, std::string("处理 ") + op + " 时异常: " + e.what());
@@ -636,6 +638,41 @@ json ControlPlane::op_fault(const json& args, std::int64_t id) {
                                            {"inject_delay_ms", full["inject_delay_ms"]},
                                            {"inject_jitter_ms", full["inject_jitter_ms"]}}},
                           {"params", store_.encoder_json()}});
+}
+
+json ControlPlane::op_session_list(std::int64_t id) {
+  if (!prov_.sessions) {
+    return make_error(id, "not implemented: session.list（本后端没有会话表：假域/回放/HTTP "
+                          "后端没有多设备会话）");
+  }
+  json out = prov_.sessions(cue::now_us());
+  if (!out.is_object()) out = json::object();
+  out["control_channel"] = channel_tag();
+  return make_ok(id, out);
+}
+
+json ControlPlane::op_session_kill(const json& args, std::int64_t id) {
+  if (!prov_.session_kill) {
+    return make_error(id, "not implemented: session.kill（本后端没有会话表）");
+  }
+  if (!args.contains("session_id") || !args["session_id"].is_number_integer()) {
+    return make_error(id, "缺 args.session_id（整数；用 session.list 查）");
+  }
+  const long long raw = args["session_id"].get<long long>();
+  if (raw <= 0 || raw > 0xFFFFFFFFLL) {
+    return make_error(id, "args.session_id 越界：" + std::to_string(raw) +
+                              "（合法的会话号是正整数）");
+  }
+  const auto session_id = static_cast<uint32_t>(raw);
+  std::string err;
+  if (!prov_.session_kill(session_id, err)) {
+    return make_error(id, err.empty() ? "session.kill 失败" : err);
+  }
+  return make_ok(id, json{{"killed", true},
+                          {"session_id", session_id},
+                          {"reason", "session.kill"},
+                          // 语义写进响应：调用方不能把"断开了"读成"优雅排空了"
+                          {"mode", "immediate"}});
 }
 
 json ControlPlane::op_subscribe(const json& args, ControlSession& session, std::int64_t id) {
