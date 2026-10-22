@@ -1,0 +1,188 @@
+{
+  "suite": "fault-matrix",
+  "base": "../real-faults.json",
+  "seed_range": [
+    40,
+    80
+  ],
+  "count": 40,
+  "note": "FR-EVAL.5 的注入矩阵：六个根因 × 各自的 severity/档位轴批量生成 case。每个组的取值都不是随手写的——fault 类的有效档位来自 suites/real-faults.json 的本机实测（丢包 45/55/65%、排队 8/12/18 fps、限速 0.10~0.11 Mbps 是 720p 合成源的可判带），管线参数类用实测确认过的组合（4K + veryfast/medium/slow、placebo + 1360x768/1600x900/1920x1080）。生成器负责拒绝物理上不成立的组合（见生成物 note 里的 8 条规则）。 时延类固定 passthrough（transcode=on 会把发送段延迟与编码负载混在一起，规则拒绝）。",
+  "expect": {
+    "network_loss": [
+      "ingress_drop",
+      "drop"
+    ],
+    "bandwidth_insufficient": [
+      "rate"
+    ],
+    "queue_backlog": [
+      "backlog"
+    ],
+    "network_delay": [
+      "delay",
+      "jitter"
+    ],
+    "encoder_too_slow": [
+      "none"
+    ],
+    "resolution_too_high": [
+      "none"
+    ]
+  },
+  "groups": [
+    {
+      "note": "上行丢包 + passthrough：drop（出向丢包）与 20% 会被规则拒绝，其余 3 个成立",
+      "axes": {
+        "fault.kind": [
+          "ingress_drop",
+          "drop"
+        ],
+        "fault.value": [
+          20,
+          45,
+          55,
+          65
+        ],
+        "pipeline.transcode": [
+          false
+        ]
+      }
+    },
+    {
+      "note": "上行丢包 × 720p 转码底子 × 快档（清除注入后必须能回到 fps_min 以上）",
+      "axes": {
+        "fault.kind": [
+          "ingress_drop"
+        ],
+        "fault.value": [
+          45,
+          55,
+          65
+        ],
+        "pipeline.transcode": [
+          true
+        ],
+        "pipeline.preset": [
+          "ultrafast",
+          "veryfast"
+        ]
+      }
+    },
+    {
+      "note": "限速：0.1 是 cued 参数下限，0.12 以上故障态 fps 已回到阈值以上（实测）",
+      "axes": {
+        "fault.kind": [
+          "rate"
+        ],
+        "fault.value": [
+          0.1,
+          0.105,
+          0.11
+        ],
+        "pipeline.transcode": [
+          true
+        ],
+        "pipeline.preset": [
+          "ultrafast",
+          "veryfast"
+        ]
+      }
+    },
+    {
+      "note": "排队节奏 + passthrough",
+      "axes": {
+        "fault.kind": [
+          "backlog"
+        ],
+        "fault.value": [
+          8,
+          12,
+          18
+        ],
+        "pipeline.transcode": [
+          false
+        ]
+      }
+    },
+    {
+      "note": "排队节奏 × 720p 转码底子",
+      "axes": {
+        "fault.kind": [
+          "backlog"
+        ],
+        "fault.value": [
+          8,
+          12,
+          18
+        ],
+        "pipeline.transcode": [
+          true
+        ],
+        "pipeline.preset": [
+          "ultrafast",
+          "veryfast"
+        ]
+      }
+    },
+    {
+      "note": "时延 + passthrough：模板的 lat_p99_ms=150，生成器要求注入 ≥ 阈值+30 ms",
+      "axes": {
+        "fault.kind": [
+          "delay"
+        ],
+        "fault.value": [
+          200,
+          300,
+          400
+        ],
+        "pipeline.transcode": [
+          false
+        ]
+      }
+    },
+    {
+      "note": "管线参数类：慢编码器（placebo），修复靠模板的 repair=ultrafast",
+      "axes": {
+        "fault.kind": [
+          "none"
+        ],
+        "expect.root_cause": [
+          "encoder_too_slow"
+        ],
+        "pipeline.transcode": [
+          true
+        ],
+        "pipeline.preset": [
+          "placebo"
+        ],
+        "pipeline.size": [
+          "1360x768",
+          "1600x900",
+          "1920x1080"
+        ]
+      }
+    },
+    {
+      "note": "管线参数类：4K 输出（op 段 >1.5 ms 的区分点），修复靠 repair 降到 1280x720",
+      "axes": {
+        "fault.kind": [
+          "none"
+        ],
+        "expect.root_cause": [
+          "resolution_too_high"
+        ],
+        "pipeline.transcode": [
+          true
+        ],
+        "pipeline.preset": [
+          "veryfast",
+          "medium",
+          "slow"
+        ],
+        "pipeline.size": [
+          "3840x2160"
+        ]
+      }
+    }
+  ]
+}

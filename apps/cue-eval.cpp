@@ -2,6 +2,7 @@
 // 用法：
 //   cue-eval --suite suites/m4-diagnosis.json --mode scripted --repeat 1
 //   cue-eval --suite ... --mode real --repeat 1 --warmup 6        # 需并行推流
+//   cue-eval --gen suites/matrices/fault-matrix.json              # 矩阵生成 case（FR-EVAL.5）
 //   cue-eval --resume run-<id>                                    # 断点续跑
 //   cue-eval --diff run-<a> run-<b>                               # 回归对比
 //
@@ -21,9 +22,11 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "cue/eval/compare.h"
 #include "cue/eval/eval.h"
+#include "cue/eval/generator.h"
 #include "cue/eval/state.h"
 
 namespace eval = cue::eval;
@@ -42,6 +45,8 @@ int usage() {
       "           [--out dir] [--warmup s] [--model name] [--cued path] [--probe path]\n"
       "           [--sla-settle-ms N] [--endpoint URL]\n"
       "           [--replay|--live] [--record] [--cassette-dir dir]\n"
+      "  cue-eval --gen <matrix.json> [--out dir]           # 矩阵批量生成 case（默认写到\n"
+      "                  suites/generated/；拒绝覆盖非生成物）\n"
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
       "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
       "\n"
@@ -144,6 +149,8 @@ int main(int argc, char** argv) {
 
   eval::RunConfig cfg;
   std::string diff_a, diff_b;
+  std::string gen_path;
+  bool out_set = false;
   bool suite_set = false;
   bool mode_set = false;
   bool repeat_set = false;
@@ -179,8 +186,15 @@ int main(int argc, char** argv) {
       repeat_set = true;
     } else if (a == "--max-yuan") {
       cfg.max_yuan = std::atof(next().c_str());
+    } else if (a == "--gen") {
+      gen_path = next();
+      if (gen_path.empty()) {
+        std::fprintf(stderr, "--gen 需要矩阵文件路径\n");
+        return 2;
+      }
     } else if (a == "--out") {
       cfg.out_dir = next();
+      out_set = true;
     } else if (a == "--warmup") {
       cfg.warmup_s = std::max(0, std::atoi(next().c_str()));
     } else if (a == "--sla-settle-ms") {
@@ -222,6 +236,76 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "未知参数: %s\n", a.c_str());
       return 2;
     }
+  }
+
+  // FR-EVAL.5：--gen 是独立模式（只展开矩阵、写 suite，不跑 case）。
+  // 与 --diff/--resume 同给会让"这次到底产出了什么"不可解释，直接拒绝。
+  if (!gen_path.empty()) {
+    if (!diff_a.empty() || !diff_b.empty() || !cfg.resume_run_id.empty()) {
+      std::fprintf(stderr, "--gen 不能与 --diff / --resume 同时使用\n");
+      return 2;
+    }
+    auto gen = eval::generate_from_files(gen_path);
+    if (!gen) {
+      std::fprintf(stderr, "[gen] 生成失败: %s\n", gen.error().c_str());
+      return 2;
+    }
+    const std::string dir = out_set ? cfg.out_dir : std::string("suites/generated");
+    const std::string name = gen->suite.value("suite", std::string("generated"));
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+      std::fprintf(stderr, "[gen] 无法创建输出目录 %s: %s\n", dir.c_str(), ec.message().c_str());
+      return 5;
+    }
+    const std::string path = dir + "/" + name + ".json";
+    // 只允许覆盖 --gen 自己的产物：手写 suite 的 note 里没有这个标记，防止
+    // 「--out suites」把 real-faults.json 这类手写集冲掉（生成器不该改手写资产）。
+    if (std::filesystem::exists(path)) {
+      std::ifstream old(path);
+      std::string text((std::istreambuf_iterator<char>(old)), std::istreambuf_iterator<char>());
+      if (text.find("cue-eval --gen") == std::string::npos) {
+        std::fprintf(stderr,
+                     "[gen] 拒绝覆盖 %s：它不是 --gen 生成的 suite（手写 suite 不允许被生成器改写）\n",
+                     path.c_str());
+        return 2;
+      }
+    }
+    {
+      std::ofstream out(path);
+      if (!out) {
+        std::fprintf(stderr, "[gen] 无法写入 %s\n", path.c_str());
+        return 5;
+      }
+      out << gen->suite.dump(2) << "\n";
+      out.flush();
+      if (!out) {
+        std::fprintf(stderr, "[gen] 写 %s 失败\n", path.c_str());
+        return 5;
+      }
+    }
+    const auto& st = gen->stats;
+    std::vector<std::string> dist;
+    for (const auto& [root, n] : st.by_root_cause) {
+      dist.push_back(root + "=" + std::to_string(n));
+    }
+    std::vector<std::string> rejections;
+    for (const auto& [why, n] : st.rejected_reasons) {
+      rejections.push_back(why + "×" + std::to_string(n));
+    }
+    std::string joined;
+    for (std::size_t i = 0; i < dist.size(); ++i) {
+      joined += (i == 0 ? "" : ", ") + dist[i];
+    }
+    std::string why_joined;
+    for (std::size_t i = 0; i < rejections.size(); ++i) {
+      why_joined += (i == 0 ? "" : "；") + rejections[i];
+    }
+    const std::string why_text = why_joined.empty() ? "" : "（" + why_joined + "）";
+    std::printf("[gen] 生成 %zu 个 case → %s（%s）；组合 %zu 个、排除 %zu 个非法%s\n",
+                st.generated, path.c_str(), joined.c_str(), st.combinations, st.rejected,
+                why_text.c_str());
+    return 0;
   }
 
   if (!diff_a.empty() || !diff_b.empty()) {

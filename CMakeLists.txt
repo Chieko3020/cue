@@ -168,6 +168,7 @@ target_link_libraries(cue_agent PUBLIC
 # 修它需要 C++ 侧引入 IPipelineControl 接口，故 eval 只能同时依赖两层。
 add_library(cue_eval STATIC
   src/eval/eval.cpp
+  src/eval/generator.cpp
   src/eval/state.cpp
   src/eval/compare.cpp)
 target_link_libraries(cue_eval PUBLIC cue_agent cue_pipeline PkgConfig::CURL)
@@ -228,6 +229,13 @@ add_executable(test_eval tests/test_eval.cpp)
 target_link_libraries(test_eval PRIVATE cue_eval)
 add_test(NAME eval COMMAND test_eval)
 set_tests_properties(eval PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# FR-EVAL.5：case 生成器的矩阵展开 / id 唯一 / 非法组合被拒 / 继承字段
+# 纯函数（不读文件、不起管线），毫秒级跑完。
+add_executable(test_generator tests/test_generator.cpp)
+target_link_libraries(test_generator PRIVATE cue_eval)
+add_test(NAME generator COMMAND test_generator)
+set_tests_properties(generator PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(test_state tests/test_state.cpp)
 target_link_libraries(test_state PRIVATE cue_eval)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AC-15 的可重复验证：real-faults 的每一类故障都用**真 cued 管线**跑一遍
+# AC-15 / FR-EVAL.13 的可重复验证：real-faults 的每一类故障都用**真 cued 管线**跑一遍
 # 「故障态 → 修复态」，repeat 次，断言根因与 SLA 判定逐次一致。
 #
 # 为什么用 --record-tools：scripted 模式在不给 --record-tools/--endpoint/--replay-tools
@@ -10,27 +10,35 @@
 # 每类的「故障态」读数取自 state.jsonl 里 query_metrics 的真实观测（注入后会等 4 条
 # 新采样再取证，见 eval.cpp），修复态读数取自 harness 重测的 final_fps。
 #
-# 断言：
+# 断言按**类别**（expect.root_cause）而不是 case id 组织——这是扩到 6 类 × 3 个
+# case 后的硬要求：同一类下 severity/档位不同，但物理指纹必须一致。
 #   a) 每个 case 的 repeat 次都 scored（无 run_error）、root_cause 全部等于 expect；
-#   b) repeat 次的 SLA 判定一致且为通过（阈值由本机实测校准：故障态 11~21 fps、
-#      修复态 28.4~28.7 fps，五类统一 fps_min=25，两侧各留 ≥3 fps）；
+#   b) repeat 次的 SLA 判定一致且为通过（阈值由本机实测校准：故障态明显低于阈值、
+#      修复态 29.4~30.2 fps）；
 #   c) 每类的**诊断特征**在故障态成立（这是 AC-15「可从工具面诊断」的可执行判据）：
-#        network_loss         injected>0, dropped=0, frames_in=frames_out
-#        bandwidth_insufficient budget_drops>0, dropped>0, injected=0
-#        queue_backlog        frames_in-frames_out≥10, dropped=0, budget_drops=0
-#        encoder_too_slow     encode_p50>33ms, op_p50<1ms, budget_drops=0
-#        resolution_too_high  encode_p50>33ms, op_p50>1.5ms, budget_drops=0
-#        network_delay        send_p99_ms>100, delayed_pkts>0, injected=dropped=budget_drops=0,
-#                             ingress_late=0（延迟不降 fps，这正是它与丢包的区别）
-#   d) 故障态 fps 的 repeat 间离散度 ≤30%，修复态 fps 的离散度 ≤10%（阈值没抖）。
+#        network_loss         ingress_drop 注入；injected>0, dropped=0, budget_drops=0
+#        bandwidth_insufficient budget_drops>0, dropped>0, injected=0, encode<33ms
+#        queue_backlog        frames_in-frames_out≥10, dropped=0, budget_drops=0, injected=0
+#        encoder_too_slow     encode_p50>33ms, op_p50<1ms, budget_drops=dropped=0
+#        resolution_too_high  encode_p50>33ms, op_p50>1.5ms, budget_drops=dropped=0
+#        network_delay        send_p99 ≥ 0.8×注入值, delayed_pkts>0, 三类丢包计数全 0,
+#                             ingress_late=0、故障窗口 e2e p99 越过声明阈值而修复后回落
+#                             （延迟不降 fps，这正是它与丢包的区别）
+#   d) 修复态 fps 的 repeat 间离散度 ≤10%（阈值不能踩在抖动边缘）。故障态的离散度
+#      **只记录不设阈值**：编码/分辨率受限时 cued 的 1 s 窗口读数本身能抖到 ±40%
+#      （实测 res-4k-medium 43%），真正要求一致的是逐次的 SLA 判定与每类指纹；
+#      时延类不降 fps，反过来要求故障窗口仍然达标；
+#   e) **全量模式**下 suite 必须满足 FR-EVAL.13：≥5 类故障、每类 ≥3 个 case。
 #
 # 用法：
 #   BUILD_DIR=build ./scripts/test-real-faults.sh
 #   REPEAT=3 BUILD_DIR=build SUITE=suites/real-faults.json ./scripts/test-real-faults.sh
+#   ./scripts/test-real-faults.sh --fast     # 每类只抽样第一个 case（6 个；未给 REPEAT 时 repeat=1），
+#                                            # 默认全量 18 个 case × REPEAT=3
 #
 # 环境变量：BUILD_DIR（默认 build；有自己的构建目录时用 BUILD_DIR 指定）、REPEAT（默认 3）、
 #           SUITE（默认 suites/real-faults.json）、WORK_ROOT（默认 runs/ac15-real-faults）、
-#           PUSH_SECONDS（每次推流秒数，默认 3）
+#           PUSH_SECONDS（每次推流秒数，默认 10）
 #
 # 前置：node（scripts/test-client.mjs 合成推流）、python3（state.jsonl 断言）、ss。
 # 端口：cue-eval 的子进程后端把 cued 的 WS/probe 端口固定在 9000/9001；
@@ -41,12 +49,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 BUILD_DIR="${BUILD_DIR:-build}"
+REPEAT_ENV="${REPEAT:-}"  # 记住「用户有没有显式给 REPEAT」：fast 模式未显式给时默认 1
 REPEAT="${REPEAT:-3}"
 SUITE="${SUITE:-suites/real-faults.json}"
 WORK="${WORK_ROOT:-$ROOT/runs/ac15-real-faults}"
 PUSH_SECONDS="${PUSH_SECONDS:-10}"
 WS_PORT=9000
 PROBE_PORT=9001
+
+FAST=0
+for arg in "$@"; do
+  case "$arg" in
+    --fast) FAST=1 ;;
+    --all) FAST=0 ;;
+    *) echo "未知参数: $arg（可用：--fast / --all）" >&2; exit 2 ;;
+  esac
+done
+# fast 模式没显式给 REPEAT 时按 1 次跑：抽样是冒烟用，不做 pass^k。
+if [ "$FAST" = "1" ] && [ -z "$REPEAT_ENV" ]; then
+  REPEAT=1
+fi
 
 CUED="$ROOT/$BUILD_DIR/cued"
 EVAL="$ROOT/$BUILD_DIR/cue-eval"
@@ -92,6 +114,30 @@ trap cleanup EXIT INT TERM
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
+
+# --fast：每类只保留 suite 里的第一个 case，写一份过滤后的 suite 到工作目录。
+# 默认**不抽样**：全量 6 类 × 3 个 case 才是 FR-EVAL.13 的口径，抽样只用于快速冒烟。
+if [ "$FAST" = "1" ]; then
+  FILTERED="$WORK/suite-fast.json"
+  FILTERED_N=$(python3 - "$SUITE" "$FILTERED" <<'PY'
+import json, sys
+suite = json.load(open(sys.argv[1], encoding="utf-8"))
+seen, kept = set(), []
+for c in suite["cases"]:
+    root = c["expect"]["root_cause"]
+    if root in seen:
+        continue
+    seen.add(root)
+    kept.append(c)
+suite["cases"] = kept
+json.dump(suite, open(sys.argv[2], "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+print(len(kept))
+PY
+)
+  SUITE="$FILTERED"
+  note "fast 模式：每类抽样 1 个 case（$FILTERED_N 个）；默认全跑请去掉 --fast"
+fi
+
 note "工作目录 $WORK（BUILD_DIR=$BUILD_DIR REPEAT=$REPEAT SUITE=$SUITE）"
 
 # ---- 合成推流：真 WS 帧 → cued 解码 → 指标里就有真实抖动 ----
@@ -127,16 +173,47 @@ EXPECT_SPAWN=$((REPEAT * $(python3 -c "import json,sys;print(len(json.load(open(
   fail "只启动了 $SPAWNED 次 cued（预期 ≥ $EXPECT_SPAWN）：说明没有真的跑管线"
 
 # ---- 断言 + 输出对照表 ----
-note "断言：根因 / SLA / 诊断特征 / 离散度"
-python3 - "$WORK" "$REPEAT" "$SUITE" <<'PY'
+note "断言：根因 / SLA / 每类诊断特征 / 离散度"
+python3 - "$WORK" "$REPEAT" "$SUITE" "$FAST" <<'PY'
 import glob
 import json
 import sys
 
-work, repeat, suite_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+work, repeat, suite_path, fast = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1"
 suite = json.load(open(suite_path, encoding="utf-8"))
 cases = {c["id"]: c for c in suite["cases"]}
-sla_fps = {cid: c["expect"]["sla"]["fps_min"] for cid, c in cases.items()}
+
+
+def sla_of(c):
+    return c["expect"].get("sla") or {}
+
+
+def fps_min_of(c):
+    s = sla_of(c)
+    v = s.get("fps_min", s.get("usable_fps_min", 0))
+    return float(v or 0)
+
+
+def fault_of(c):
+    """(kind, value)：注入量按 kind 从 params 里取，单位随类而不同。"""
+    f = c.get("fault") or {}
+    kind = f.get("kind") or "none"
+    params = f.get("params") or {}
+    key = {"drop": "drop_pct", "ingress_drop": "inject_ingress_pct", "rate": "rate_mbps",
+           "backlog": "queue_fps", "delay": "delay_ms", "jitter": "jitter_ms"}.get(kind)
+    value = float(params.get(key, 0)) if key else 0.0
+    return kind, value
+
+
+# FR-EVAL.13：全量模式下 suite 本身必须 ≥5 类、每类 ≥3 个 case。
+# 放在断言里而不是只在文档里写：删掉 case 或加一类只给 1 个，这个脚本先红。
+classes = {}
+for c in suite["cases"]:
+    classes.setdefault(c["expect"]["root_cause"], []).append(c["id"])
+if not fast:
+    assert len(classes) >= 5, f"FR-EVAL.13：只有 {len(classes)} 类故障（要求 ≥5）：{sorted(classes)}"
+    thin = {r: len(ids) for r, ids in classes.items() if len(ids) < 3}
+    assert not thin, f"FR-EVAL.13：每类至少 3 个 case，不足的：{thin}"
 
 paths = glob.glob(f"{work}/out/run-*/state.jsonl")
 if len(paths) != 1:
@@ -175,22 +252,33 @@ def num(v, nd=2):
     return "n/a" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
 
 
-def check_signature(cid, root, m):
-    """AC-15 的「可从工具面诊断」判据：每类在故障态的指纹必须成立。"""
+def check_signature(c, o, m):
+    """AC-15 的「可从工具面诊断」判据：每类在故障态的指纹必须成立。
+
+    按类别（root_cause）分派，case id 不参与判断——同一类下的 3 个 case 只在
+    severity/档位上不同，物理指纹必须一致。注入量从 case 里读，不写死。
+    """
+    cid = c["id"]
+    root = c["expect"]["root_cause"]
+    kind, value = fault_of(c)
+    sla = sla_of(c)
     fps = m["fps"]
     enc = m.get("encode_p50_ms")
     op = m.get("op_p50_ms")
     if root == "network_loss":
+        assert kind == "ingress_drop", f"{cid}: network_loss 必须用上行丢包（实际 {kind}）"
         assert m["injected"] > 0, f"{cid}: 上行丢包应让 injected>0，实际 {m['injected']}"
         assert m["dropped"] == 0, f"{cid}: 单分片帧整体丢失不产生 dropped，实际 {m['dropped']}"
         assert m["frames_in"] >= m["frames_out"], f"{cid}: frames_in<frames_out 不合理"
         assert m["budget_drops"] == 0, f"{cid}: 丢包不应触发令牌桶丢帧"
     elif root == "bandwidth_insufficient":
+        assert kind == "rate", f"{cid}: bandwidth_insufficient 必须用限速（实际 {kind}）"
         assert m["budget_drops"] > 0, f"{cid}: 限速应让 budget_drops>0，实际 {m['budget_drops']}"
         assert m["dropped"] >= m["budget_drops"], f"{cid}: 令牌桶丢帧应计进 dropped"
         assert m["injected"] == 0, f"{cid}: 限速与注入丢包是两回事，injected 应为 0"
         assert enc is not None and enc < 33.0, f"{cid}: 编码不该是瓶颈，encode_p50={enc}"
     elif root == "queue_backlog":
+        assert kind == "backlog", f"{cid}: queue_backlog 必须用排队节奏（实际 {kind}）"
         gap = m["frames_in"] - m["frames_out"]
         assert gap >= 10, f"{cid}: 排队应让 frames_in-frames_out 增长，实际 {gap}"
         assert m["dropped"] == 0, f"{cid}: 排队模式不丢帧，dropped 应为 0"
@@ -200,38 +288,50 @@ def check_signature(cid, root, m):
         assert enc is not None and enc > 33.0, f"{cid}: 慢 preset 应让 encode_p50>33ms，实际 {enc}"
         assert op is not None and op < 1.0, f"{cid}: 720p 的缩放开销应 <1ms，实际 {op}"
         assert m["budget_drops"] == 0 and m["dropped"] == 0, f"{cid}: 编码慢不是链路问题"
+    elif root == "resolution_too_high":
+        assert enc is not None and enc > 33.0, f"{cid}: 4K 编码应超预算，实际 {enc}"
+        assert op is not None and op > 1.5, f"{cid}: 4K 缩放（op 段）应明显，实际 {op}"
+        assert m["budget_drops"] == 0 and m["dropped"] == 0, f"{cid}: 分辨率高不是链路问题"
     elif root == "network_delay":
         # 时延类：唯一成立的是"包都发出去了、只是晚了"。fps 不掉、丢包计数全 0，
-        # 所以判据只能落在 send 段分位与延迟计数上。
-        assert m.get("send_p99_ms") is not None and m["send_p99_ms"] > 100.0, (
-            f"{cid}: 200ms 延迟应让 send_p99 明显上升，实际 {m.get('send_p99_ms')}")
+        # 所以判据只能落在 send 段分位、延迟计数与故障窗口的端到端 p99 上。
+        assert kind in ("delay", "jitter"), f"{cid}: network_delay 必须用延迟/抖动（实际 {kind}）"
+        send99 = m.get("send_p99_ms")
+        assert send99 is not None and send99 >= 0.8 * value, (
+            f"{cid}: 注入 {value}ms 但 send_p99={send99}，发送段没有反映出延迟")
         assert m["injected"] == 0, f"{cid}: 时延不是丢包，injected 应为 0（实际 {m['injected']}）"
         assert m["budget_drops"] == 0 and m["dropped"] == 0, (
             f"{cid}: 时延不该触发任何丢帧（budget_drops={m['budget_drops']} dropped={m['dropped']}）")
         assert m.get("delayed_pkts", 0) > 0, f"{cid}: delayed_pkts 应随注入增长"
         assert m.get("ingress_late", 0) == 0, (
             f"{cid}: 下行延迟注入不该让帧在 cued 侧被判迟到（ingress_late={m.get('ingress_late')}）")
-        assert fps >= sla_fps[cid], (
-            f"{cid}: 时延故障不降 fps，故障窗口应仍然达标（fps={fps} < {sla_fps[cid]}）")
-    elif root == "resolution_too_high":
-        assert enc is not None and enc > 33.0, f"{cid}: 4K 编码应超预算，实际 {enc}"
-        assert op is not None and op > 1.5, f"{cid}: 4K 缩放（op 段）应明显，实际 {op}"
-        assert m["budget_drops"] == 0 and m["dropped"] == 0, f"{cid}: 分辨率高不是链路问题"
+        assert fps >= fps_min_of(c), (
+            f"{cid}: 时延故障不降 fps，故障窗口应仍然达标（fps={fps} < {fps_min_of(c)}）")
+        # 端到端：故障窗口的 p99 必须真的越过声明阈值，修复后必须回落——
+        # 否则这个 case 的时延 SLA 就是两条都成立的摆设。
+        lat = float(sla.get("lat_p99_ms") or 0)
+        assert lat > 0, f"{cid}: 时延类 case 必须声明 lat_p99_ms"
+        p99_fault, p99_after = o.get("p99_ms_fault"), o.get("p99_ms_after")
+        assert p99_fault is not None and p99_fault > lat, (
+            f"{cid}: 故障窗口 e2e p99={p99_fault} 未越过阈值 {lat}ms，时延故障不可判")
+        assert p99_after is not None and p99_after < lat, (
+            f"{cid}: 修复后 e2e p99={p99_after} 未回落到阈值 {lat}ms 以内")
     else:
         raise SystemExit(f"{cid}: 未知 root_cause {root}")
     # 时延类的那条反命题已在分支里断言（fps 不降），这里只管"故障会让 fps 掉下来"的五类
     if root != "network_delay":
-        assert fps < sla_fps[cid], f"{cid}: 故障态 fps={fps} 应低于阈值 {sla_fps[cid]}"
+        assert fps < fps_min_of(c), f"{cid}: 故障态 fps={fps} 应低于阈值 {fps_min_of(c)}"
 
 
 print()
-print("| case | 根因 | 故障态实测（fps / 关键计数） | 修复态 fps | SLA×%d |" % repeat)
+print("| case | 根因（注入） | 故障态实测 fps / 关键计数 | 修复态 fps | SLA×%d |" % repeat)
 print("|---|---|---|---|---|")
 verdicts = {}
-for cid in cases:
+for cid, c in cases.items():
     got = rows.get(cid, [])
     assert len(got) == repeat, f"{cid}: 期望 {repeat} 次结果，实际 {len(got)}"
-    want = cases[cid]["expect"]["root_cause"]
+    want = c["expect"]["root_cause"]
+    kind, value = fault_of(c)
     faults = [fault_metrics(o) for o in got]
     roots = [o["diagnosis"]["root_cause"] for o in got]
     atlas = [bool(o["score"]["sla"]) for o in got]
@@ -239,61 +339,57 @@ for cid in cases:
     for o in got:
         assert o["scored"], f"{cid}: 存在 run_error: {o.get('error_kind')}"
         assert not o.get("error_kind"), f"{cid}: run_error={o.get('error_kind')}"
-    assert set(roots) == {want}, f"{cid}: 3 次根因 {roots} 与期望 {want} 不一致"
+    assert set(roots) == {want}, f"{cid}: {repeat} 次根因 {roots} 与期望 {want} 不一致"
     assert set(atlas) == {True}, f"{cid}: SLA 判定在 {repeat} 次里不一致：{atlas}"
     assert len(set(roots)) == 1, f"{cid}: 根因在 {repeat} 次里不一致：{roots}"
-    # 故障态：每次读数都要明显低于阈值（≥3 fps 余量），且每类的诊断指纹成立。
-    # 单次读数是 cued 的 1 s 窗口：编码/限速受限时一窗内只完成 10~18 帧，
-    # 窗口读数本身就有 ±30% 的抖动——这正是「余量」必须留够的原因；
-    # 真正要一致的是 SLA 判定（逐次断言），不是这一窗的 fps。
-    f_fault = [m["fps"] for m in faults]
-    # 时延类故障**不**降 fps（数据报只是晚到，发送速率不变）——这正是它与丢包/限速的
-    # 区别。所以对这类 case 断言的是反向命题：故障窗口里 fps 必须仍然达标；
-    # 其余五类沿用"故障态必须明显低于阈值"的余量断言。
+    fps_min = fps_min_of(c)
     fps_degraded = want != "network_delay"
-    for m in faults:
+    for o, m in zip(got, faults):
         if fps_degraded:
-            assert m["fps"] <= sla_fps[cid] - 3.0, (
-                f"{cid}: 故障态 fps={m['fps']:.2f} 与阈值 {sla_fps[cid]} 的余量不足 3 fps")
+            assert m["fps"] <= fps_min - 3.0, (
+                f"{cid}: 故障态 fps={m['fps']:.2f} 与阈值 {fps_min} 的余量不足 3 fps")
         else:
-            assert m["fps"] >= sla_fps[cid], (
-                f"{cid}: 时延故障不该降 fps，实际 {m['fps']:.2f} < 阈值 {sla_fps[cid]}")
-        check_signature(cid, want, m)
-    f_base = med(f_fault)
+            assert m["fps"] >= fps_min, (
+                f"{cid}: 时延故障不该降 fps，实际 {m['fps']:.2f} < 阈值 {fps_min}")
+        check_signature(c, o, m)
+    f_base = med([m["fps"] for m in faults])
     if fps_degraded:
-        assert f_base <= sla_fps[cid] - 5.0, (
-            f"{cid}: 故障态 fps 中位数 {f_base:.2f} 与阈值 {sla_fps[cid]} 之间余量不足 5 fps")
+        assert f_base <= fps_min - 5.0, (
+            f"{cid}: 故障态 fps 中位数 {f_base:.2f} 与阈值 {fps_min} 之间余量不足 5 fps")
     # 修复态：每次都要明显高于阈值，且离散度小（阈值不能踩在抖动边缘）
     for f in finals:
-        assert f >= sla_fps[cid] + 1.0, f"{cid}: 修复态 fps={f:.2f} 未明显高于阈值 {sla_fps[cid]}"
+        assert f >= fps_min + 1.0, f"{cid}: 修复态 fps={f:.2f} 未明显高于阈值 {fps_min}"
     fspread = (max(finals) - min(finals)) / med(finals)
     assert fspread <= 0.10, f"{cid}: 修复态 fps 离散度 {fspread:.0%} 过大：{finals}"
-    spread = (max(f_fault) - min(f_fault)) / f_base
-    verdicts[cid] = ("/".join("过" for _ in atlas), roots, f_base, med(finals), faults[0], spread)
+    fspread_fault = (max(m["fps"] for m in faults) - min(m["fps"] for m in faults)) / f_base
+    verdicts[cid] = (want, f_base, med(finals), fspread_fault)
     m = faults[0]
-    detail = (
-        f"injected={num(m['injected'],0)} dropped={num(m['dropped'],0)} "
-        f"budget_drops={num(m['budget_drops'],0)} "
-        f"frames_in/out={num(m['frames_in'],0)}/{num(m['frames_out'],0)} "
-        f"encode_p50={num(m['encode_p50_ms'])}ms op_p50={num(m['op_p50_ms'])}ms"
-    )
+    detail = (f"injected={num(m['injected'],0)} dropped={num(m['dropped'],0)} "
+              f"budget_drops={num(m['budget_drops'],0)} "
+              f"frames_in/out={num(m['frames_in'],0)}/{num(m['frames_out'],0)} "
+              f"encode_p50={num(m['encode_p50_ms'])}ms op_p50={num(m['op_p50_ms'])}ms")
     if want == "network_delay":
         detail += (f" send_p50/p99={num(m.get('send_p50_ms'))}/{num(m.get('send_p99_ms'))}ms"
                    f" delayed_pkts={num(m.get('delayed_pkts'),0)}"
-                   f" ingress_late={num(m.get('ingress_late'),0)}")
-    print(f"| {cid} | {want} | fps={num(med(f_fault))}；{detail} | {num(med(finals))} | "
-          f"{verdicts[cid][0]} |")
+                   f" ingress_late={num(m.get('ingress_late'),0)}"
+                   f" e2e_p99 故障/修复={num(got[0].get('p99_ms_fault'))}/"
+                   f"{num(got[0].get('p99_ms_after'))}ms")
+    shown = int(value) if value == int(value) else value
+    print(f"| {cid} | {want}（{kind}={shown}） | "
+          f"fps={num(med([m['fps'] for m in faults]))}；{detail} | {num(med(finals))} | "
+          f"{'/'.join('过' for _ in atlas)} |")
 
 print()
 print()
 print("一致性：每个 case 的 %d 次 root_cause 完全相同、SLA 判定完全相同（全部通过）。" % repeat)
-print("离散度（故障态是 cued 的 1 s 窗口读数，编码/限速受限时窗口本身就抖；修复态约 1 s 一条、取 3 条中位）：")
+print("离散度（故障态是 cued 的 1 s 窗口读数，编码/限速受限时窗口本身就抖；修复态取 %d 条中位）：" % repeat)
 for cid, v in verdicts.items():
-    print(f"  {cid}: 故障态 {v[2]:.2f} fps（repeat 间 {v[5]:.0%}）、修复态 {v[3]:.2f} fps")
-print("判据：故障态每条读数在五类丢包/限速/编码 case 上低于阈值 ≥3 fps（中位 ≥5 fps）；"
+    print(f"  {cid}: [{v[0]}] 故障态 {v[1]:.2f} fps（repeat 间 {v[3]:.0%}）、修复态 {v[2]:.2f} fps")
+print("判据：故障态每条读数在丢包/限速/编码/排队类上低于阈值 ≥3 fps（中位 ≥5 fps）；"
       "时延类（network_delay）反过来要求故障态 fps 仍然达标（它不降 fps），"
-      "另由 send 段分位与 delayed_pkts 的指纹成立来证明故障确实在。修复态每次都高于阈值 ≥1 fps。")
+      "且故障窗口 e2e p99 越过声明阈值、修复后回落。修复态每次都高于阈值 ≥1 fps。")
 PY
 
 note "全部通过。证据：$WORK（eval.log / out/run-*/state.jsonl / tools/*.tools.jsonl）"
 note "总耗时 ${ELAPSED}s（含 repeat=$REPEAT）"
+if [ "$FAST" = "1" ]; then note "注意：本次是 fast 模式（每类抽样 1 个），不是 FR-EVAL.13 的全量口径"; fi
