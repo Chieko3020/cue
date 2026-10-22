@@ -17,6 +17,10 @@ namespace cue::agent {
 
 using json = nlohmann::json;
 
+// 会话持久化（FR-AGENT.5）：只在这里前向声明，避免 agent.h ⇄ session.h 互相包含
+class SessionLog;
+struct LoadedSession;
+
 enum class Stage { Collect, Diagnose, Repair, Verify, Done, GiveUp };
 const char* stage_name(Stage s);
 
@@ -43,9 +47,12 @@ struct RunResult {
   double cost_yuan = 0.0;
   Diagnosis diagnosis;
   std::string error;
+  // 会话写盘失败（磁盘满/权限/锁丢失…）。**不让它把已经跑完的诊断判成失败**，
+  // 但必须能被调用方看到：静默失败等于"用户以为有存档、崩溃后什么都没有"。
+  std::string session_error;
   // "跑完了" 必须是 "到达 done 且没有 error"：只有 stage 会把「done without verify」
   // 这种自相矛盾的结果报成成功（eval 侧又按 error 记为 agent_error）。
-  bool ok() const { return final_stage == Stage::Done && error.empty(); }
+  bool ok() const { return final_stage == Stage::Done && error.empty() && session_error.empty(); }
 };
 
 class Runner {
@@ -71,6 +78,17 @@ class Runner {
     // 非空且被置位 = 中止本次 run（SIGTERM / 外部取消）。每轮开始与每次 LLM 调用前检查；
     // 它不参与成本/轮次预算，也不写 done 阶段：取消的 run 一律以 error="cancelled" 失败。
     const std::atomic<bool>* cancel = nullptr;
+
+    // ---- 会话持久化（FR-AGENT.5）----
+    // 非空：把本次 run 的完整轨迹（含**当时那份 system prompt**）逐条追加进 session。
+    // 每条状态变化都落盘，进程被 kill -9 之后文件里是到那一刻为止的完整快照。
+    SessionLog* session = nullptr;
+    // 非空：从已加载的 session 继续——阶段复位到中断时的阶段、预算从累计值接着算、
+    // 对话逐条重放（system prompt 用 session 里记的，不用 cfg_.system_prompt）。
+    // 通常与 session 一起给：resume 决定起点，session 决定往哪写。
+    const LoadedSession* resume = nullptr;
+    // 新会话 meta 里的 mode（"run" / "demo" / "eval"）；恢复时不使用。
+    std::string session_mode = "run";
   };
 
   Runner(llm::ILlmClient& llm, const tool::Registry& tools, Config cfg);

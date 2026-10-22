@@ -252,6 +252,7 @@ add_library(cue_agent STATIC
   src/llm/cassette.cpp
   src/tool/registry.cpp
   src/agent/runner.cpp
+  src/agent/session.cpp
   src/common/sha256.cpp)
 target_link_libraries(cue_agent PUBLIC
   cue_proto nlohmann_json::nlohmann_json PkgConfig::CURL Threads::Threads)
@@ -312,6 +313,13 @@ add_test(NAME wire COMMAND test_wire)
 add_executable(test_agent tests/test_agent.cpp)
 target_link_libraries(test_agent PRIVATE cue_agent)
 add_test(NAME agent COMMAND test_agent)
+
+# T-19（FR-AGENT.5）：会话持久化与中断恢复——六类记录往返 / 尾部残行容错 / 预算续算 /
+# 阶段复位 / 已结束会话拒绝续写 / 单写者锁 / 未回填 tool_call 的合成修复。
+# 全是本地文件读写 + ScriptedClient，毫秒级跑完（不联网、不起管线）。
+add_executable(test_session tests/test_session.cpp)
+target_link_libraries(test_session PRIVATE cue_agent)
+add_test(NAME session COMMAND test_session)
 
 add_executable(test_context tests/test_context.cpp)
 target_link_libraries(test_context PRIVATE cue_agent)
@@ -432,7 +440,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 # 测试不属于任何一层：它们要能同时看见所有头文件（包括故意写错的越界组合，
 # 那是测试的职责）。统一在这里补全，避免 20 多个 target 各写一遍。
 set(CUE_TEST_TARGETS
-  test_wire test_agent test_context test_eval test_generator test_state test_compare
+  test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_control_channel test_tools test_delay_injector test_nack test_capture
   test_config test_metrics)
@@ -538,7 +546,8 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # "ASan runtime does not come first"，也不会被 ASan 的 shadow 映射撞坏 RLIMIT_AS。
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
-  foreach(_t wire agent context eval state compare console cassette probe sandbox jitter_buffer
+  foreach(_t wire agent session context eval state compare console cassette probe sandbox
+            jitter_buffer
             control_channel tools delay_injector nack capture config metrics)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()

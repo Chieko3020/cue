@@ -8,6 +8,7 @@
 
 #include "cue/agent/agent.h"
 #include "cue/agent/context.h"
+#include "cue/agent/session.h"
 #include "cue/common/clock.h"
 
 namespace cue::agent {
@@ -186,7 +187,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   // 退出原因：预算耗尽/异常都必须体现为 GiveUp + 非空 error（否则评测会把
   // "没跑完"当成"答错"计入成功率分母，审查实测过这个污染路径）。
   std::string stop_reason;
-  const int64_t t_start = now_us();
+  int64_t t_start = now_us();
   const int64_t wall_limit_us = int64_t(budget.max_wall_s) * 1'000'000LL;
   // 成本单价：input/output 分开计价（未配置时回落到统一单价）。估算，非账单。
   const double price_in = cfg_.prompt_yuan_per_mtok > 0 ? cfg_.prompt_yuan_per_mtok : cfg_.yuan_per_mtok;
@@ -202,10 +203,84 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     return cfg_.cancel != nullptr && cfg_.cancel->load(std::memory_order_relaxed);
   };
 
+  // ---- 会话持久化（FR-AGENT.5）----
+  // 写盘失败只记一次并报事件：它不能把已经跑完的诊断判成失败，但绝不能静默——
+  // "用户以为有存档、崩溃后什么都没有"是最坏的结果。
+  auto note_write = [&](std::expected<void, std::string>&& w) {
+    if (w) return;
+    if (r.session_error.empty()) {
+      r.session_error = std::move(w.error());
+      emit("session.write_error", {{"error", r.session_error}});
+    }
+  };
+  auto write = [&](auto&& fn) {
+    if (cfg_.session == nullptr) return;
+    note_write(fn(*cfg_.session));
+  };
+  // 墙钟累计（含恢复前那段）：resume 时把 t_start 前移到"已花掉的时长"，
+  // 于是 now - t_start 天然就是累计值，预算检查与 budget 记录用的是同一个量。
+  auto wall_us = [&] { return now_us() - t_start; };
+  auto progress = [&] { return SessionProgress{r.turns, r.cost_yuan, wall_us()}; };
+
   std::vector<llm::ChatMessage> msgs;
-  msgs.push_back(msg("system", cfg_.system_prompt));
-  msgs.push_back(msg("user", goal));
-  emit("run.start", {{"goal", goal}, {"budget", {{"max_turns", budget.max_turns}}}});
+  // 所有入历史的路径都走 push：进上下文的同时落盘。漏掉任何一处，恢复后模型看到的
+  // 世界就和中断前不一致（尤其 system prompt 与 tool 结果的配对）。
+  auto push = [&](llm::ChatMessage m) {
+    write([&](SessionLog& s) { return s.write_message(m); });
+    msgs.push_back(std::move(m));
+  };
+
+  std::string goal_eff = goal;
+  if (cfg_.resume != nullptr) {
+    const LoadedSession& rs = *cfg_.resume;
+    // 防御：已结束的会话不该走到这里（open_session 会拒绝），但 Runner 不能依赖调用方
+    if (rs.stage == Stage::Done || rs.stage == Stage::GiveUp || rs.messages.empty()) {
+      r.final_stage = Stage::GiveUp;
+      if (rs.messages.empty()) {
+        r.error = "session 里没有可恢复的对话（缺 system/user）";
+      } else {
+        r.error = std::string("该会话已结束（阶段 ") + stage_name(rs.stage) + "），拒绝恢复";
+      }
+      emit("session.resume_failed", {{"error", r.error}});
+      return r;
+    }
+    msgs = rs.messages;
+    stage = rs.stage;
+    // 预算续算：轮次与成本是精确值（session 里逐轮记的），不是从头开始
+    r.turns = rs.progress.turns;
+    r.cost_yuan = rs.progress.cost_yuan;
+    used_observe = rs.used_observe;
+    used_mutating = rs.used_mutating;
+    consecutive_rejects = rs.consecutive_rejects;
+    r.diagnosis = rs.diagnosis;
+    if (rs.meta.contains("goal") && rs.meta["goal"].is_string()) {
+      goal_eff = rs.meta["goal"].get<std::string>();
+    }
+    // 墙钟：把 t_start 往前挪已耗时长，剩余预算 = max_wall - 已经花掉的
+    t_start = now_us() - rs.progress.wall_us;
+    // 中断在「assistant(tool_calls) 已落盘、tool 结果还没落盘」之间：补合成结果并落盘，
+    // 否则历史里有一个没回填的 tool_call，下一次请求直接被 API 400 拒掉。
+    for (const auto& synthetic : rs.synthetic_tail) {
+      write([&](SessionLog& s) { return s.write_message(synthetic, true); });
+      msgs.push_back(synthetic);
+    }
+    emit("session.resumed", {{"path", rs.path},
+                             {"from_stage", stage_name(stage)},
+                             {"turns", r.turns},
+                             {"cost_yuan", r.cost_yuan},
+                             {"messages", static_cast<int>(msgs.size())}});
+  } else {
+    // 新会话：meta 先落盘（含**当时那份** system prompt 与 goal，恢复时以此为准）
+    write([&](SessionLog& s) {
+      return s.write_meta(cfg_.model, cfg_.session_mode, cfg_.system_prompt, goal);
+    });
+    push(msg("system", cfg_.system_prompt));
+    push(msg("user", goal));
+  }
+  emit("run.start", {{"goal", goal_eff},
+                     {"budget", {{"max_turns", budget.max_turns}}},
+                     {"stage", stage_name(stage)},
+                     {"resumed", cfg_.resume != nullptr}});
 
   while (r.turns < budget.max_turns) {
     // 每轮开始先看取消：预算检查在它之后，取消优先（否则会被报成预算耗尽）
@@ -270,6 +345,10 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     }
     r.cost_yuan +=
         (double(resp->usage.prompt_tokens) * price_in + double(resp->usage.completion_tokens) * price_out) / 1e6;
+    // 预算落盘放在这里：轮次与成本已经结算，崩溃后从这份累计值接着算
+    write([&](SessionLog& s) {
+      return s.write_budget(progress(), used_observe, used_mutating, consecutive_rejects);
+    });
     emit("llm.response",
          {{"turn", r.turns}, {"content", resp->content}, {"tool_calls", resp->tool_calls.size()}});
 
@@ -287,18 +366,18 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       // finish_reason=length：输出被 max_tokens 截断，工具参数可能是半截 JSON（SPEC §7.9）。
       // 不执行本轮的调用，回灌要求模型精简后重试（算一轮，受轮次预算约束）。
       emit("llm.truncated", {{"turn", r.turns}, {"content_bytes", resp->content.size()}});
-      if (!resp->content.empty()) msgs.push_back(msg("assistant", resp->content));
-      msgs.push_back(msg("user", "上一次输出因 max_tokens 被截断（finish_reason=length），"
-                                "工具参数可能不完整而无法执行。请精简输出后重试："
-                                "一次只调用必要的工具，evidence 只摘抄关键片段。"));
+      if (!resp->content.empty()) push(msg("assistant", resp->content));
+      push(msg("user", "上一次输出因 max_tokens 被截断（finish_reason=length），"
+                       "工具参数可能不完整而无法执行。请精简输出后重试："
+                       "一次只调用必要的工具，evidence 只摘抄关键片段。"));
       continue;
     }
 
     if (resp->tool_calls.empty()) {
       // 无工具调用不能推进状态（审查实测：verify 阶段模型说句"好了"就直接 done）。
       // 只算一轮无效轮次并把要求回灌，由模型自己决定下一步。
-      if (!resp->content.empty()) msgs.push_back(msg("assistant", resp->content));
-      msgs.push_back(msg("user", "本轮没有调用任何工具，状态不会推进。请调用工具；" + stage_hint(stage)));
+      if (!resp->content.empty()) push(msg("assistant", resp->content));
+      push(msg("user", "本轮没有调用任何工具，状态不会推进。请调用工具；" + stage_hint(stage)));
       emit("turn.no_tool_call", {{"turn", r.turns}, {"stage", stage_name(stage)}});
       continue;
     }
@@ -307,7 +386,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     {
       llm::ChatMessage m = msg("assistant", resp->content);
       m.tool_calls = resp->tool_calls;
-      msgs.push_back(std::move(m));
+      push(std::move(m));
     }
 
     std::size_t i = 0;
@@ -376,11 +455,25 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
           ++consecutive_rejects;
           const json next_j = args.contains("next") ? args["next"] : json(nullptr);
           emit("guard.reject", {{"next", next_j}, {"reason", reject}});
-          msgs.push_back(tool_msg("拒绝：" + reject, tc.id, "stage_complete"));
+          // 守卫拒绝也要留痕：恢复后必须能解释"当时为什么没进入下一阶段"
+          const std::string to_name =
+              next_j.is_string() ? next_j.get<std::string>() : std::string("?");
+          write([&](SessionLog& s) {
+            return s.write_stage(stage, to_name, false, reject, progress(), used_observe,
+                                 used_mutating, consecutive_rejects, r.diagnosis);
+          });
+          push(tool_msg("拒绝：" + reject, tc.id, "stage_complete"));
           if (consecutive_rejects >= 2) {  // SPEC §7.5：连续 2 次守卫拒绝 → give_up
             // 错误串保留 "too many guard rejects" 前缀：src/eval/eval.cpp 的
             // classify_run_error 按这个子串分类为 agent_guard_loop（本轮不能改 eval/*）
             stop_reason = "too many guard rejects (consecutive 2)";
+            // 这一次迁移是 harness 强制的，不是模型请求的：forced 让会话审计能区分两者；
+            // from 必须是**迁移前**的阶段（先落盘再改 stage，否则记录里是 give_up→give_up）
+            write([&](SessionLog& s) {
+              return s.write_stage(stage, "give_up", false, stop_reason, progress(), used_observe,
+                                   used_mutating, consecutive_rejects, r.diagnosis,
+                                   /*forced=*/true);
+            });
             stage = Stage::GiveUp;
             emit("stage.enter", {{"stage", stage_name(stage)}, {"reason", stop_reason}});
             ++i;
@@ -389,14 +482,20 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
           continue;
         }
 
+        // from 必须是迁移**前**的阶段：先记下再改 stage，否则记录里永远是 X→X
+        const Stage from_stage = stage;
         stage = *target;
         consecutive_rejects = 0;
+        write([&](SessionLog& s) {
+          return s.write_stage(from_stage, stage_name(stage), true, "", progress(), used_observe,
+                               used_mutating, consecutive_rejects, r.diagnosis);
+        });
         {
           json data{{"stage", stage_name(stage)}};
           if (stage == Stage::Done) data["verify"] = verify_kind;
           emit("stage.enter", data);
         }
-        msgs.push_back(tool_msg("ok, now in stage " + std::string(stage_name(stage)), tc.id, "stage_complete"));
+        push(tool_msg("ok, now in stage " + std::string(stage_name(stage)), tc.id, "stage_complete"));
         if (stage == Stage::Done || stage == Stage::GiveUp) {
           ++i;
           break;
@@ -407,35 +506,66 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       // ---- 普通工具：审批 + 校验 + 执行 ----
       json args = json::parse(tc.arguments, nullptr, false);
       if (args.is_discarded()) {
-        msgs.push_back(tool_msg("参数不是合法 JSON", tc.id, tc.name));
+        push(tool_msg("参数不是合法 JSON", tc.id, tc.name));
         continue;
       }
 
       // 风险/审批策略只在 Registry::call_guarded 里实现一处——任何新调用点都不会绕过审批
+      const int64_t t_tool = now_us();
       const auto g = tools_.call_guarded(tc.name, args, cfg_.ctx, [&](tool::Risk risk) {
         emit("tool.call", {{"tool", tc.name}, {"risk", tool::risk_name(risk)}, {"args", args}});
       });
+      const int64_t tool_us = now_us() - t_tool;
 
       if (g.status == tool::GuardedCall::Status::ApprovalDenied) {
+        write([&](SessionLog& s) {
+          return s.write_tool(tc.name, args, false, g.error, tool_us, /*approval_denied=*/true,
+                              tool::risk_name(g.risk), r.turns);
+        });
         emit("approval.denied", {{"tool", tc.name}, {"risk", tool::risk_name(g.risk)}});
-        msgs.push_back(tool_msg(g.error, tc.id, tc.name));
+        push(tool_msg(g.error, tc.id, tc.name));
         continue;
       }
       if (g.status == tool::GuardedCall::Status::Failed) {
+        write([&](SessionLog& s) {
+          return s.write_tool(tc.name, args, false, g.error, tool_us, /*approval_denied=*/false,
+                              tool::risk_name(g.risk), r.turns);
+        });
         emit("tool.error", {{"tool", tc.name}, {"error", g.error}});
-        msgs.push_back(tool_msg("错误：" + g.error, tc.id, tc.name));
+        push(tool_msg("错误：" + g.error, tc.id, tc.name));
         continue;
       }
 
+      write([&](SessionLog& s) {
+        return s.write_tool(tc.name, args, g.result.ok, g.result.content, tool_us,
+                            /*approval_denied=*/false, tool::risk_name(g.risk), r.turns);
+      });
       emit("tool.result", {{"tool", tc.name}, {"ok", g.result.ok}, {"data", g.result.data}});
       // 失败的观测不算观测（cued 未收到流时 query_metrics 返回 ok=false）
-      if (tools_.is_observation_tool(tc.name) && g.result.ok) used_observe = true;
+      if (tools_.is_observation_tool(tc.name) && g.result.ok) {
+        used_observe = true;
+        // 观测快照单独落盘：判分要校验"证据在真实观测里存在"，而对话里的 tool 消息
+        // 可能被上下文裁剪或截断，不能当审计真值。
+        ObservationRecord ob;
+        ob.tool = tc.name;
+        ob.args = args;
+        ob.text = g.result.content;
+        ob.data = g.result.data;
+        ob.turn = r.turns;
+        write([&](SessionLog& s) { return s.write_observation(ob); });
+      }
       // 「修复动作」= 任何非只读工具成功：dangerous（如 inject_fault）同样是改状态，
       // 只算 Mutating 会让「靠取消注入完成修复」的合理轨迹被守卫永远卡在 repair。
       if (g.risk != tool::Risk::ReadOnly && g.result.ok) used_mutating = true;
 
-      msgs.push_back(tool_msg(g.result.content, tc.id, tc.name));
+      push(tool_msg(g.result.content, tc.id, tc.name));
     }
+
+    // 守卫标志可能在同一轮里变化（第一次成功观测 / 第一次写操作）：立刻落盘，
+    // 否则恢复时守卫会拿一个过时的标志去判断"能不能进 diagnose/verify"。
+    write([&](SessionLog& s) {
+      return s.write_budget(progress(), used_observe, used_mutating, consecutive_rejects);
+    });
 
     // 取消发生在工具之间：同批剩余 tool_call 不回填（run 到此结束，不会再有下一次
     // LLM 调用需要这份历史），直接以 cancelled 收口
@@ -448,8 +578,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     // 否则 assistant(tool_calls) 后面缺 tool 结果，事件流/历史都是坏的配对。
     if (stage == Stage::Done || stage == Stage::GiveUp) {
       for (; i < resp->tool_calls.size(); ++i) {
-        msgs.push_back(
-            tool_msg("未执行：本阶段已结束", resp->tool_calls[i].id, resp->tool_calls[i].name));
+        push(tool_msg("未执行：本阶段已结束", resp->tool_calls[i].id, resp->tool_calls[i].name));
       }
       break;
     }
@@ -474,6 +603,9 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     stop_reason = "done without verify";
   }
   r.error = stop_reason;
+  // end 记录：cancelled 的 end 仍标记 resumable（取消只是这次 run 被叫停），
+  // 其余结束原因把会话封口
+  write([&](SessionLog& s) { return s.write_end(r.final_stage, stop_reason, progress()); });
   emit("run.end", {{"stage", stage_name(r.final_stage)},
                    {"turns", r.turns},
                    {"cost_yuan", r.cost_yuan},
