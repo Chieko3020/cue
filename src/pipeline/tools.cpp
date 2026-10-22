@@ -74,8 +74,16 @@ void add_probe_metrics(json& j, const ProbeMetrics& p) {
   j["e2e_recv_p50_us"] = pct(p.recv.p50);
   j["e2e_reassembly_p50_us"] = pct(p.reassembly.p50);
   j["e2e_decode_p50_us"] = pct(p.decode.p50);
-  // 抖动缓冲段：cued 侧还没实现，probe 如实输出 null 并带原因（不写 0）
+  // 抖动缓冲段：probe 侧的等待时长（进队 → 放行）。没有样本时是 null，绝不写 0。
   j["e2e_buffer_p50_us"] = pct(p.buffer.p50);
+  j["e2e_buffer_p99_us"] = pct(p.buffer.p99);
+  // 抖动缓冲的状态：level 涨说明升档在换平滑（代价是延迟），skipped 涨说明帧真的丢了。
+  j["e2e_jb_level"] = p.jb_level;
+  j["e2e_jb_switches"] = p.jb_switches;
+  j["e2e_jb_target_frames"] = p.jb_target_frames;
+  j["e2e_jb_depth"] = p.jb_depth;
+  j["e2e_jb_skipped"] = p.jb_skipped;
+  j["e2e_jb_late"] = p.jb_late;
   if (!p.buffer_reason.empty()) j["e2e_buffer_reason"] = p.buffer_reason;
 }
 

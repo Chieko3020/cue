@@ -3,7 +3,8 @@
 //
 // 六段埋点（SPEC §5.3）：
 //   recv   首片到达 → 本帧重组完成（帧内首片到齐时间）
-//   buffer 帧重组耗时（M2a 与 recv 同口径，M2b 拆出抖动缓冲后分离）
+//   buffer 帧在抖动缓冲里的真实等待（进队 → 放行）；T-04 之前这里记的是重组耗时，
+//          与 recv 同口径，等于没有抖动缓冲这一段
 //   decode libavcodec 解码耗时
 //   op     ProcessorChain 耗时（M2a 为 passthrough，恒 ~0）
 //   encode 编码耗时（M2b 转码后才非 0）
@@ -44,6 +45,7 @@ extern "C" {
 #include "cue/common/clock.h"
 #include "cue/media/encoder.h"
 #include "cue/media/h264_decoder.h"
+#include "cue/media/jitter_buffer.h"
 #include "cue/proto/wire.h"
 
 namespace beast = boost::beast;
@@ -327,7 +329,8 @@ json stage_ms(const Ring& r, double p) {
   return double(r.pct(p)) / 1000.0;
 }
 
-void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, uint64_t& frames_prev) {
+void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
+            uint64_t& frames_prev, const cue::media::JitterBufferStats& jb) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
   const double fps = double(df) / dt;
@@ -354,7 +357,13 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
                   double(rings[i].pct(0.99)) / 1000.0);
     }
   }
-  std::printf(" ms(p50/p95/p99)\n");
+  std::printf(" ms(p50/p95/p99)");
+  // 抖动缓冲的状态单列：jb_depth 是"现在压着几帧"，jb_skipped/jb_late 是累计计数，
+  // 与六段一样每秒一行，agent 才能把「buffer 段涨」和「队列在涨」关联起来。
+  std::printf("  jb depth=%zu lvl=%zu tgt=%zu sw=%llu skip=%llu late=%llu\n", jb.depth, jb.level,
+              jb.target_frames, static_cast<unsigned long long>(jb.switches),
+              static_cast<unsigned long long>(jb.skipped),
+              static_cast<unsigned long long>(jb.late_dropped));
   // 结构化指标行：process_control 只认这一行（严格整行前缀 "METRICS "），不再靠裸子串
   // 匹配 "in="/"dec="（cued 多打一个 frames_in= 就会串味，review #29）。
   // 六段里未被采样的段写 null：报告里显示 n/a，不能被 0 冒充实测。
@@ -381,7 +390,15 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
          {"audio_decoded", false},
          // 真解码 = libavcodec opus 解码器 + 下行音频数据报类型 + 播放侧，是独立的一条链路；
          // 本批只做「收、计、可见」，原因显式写进指标，不做静默降级。
-         {"audio_decode_reason", "opus_decode_not_implemented"}};
+         {"audio_decode_reason", "opus_decode_not_implemented"},
+         // 抖动缓冲（FR-PIPE.2）：cued 侧是固定档，所以 jb_level 恒为 0、jb_switches 恒为 0；
+         // 深度/跳帧/迟到是真实计数。它们与 buffer 段一起构成"抖动缓冲到底在干什么"的证据。
+         {"jb_depth", jb.depth},
+         {"jb_level", jb.level},
+         {"jb_switches", jb.switches},
+         {"jb_target_frames", jb.target_frames},
+         {"jb_skipped", jb.skipped},
+         {"jb_late", jb.late_dropped}};
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
       m[kStageNames[i]] = nullptr;
@@ -405,6 +422,12 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
               {"serr", c.send_errors},
               {"audio_frames_in", c.audio_frames_in},
               {"audio_decoded", false},
+              {"buffer_p50", stage_ms(rings[1], 0.50)},
+              {"buffer_p99", stage_ms(rings[1], 0.99)},
+              {"jb_depth", jb.depth},
+              {"jb_skipped", jb.skipped},
+              {"jb_late", jb.late_dropped},
+              {"jb_level", jb.level},
               {"decode_p50", stage_ms(rings[2], 0.50)},
               {"decode_p99", stage_ms(rings[2], 0.99)},
               {"op_p50", stage_ms(rings[3], 0.50)},
@@ -467,6 +490,13 @@ int main(int argc, char** argv) {
   uint64_t inject_seed = 42;
   std::string inject_trace;
   bool fec_enabled = true;
+  // 抖动缓冲（FR-PIPE.2）。默认值刻意取小：目标深度 2 帧 = 1 个帧间隔（30 fps ≈ 33 ms）的
+  // 驻留，等待预算 40 ms 只用来兜「缺帧时要不要再等一会儿」。把这两个数调大能把乱序纠正
+  // 得更彻底，代价是端到端延迟线性上升——所以默认不下"几百 ms"那种手。
+  bool jitter_enabled = true;
+  long long jitter_max_frames = 8;     // 队列容量硬上限（帧）
+  long long jitter_budget_ms = 40;     // 缺帧等待预算
+  long long jitter_target_frames = 2;  // 固定目标深度（帧）
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
@@ -543,6 +573,16 @@ int main(int argc, char** argv) {
       const auto val = next();
       if (val.empty()) bad(val);
       inject_trace = std::string(val);
+    } else if (a == "--jitter") {
+      const auto val = next();
+      if (val != "on" && val != "off") bad(val);
+      jitter_enabled = (val == "on");
+    } else if (a == "--jitter-max-frames") {
+      jitter_max_frames = want_int(1, 64);
+    } else if (a == "--jitter-budget-ms") {
+      jitter_budget_ms = want_int(0, 2000);
+    } else if (a == "--jitter-target-frames") {
+      jitter_target_frames = want_int(1, 16);
     } else if (a == "--fec") {
       const auto val = next();
       if (val != "on" && val != "off") bad(val);
@@ -554,6 +594,8 @@ int main(int argc, char** argv) {
           "     [--gop N] [--preset NAME] [--threads N] [--send-mbps F]\n"
           "     [--inject-drop 0..100] [--inject-ingress-drop 0..100] [--queue-fps N]\n"
           "     [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
+          "     [--jitter on|off] [--jitter-target-frames 2] [--jitter-max-frames 8]\n"
+          "     [--jitter-budget-ms 40]\n"
           "  --bind 默认 127.0.0.1（只回环）；跨机演示才用 --bind 0.0.0.0，\n"
           "  并且必须自己限制网络可达性（cued 本身没有鉴权）。\n");
       return 0;
@@ -562,6 +604,23 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
+
+  // 抖动缓冲配置：目标深度 > 容量上限时把容量抬上去，否则每帧进队就立刻被挤掉，
+  // 那不是"配置得紧"，是配置矛盾（静默按错误行为跑是最难查的一类）。
+  if (jitter_target_frames > jitter_max_frames) {
+    std::fprintf(stderr,
+                 "[cued] --jitter-target-frames %lld > --jitter-max-frames %lld："
+                 "容量上限抬到目标深度\n",
+                 jitter_target_frames, jitter_max_frames);
+    jitter_max_frames = jitter_target_frames;
+  }
+  cue::media::JitterBufferConfig jb_cfg;
+  jb_cfg.enabled = jitter_enabled;
+  jb_cfg.max_frames = static_cast<std::size_t>(jitter_max_frames);
+  jb_cfg.target_frames = static_cast<std::size_t>(jitter_target_frames);
+  jb_cfg.budget_us = jitter_budget_ms * 1000;
+  // 帧间隔由 PTS 增量的 EWMA 自估（浏览器/转码的帧率不一定是 --fps），这里只给起点。
+  jb_cfg.nominal_interval_us = 1'000'000 / std::max<int>(out_fps, 1);
 
   cue::media::H264Decoder decoder;
   {
@@ -750,7 +809,11 @@ int main(int argc, char** argv) {
                   {"transcode", transcode_enabled ? "on" : "off"},
                   {"fec", fec_enabled ? "on" : "off"},
                   {"inject_drop", inject_drop},
-                  {"inject_seed", inject_seed}});
+                  {"inject_seed", inject_seed},
+                  {"jitter", jitter_enabled ? "on" : "off"},
+                  {"jitter_target_frames", jitter_target_frames},
+                  {"jitter_max_frames", jitter_max_frames},
+                  {"jitter_budget_ms", jitter_budget_ms}});
   // 带 --inject-drop 启动 = 这条管线上电时故障已经生效（agent 会看到 applied 而不是 cleared）
   if (inject_drop > 0.0) {
     emit_event("fault.applied", json{{"kind", "drop"},
@@ -795,6 +858,9 @@ int main(int argc, char** argv) {
     // 上行注入用的包序号（独立空间）
     uint64_t in_seq = 0;
     RateLimitedLog err_log;  // 每连接一份：重启 cued 后限流状态跟着新会话走
+    // 抖动缓冲：每连接一份。上一代的 PTS 基线与积压帧不能带进新会话，
+    // 否则新流前几帧会被判成"迟到"、旧帧会被发到新 probe 上。
+    cue::media::JitterBuffer jb(jb_cfg);
 
     // 发送侧排队（--queue-fps）：不足「一帧的发送时刻」就留在队列里，而不是丢包。
     // 队列深度对 agent 可见：frames_in（已收帧）减 frames_out（已发帧）就是积压深度，
@@ -832,6 +898,186 @@ int main(int argc, char** argv) {
       }
     };
 
+    // 一帧「重组完成之后」的全部处理：解码 → 处理器链 → 编码 → 令牌桶 → FEC → 发送。
+    // 抽成 lambda 是因为抖动缓冲在**三个不同时刻**放行帧（push 当场 / 周期 tick / 断连接 flush），
+    // 三条入口必须走同一条路径，否则「jb 放行的帧」和「直接处理的帧」会长出两套行为。
+    auto process_frame = [&](cue::media::JitterFrame&& jf) {
+      const uint64_t pts_us = jf.pts_us;
+      const uint32_t frame_id = jf.frame_id;
+      bool keyframe = jf.keyframe;
+      // buffer 段：这一帧在抖动缓冲里真实等了多久（= 放行时刻 − 进队时刻）。
+      // recv 段只含重组，两段从此不再同口径——旧实现两段都写重组耗时，buffer 等于没有。
+      rings[1].push(jf.wait_us);
+
+      const int64_t t_dec0 = cue::now_us();
+      std::string derr;
+      AVFrame* decoded = decoder.decode(jf.payload, derr);
+      rings[2].push(cue::now_us() - t_dec0);
+      if (decoded) {
+        ++c.frames_decoded;
+      } else if (!derr.empty()) {
+        ++c.decode_errors;
+      }
+
+      const int64_t t_op0 = cue::now_us();
+      std::vector<uint8_t> encoded_buf;
+      std::span<const uint8_t> payload{jf.payload};
+      bool skip_send = false;
+      // 下行载荷的真实 codec：passthrough 时是上行声明的 codec，转码后恒为 H264。
+      // probe 靠它决定「解码」还是「跳过」，所以必须跟着**实际发出的字节**走，
+      // 而不是跟着上行包头走（转码路径一旦改成 H264，上行可能是别的 codec）。
+      uint8_t out_codec = jf.codec;
+      int64_t enc_us = 0;      // 编码段真实耗时（review #3：不再无条件记 0）
+      bool enc_sampled = false;  // transcode 关闭时该段不采样，报告里显示 "-"
+
+      if (transcode_enabled && decoded) {
+        if (!chain_ready) {
+          const int dw = out_w > 0 ? out_w : decoded->width;
+          const int dh = out_h > 0 ? out_h : decoded->height;
+          std::string cerr;
+          if (chain.configure(dw, dh, out_kbps, out_fps, out_gop, preset, cerr, out_threads)) {
+            chain_ready = true;
+            std::fprintf(stderr, "[cued] transcode on: %dx%d %dkbps gop=%d preset=%s\n", dw, dh,
+                         out_kbps, out_gop, preset.c_str());
+          } else {
+            transcode_enabled = false;
+            std::fprintf(stderr, "[cued] transcode configure failed: %s\n", cerr.c_str());
+          }
+        }
+        if (chain_ready) {
+          std::string eerr;
+          auto enc = chain.process(decoded, pts_us, eerr, &enc_us);
+          enc_sampled = enc_us > 0;
+          if (enc) {
+            encoded_buf = std::move(enc->data);
+            payload = encoded_buf;
+            keyframe = enc->keyframe;
+            out_codec = static_cast<uint8_t>(cue::proto::Codec::H264);
+          } else {
+            skip_send = true;
+            if (enc.error() == cue::media::EncodeError::EncoderDelay) {
+              ++c.encode_delays;  // 编码器内部延迟：正常路径，不是配置错误
+            } else {
+              // 尺寸/格式/编码器错误过去混在 nullopt 里"指标轻微变差"，现在必须可见（review #31）
+              ++c.encode_errors;
+              err_log.log(cue::now_us(), std::string("编码失败[") +
+                                             cue::media::encode_error_name(enc.error()) + "]: " +
+                                             eerr);
+            }
+          }
+        }
+      }
+      // op 段只算 ProcessorChain 里除编码以外的部分（M2a 为 passthrough ≈0），
+      // encode 段单列 —— 两段互不重叠，否则「op 含编码」会让六段口径名不副实。
+      const int64_t t_op_end = cue::now_us();
+      rings[3].push(std::max<int64_t>(0, t_op_end - t_op0 - enc_us));
+      if (enc_sampled) rings[4].push(enc_us);
+
+      const int64_t t_send0 = cue::now_us();
+      std::vector<std::vector<uint8_t>> datagrams;
+      cue::proto::SplitError split_err = cue::proto::SplitError::None;
+      bool budget_ok = false;
+      if (!skip_send) {
+        datagrams = cue::proto::split_into_datagrams(payload, session_id, frame_id, pts_us,
+                                                     keyframe, &split_err, out_codec);
+        if (!datagrams.empty()) {
+          // SPEC §7.2 令牌桶：按包计费（含 24 B 头）、64 包突发、不足时先丢非关键帧
+          budget_ok = keyframe ? bucket.take_key(datagrams.size(), t_send0)
+                               : bucket.take_nonkey(datagrams.size(), t_send0);
+        }
+      }
+      if (skip_send) {
+        ++c.frames_dropped;
+      } else if (split_err != cue::proto::SplitError::None) {
+        // 空帧 / 超过单帧 1024 分片：协议上限内发不出去，计 rejected 而不是静默丢（#34）
+        ++c.rejected;
+        ++c.frames_dropped;
+        err_log.log(cue::now_us(),
+                    std::string("帧无法切片: ") + cue::proto::split_error_reason(split_err));
+      } else if (!budget_ok) {
+        ++c.budget_drops;
+        ++c.frames_dropped;
+      } else {
+        xmit_cache.put(frame_id, datagrams);
+
+        // 注入丢包：判定序号必须是整条连接全局单调、且与 FEC 包共用一个序号空间。
+        // 旧口径 frame_id*64+pk 在分片数 >64（720p 关键帧）时会与 FEC 包撞号，
+        // 且 frame_id*64+64 == (frame_id+1)*64 会跨帧撞号 → 丢包不再独立同分布。
+        // 注入在「进队之前」判定：排队模式换的是发送节奏，不是丢包策略。
+        std::vector<std::vector<uint8_t>> outgoing;
+        outgoing.reserve(datagrams.size() + 1);
+        std::size_t pk = 0;
+        for (const auto& d : datagrams) {
+          const std::size_t cur_pk = pk++;
+          if (injector.drop(pkt_seq++)) {
+            ++c.injected_drops;
+            if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", frame_id, cur_pk);
+            continue;
+          }
+          outgoing.push_back(d);
+        }
+
+        // XOR-FEC：一帧的所有分片为一组，生成 1 个冗余包。
+        // 载荷的字节序/字段顺序收在 wire.h（两端不再各写一份 memcpy，review #18）。
+        if (fec_enabled && datagrams.size() > 1) {
+          std::size_t maxlen = 0;
+          for (auto& d : datagrams) {
+            maxlen = std::max(maxlen, d.size() - cue::proto::kDatagramHeaderSize);
+          }
+          std::vector<uint8_t> parity(maxlen, 0);
+          for (auto& d : datagrams) {
+            const std::size_t plen = d.size() - cue::proto::kDatagramHeaderSize;
+            for (std::size_t i = 0; i < plen; ++i) {
+              parity[i] ^= d[cue::proto::kDatagramHeaderSize + i];
+            }
+          }
+          cue::proto::DatagramHeader fh;
+          fh.type = static_cast<uint8_t>(cue::proto::DownType::Fec);
+          fh.session_id = session_id;
+          fh.frame_id = frame_id;
+          fh.frag_index = 0;
+          fh.frag_count = static_cast<uint16_t>(datagrams.size());
+          fh.pts_us = pts_us;
+          // 冗余包本身不是可解码帧：显式不标注 codec，免得 probe 拿奇偶校验字节去解码
+          fh.codec = cue::proto::kDownCodecUnspecified;
+          const auto hdr = cue::proto::encode(fh);
+          std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
+          cue::proto::FecPayloadHeader ph;
+          ph.base_frame_id = frame_id;
+          ph.group_index = 0;  // 一帧一组：显式写 0，不再靠"零填充"隐式约定
+          ph.member_count = static_cast<uint16_t>(datagrams.size());
+          const auto phb = cue::proto::encode(ph);
+          fpkt.insert(fpkt.end(), phb.begin(), phb.end());
+          fpkt.insert(fpkt.end(), parity.begin(), parity.end());
+          if (!injector.drop(pkt_seq++)) outgoing.push_back(std::move(fpkt));
+        }
+
+        if (queue_period_us > 0.0) {
+          // 排队模式：帧不立即发，按 --queue-fps 的节奏排空。队列涨 = 消费侧积压
+          // （frames_in - frames_out 单调增长、dropped 不涨），与令牌桶丢包
+          // （budget_drops 涨、队列不涨）是两种可区分的故障证据。
+          if (sendq.size() >= kSendQueueMax) {
+            ++c.budget_drops;
+            ++c.frames_dropped;
+            err_log.log(t_send0, "发送队列已满：积压超过上限，按丢帧处理");
+          } else {
+            const int64_t due = send_due_us > 0 ? send_due_us : t_send0;
+            send_due_us = due + static_cast<int64_t>(queue_period_us);
+            sendq.push_back(QueuedSend{std::move(outgoing), due});
+            drain_sendq(t_send0);
+          }
+        } else {
+          // 真实上线率：只要有一包没被内核接受，这一帧就不算发出去（review #16）
+          bool all_sent = true;
+          for (const auto& d : outgoing) {
+            if (!send_dgram(d)) all_sent = false;
+          }
+          if (all_sent) ++c.frames_out;
+        }
+      }
+      rings[5].push(cue::now_us() - t_send0);
+    };
+
     for (;;) {
       beast::flat_buffer buf;
       ws.read(buf, ec);
@@ -843,14 +1089,20 @@ int main(int argc, char** argv) {
       {
         const int64_t now_tick = cue::now_us();
         if (now_tick - t_last_cleanup >= 500'000) {
+          // 抖动缓冲的到期帧必须由时间驱动放行：只靠 push 驱动的话，缺帧把前端挡住时
+          // 要等到下一个包才动，"等待预算"就变成了"等下一个包"（弱网下可能是几百 ms）。
+          for (auto& ready : jb.poll(now_tick)) process_frame(std::move(ready));
           cleanup_stale(pending, now_tick, c);
           t_last_cleanup = now_tick;
         }
         // 报告同样不能挂在「帧完成」上：整帧持续丢尾片时 fps/丢帧仍要可见
         if (now_tick - t_last_report >= 1'000'000) {
           if (queue_period_us > 0.0) drain_sendq(now_tick);  // 报点前先把到期帧发出去
+          // 报点前同样先放行抖动缓冲里的到期帧：否则这一秒的 jb_depth 会把"其实已经到期"
+          // 的帧算成积压，buffer 段也会少采样几帧。
+          for (auto& ready : jb.poll(now_tick)) process_frame(std::move(ready));
           c.decode_drops = decoder.stats().dropped;
-          report(rings, c, now_tick, t_last_report, frames_prev);
+          report(rings, c, now_tick, t_last_report, frames_prev, jb.stats());
         }
       }
 
@@ -993,9 +1245,10 @@ int main(int argc, char** argv) {
       if (!complete) continue;
       ++c.frames_in;  // 帧在「完成或超时」处结算（#35）
 
-      const int64_t t_buffer_done = cue::now_us();
-      rings[0].push(t_buffer_done - fa.first_seen_us);
-      rings[1].push(t_buffer_done - fa.first_seen_us);
+      const int64_t t_reasm_done = cue::now_us();
+      // recv 段：数据报到达 → 本帧重组完成。段意保持原样，**不再**把重组耗时灌进 buffer：
+      // 那是「帧齐了」的开销，抖动缓冲的等待是另一个物理量（见 process_frame）。
+      rings[0].push(t_reasm_done - fa.first_seen_us);
 
       std::vector<uint8_t> frame;
       std::size_t total = 0;
@@ -1003,177 +1256,25 @@ int main(int argc, char** argv) {
       frame.reserve(total);
       for (const auto& part : fa.parts) frame.insert(frame.end(), part.begin(), part.end());
 
-      const int64_t t_dec0 = cue::now_us();
-      std::string derr;
-      AVFrame* decoded = decoder.decode(frame, derr);
-      rings[2].push(cue::now_us() - t_dec0);
-      if (decoded) {
-        ++c.frames_decoded;
-      } else if (!derr.empty()) {
-        ++c.decode_errors;
-      }
-
-      const int64_t t_op0 = cue::now_us();
-      std::vector<uint8_t> encoded_buf;
-      std::span<const uint8_t> payload{frame};
-      bool keyframe = fa.keyframe;
-      bool skip_send = false;
-      // 下行载荷的真实 codec：passthrough 时是上行声明的 codec，转码后恒为 H264。
-      // probe 靠它决定「解码」还是「跳过」，所以必须跟着**实际发出的字节**走，
-      // 而不是跟着上行包头走（转码路径一旦改成 H264，上行可能是别的 codec）。
-      uint8_t out_codec = h->codec;
-      int64_t enc_us = 0;      // 编码段真实耗时（review #3：不再无条件记 0）
-      bool enc_sampled = false;  // transcode 关闭时该段不采样，报告里显示 "-"
-
-      if (transcode_enabled && decoded) {
-        if (!chain_ready) {
-          const int dw = out_w > 0 ? out_w : decoded->width;
-          const int dh = out_h > 0 ? out_h : decoded->height;
-          std::string cerr;
-          if (chain.configure(dw, dh, out_kbps, out_fps, out_gop, preset, cerr, out_threads)) {
-            chain_ready = true;
-            std::fprintf(stderr, "[cued] transcode on: %dx%d %dkbps gop=%d preset=%s\n", dw, dh,
-                         out_kbps, out_gop, preset.c_str());
-          } else {
-            transcode_enabled = false;
-            std::fprintf(stderr, "[cued] transcode configure failed: %s\n", cerr.c_str());
-          }
-        }
-        if (chain_ready) {
-          std::string eerr;
-          auto enc = chain.process(decoded, fa.pts_us, eerr, &enc_us);
-          enc_sampled = enc_us > 0;
-          if (enc) {
-            encoded_buf = std::move(enc->data);
-            payload = encoded_buf;
-            keyframe = enc->keyframe;
-            out_codec = static_cast<uint8_t>(cue::proto::Codec::H264);
-          } else {
-            skip_send = true;
-            if (enc.error() == cue::media::EncodeError::EncoderDelay) {
-              ++c.encode_delays;  // 编码器内部延迟：正常路径，不是配置错误
-            } else {
-              // 尺寸/格式/编码器错误过去混在 nullopt 里"指标轻微变差"，现在必须可见（review #31）
-              ++c.encode_errors;
-              err_log.log(cue::now_us(), std::string("编码失败[") +
-                                             cue::media::encode_error_name(enc.error()) + "]: " +
-                                             eerr);
-            }
-          }
-        }
-      }
-      // op 段只算 ProcessorChain 里除编码以外的部分（M2a 为 passthrough ≈0），
-      // encode 段单列 —— 两段互不重叠，否则「op 含编码」会让六段口径名不副实。
-      const int64_t t_op_end = cue::now_us();
-      rings[3].push(std::max<int64_t>(0, t_op_end - t_op0 - enc_us));
-      if (enc_sampled) rings[4].push(enc_us);
-
-      const int64_t t_send0 = cue::now_us();
-      std::vector<std::vector<uint8_t>> datagrams;
-      cue::proto::SplitError split_err = cue::proto::SplitError::None;
-      bool budget_ok = false;
-      if (!skip_send) {
-        datagrams = cue::proto::split_into_datagrams(payload, session_id, h->frame_id, fa.pts_us,
-                                                     keyframe, &split_err, out_codec);
-        if (!datagrams.empty()) {
-          // SPEC §7.2 令牌桶：按包计费（含 24 B 头）、64 包突发、不足时先丢非关键帧
-          budget_ok = keyframe ? bucket.take_key(datagrams.size(), t_send0)
-                               : bucket.take_nonkey(datagrams.size(), t_send0);
-        }
-      }
-      if (skip_send) {
-        ++c.frames_dropped;
-      } else if (split_err != cue::proto::SplitError::None) {
-        // 空帧 / 超过单帧 1024 分片：协议上限内发不出去，计 rejected 而不是静默丢（#34）
-        ++c.rejected;
-        ++c.frames_dropped;
-        err_log.log(cue::now_us(),
-                    std::string("帧无法切片: ") + cue::proto::split_error_reason(split_err));
-      } else if (!budget_ok) {
-        ++c.budget_drops;
-        ++c.frames_dropped;
-      } else {
-        xmit_cache.put(h->frame_id, datagrams);
-
-        // 注入丢包：判定序号必须是整条连接全局单调、且与 FEC 包共用一个序号空间。
-        // 旧口径 frame_id*64+pk 在分片数 >64（720p 关键帧）时会与 FEC 包撞号，
-        // 且 frame_id*64+64 == (frame_id+1)*64 会跨帧撞号 → 丢包不再独立同分布。
-        // 注入在「进队之前」判定：排队模式换的是发送节奏，不是丢包策略。
-        std::vector<std::vector<uint8_t>> outgoing;
-        outgoing.reserve(datagrams.size() + 1);
-        std::size_t pk = 0;
-        for (const auto& d : datagrams) {
-          const std::size_t cur_pk = pk++;
-          if (injector.drop(pkt_seq++)) {
-            ++c.injected_drops;
-            if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", h->frame_id, cur_pk);
-            continue;
-          }
-          outgoing.push_back(d);
-        }
-
-        // XOR-FEC：一帧的所有分片为一组，生成 1 个冗余包。
-        // 载荷的字节序/字段顺序收在 wire.h（两端不再各写一份 memcpy，review #18）。
-        if (fec_enabled && datagrams.size() > 1) {
-          std::size_t maxlen = 0;
-          for (auto& d : datagrams) {
-            maxlen = std::max(maxlen, d.size() - cue::proto::kDatagramHeaderSize);
-          }
-          std::vector<uint8_t> parity(maxlen, 0);
-          for (auto& d : datagrams) {
-            const std::size_t plen = d.size() - cue::proto::kDatagramHeaderSize;
-            for (std::size_t i = 0; i < plen; ++i) {
-              parity[i] ^= d[cue::proto::kDatagramHeaderSize + i];
-            }
-          }
-          cue::proto::DatagramHeader fh;
-          fh.type = static_cast<uint8_t>(cue::proto::DownType::Fec);
-          fh.session_id = session_id;
-          fh.frame_id = h->frame_id;
-          fh.frag_index = 0;
-          fh.frag_count = static_cast<uint16_t>(datagrams.size());
-          fh.pts_us = fa.pts_us;
-          // 冗余包本身不是可解码帧：显式不标注 codec，免得 probe 拿奇偶校验字节去解码
-          fh.codec = cue::proto::kDownCodecUnspecified;
-          const auto hdr = cue::proto::encode(fh);
-          std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
-          cue::proto::FecPayloadHeader ph;
-          ph.base_frame_id = h->frame_id;
-          ph.group_index = 0;  // 一帧一组：显式写 0，不再靠"零填充"隐式约定
-          ph.member_count = static_cast<uint16_t>(datagrams.size());
-          const auto phb = cue::proto::encode(ph);
-          fpkt.insert(fpkt.end(), phb.begin(), phb.end());
-          fpkt.insert(fpkt.end(), parity.begin(), parity.end());
-          if (!injector.drop(pkt_seq++)) outgoing.push_back(std::move(fpkt));
-        }
-
-        if (queue_period_us > 0.0) {
-          // 排队模式：帧不立即发，按 --queue-fps 的节奏排空。队列涨 = 消费侧积压
-          // （frames_in - frames_out 单调增长、dropped 不涨），与令牌桶丢包
-          // （budget_drops 涨、队列不涨）是两种可区分的故障证据。
-          if (sendq.size() >= kSendQueueMax) {
-            ++c.budget_drops;
-            ++c.frames_dropped;
-            err_log.log(t_send0, "发送队列已满：积压超过上限，按丢帧处理");
-          } else {
-            const int64_t due = send_due_us > 0 ? send_due_us : t_send0;
-            send_due_us = due + static_cast<int64_t>(queue_period_us);
-            sendq.push_back(QueuedSend{std::move(outgoing), due});
-            drain_sendq(t_send0);
-          }
-        } else {
-          // 真实上线率：只要有一包没被内核接受，这一帧就不算发出去（review #16）
-          bool all_sent = true;
-          for (const auto& d : outgoing) {
-            if (!send_dgram(d)) all_sent = false;
-          }
-          if (all_sent) ++c.frames_out;
-        }
-      }
-      rings[5].push(cue::now_us() - t_send0);
-
+      // 重组之后、解码之前：进抖动缓冲。fa 是 pending 里的引用，erase 之后不可再用，
+      // 所以先把元信息搬进 JitterFrame，再 erase，最后 push。
+      cue::media::JitterFrame jf;
+      jf.pts_us = fa.pts_us;
+      jf.frame_id = h->frame_id;
+      jf.frag_count = fa.count;
+      jf.keyframe = fa.keyframe;
+      jf.codec = h->codec;
+      jf.payload = std::move(frame);
       pending.erase(h->frame_id);
+
+      for (auto& ready : jb.push(std::move(jf), t_reasm_done)) {
+        process_frame(std::move(ready));
+      }
     }
+    // 断连接时抖动缓冲里还压着几帧（最多一个 hold）。把它们发出去而不是静默丢弃：
+    // 丢掉的话每次断流都少几帧，probe 侧会把它看成 PTS 空洞（一次误判的"丢包"）。
+    // 这里用"远未来"的 poll 让它们在到期判据上无条件放行。
+    for (auto& ready : jb.poll(cue::now_us() + 10'000'000)) process_frame(std::move(ready));
     std::fprintf(stderr, "[cued] client disconnected\n");
   }
 }

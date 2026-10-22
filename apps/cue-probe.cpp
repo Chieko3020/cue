@@ -1,5 +1,5 @@
 // cue-probe — 下行接收端
-// UDP 收包 → 分片重组 → FEC/NACK → H.264 软解 → 帧统计（帧率 / 卡顿 / 四段延迟 / 端到端分位）
+// UDP 收包 → 分片重组 → 抖动缓冲 → FEC/NACK → H.264 软解 → 帧统计（帧率 / 卡顿 / 四段延迟 / 端到端分位）
 //
 // 延迟口径（SPEC §5：probe 通常跨机，与本机 cued 不是同一 CLOCK_MONOTONIC 基准）：
 //   pts_us 是 cued 时钟域的帧时间戳，直接拿 probe 的 now 去减会得到毫无意义的差值。
@@ -48,6 +48,7 @@ extern "C" {
 
 #include "cue/common/clock.h"
 #include "cue/media/h264_decoder.h"
+#include "cue/media/jitter_buffer.h"
 #include "cue/proto/wire.h"
 
 namespace net = boost::asio;
@@ -322,6 +323,7 @@ struct FrameStats {
   LatencyRing decode_us;      // 单帧解码耗时
   LatencyRing recv_us;        // 数据报到达 → 被读出
   LatencyRing reassembly_us;  // 首片到达 → 整帧完成
+  LatencyRing buffer_us;      // 抖动缓冲等待（进队 → 放行）
   uint64_t decoded = 0;       // 解码出的帧数（fps 的分子）
   uint64_t decode_errors = 0;
   uint64_t decode_skips = 0;    // 非 H264（或未标注）跳过解码的帧
@@ -557,6 +559,12 @@ int main(int argc, char** argv) {
   // 约 1 s，端到端指标会整段缺失。500 ms 仍然要求"当前 peer 确实安静了很久"
   // （30 fps 下任何活着的 cued 间隔都 ≤33 ms），足以防串流，又不至于吞掉重测窗口。
   long long peer_timeout_ms = 500;
+  // 抖动缓冲（FR-PROBE.4）：默认开、默认自适应。
+  // 档位阶梯是 2/4/8/16 帧；默认只允许升到 2 档（8 帧），因为 16 帧档在 30 fps 下
+  // 就是 500 ms 的驻留延迟——那个档位要显式 --jitter-max-level 3 才打开。
+  bool jitter_enabled = true;
+  long long jitter_budget_ms = 40;
+  long long jitter_max_level = 2;
   std::string bind_host = "0.0.0.0";
   std::vector<TcpReporters::Addr> report_addrs;
 
@@ -587,6 +595,16 @@ int main(int argc, char** argv) {
     } else if (a == "--report-addrs") {
       const auto val = next();
       if (!parse_report_addrs(val, report_addrs)) bad(a, val);
+    } else if (a == "--jitter") {
+      const auto val = next();
+      if (val != "on" && val != "off") bad(a, val);
+      jitter_enabled = (val == "on");
+    } else if (a == "--jitter-budget-ms") {
+      const auto val = next();
+      if (!parse_int(val, 0, 2000, jitter_budget_ms)) bad(a, val);
+    } else if (a == "--jitter-max-level") {
+      const auto val = next();
+      if (!parse_int(val, 0, 3, jitter_max_level)) bad(a, val);
     } else if (a == "--peer-timeout-ms") {
       const auto val = next();
       if (!parse_int(val, 50, 60000, peer_timeout_ms)) bad(a, val);
@@ -604,7 +622,8 @@ int main(int argc, char** argv) {
       std::printf(
           "cue-probe --port 9001 [--bind 0.0.0.0] [--nack on|off] [--nack-delay-ms 15]\n"
           "          [--nack-interval-ms 125] [--fps 30] [--stall-factor 1.5]\n"
-          "          [--peer-timeout-ms 500]\n"
+          "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
+          "          [--jitter-max-level 0..3]\n"
           "          [--report-addrs host:port[,host:port]]\n");
       return 0;
     } else {
@@ -619,6 +638,17 @@ int main(int argc, char** argv) {
   const int64_t frame_interval_us = 1'000'000 / nominal_fps;
   const int64_t stall_threshold_us =
       static_cast<int64_t>(stall_factor * static_cast<double>(frame_interval_us));
+
+  // 抖动缓冲配置：容量上限比最高档位多留 2 帧余量（留余量是为了"超过目标深度"能被观察到，
+  // 而不是一超就挤掉——容量是硬上限，不是目标深度）。
+  cue::media::JitterBufferConfig jb_cfg;
+  jb_cfg.enabled = jitter_enabled;
+  jb_cfg.adaptive = jitter_enabled;
+  jb_cfg.min_level = 0;
+  jb_cfg.max_level = static_cast<std::size_t>(jitter_max_level);
+  jb_cfg.max_frames = cue::media::kDepthLadder[jb_cfg.max_level] + 2;
+  jb_cfg.nominal_interval_us = frame_interval_us;
+  jb_cfg.budget_us = jitter_budget_ms * 1000;
 
   net::io_context ioc;
   boost::system::error_code ec;
@@ -673,13 +703,19 @@ int main(int argc, char** argv) {
             {"nack", nack_enabled ? "on" : "off"},
             {"nominal_fps", nominal_fps},
             {"stall_threshold_us", stall_threshold_us},
-            {"report_addrs", report_addrs.size()}});
+            {"report_addrs", report_addrs.size()},
+            {"jitter", jitter_enabled ? "on" : "off"},
+            {"jitter_budget_ms", jitter_budget_ms},
+            {"jitter_max_level", jitter_max_level},
+            {"jitter_max_frames", jb_cfg.max_frames}});
 
   std::map<uint32_t, FrameAcc> pending;
   LatencyRing lat;
   ClockAlign clk;
   DecodeState dec;
   FrameStats fs;
+  // 抖动缓冲：插在重组之后、解码之前。组件不带线程，队列与时间都由本循环驱动。
+  cue::media::JitterBuffer jb(jb_cfg);
   uint64_t frames = 0, lost_frames = 0, bytes = 0, packets = 0, fec_recovered = 0, nack_sent = 0;
   uint64_t rejected = 0, lat_invalid = 0, nack_pauses = 0, stats_reqs = 0;
   uint32_t max_completed = 0;
@@ -832,15 +868,13 @@ int main(int argc, char** argv) {
     }
   };
 
-  // 帧完成结算：所有分片到齐就计入帧数、延迟样本，然后解码
-  auto finish_if_complete = [&](uint32_t fid, FrameAcc& fa) {
-    for (const auto& pp : fa.parts) {
-      if (pp.empty()) return false;
-    }
-    const int64_t now_done = cue::now_us();
-    ++frames;
-    // 延迟 = probe 收帧时刻（换算到 cued 时钟域）− 帧时间戳
-    const int64_t lat_us = now_done + clk.offset_us - static_cast<int64_t>(fa.pts_us);
+  // 一帧从抖动缓冲放行之后的处理：采样端到端/缓冲段 → 解码 → 卡顿判定。
+  // 端到端延迟的口径在这里，而不是在"重组完成"处：帧真正可交付的时刻才是链路延迟，
+  // 接收端自己的抖动缓冲等待必须算进去。否则 buffer_us 涨了而 lat 不动，
+  // 两段数字会互相矛盾，报告上看起来像抖动缓冲白等了。
+  auto deliver = [&](const cue::media::JitterFrame& jf) {
+    const int64_t now_rel = cue::now_us();
+    const int64_t lat_us = now_rel + clk.offset_us - static_cast<int64_t>(jf.pts_us);
     if (clk.have && lat_plausible(lat_us)) {
       lat.push(lat_us);
     } else {
@@ -853,20 +887,41 @@ int main(int argc, char** argv) {
         warned_clock = true;
       }
     }
+    // 抖动缓冲段：进队 → 放行。这是 buffer_us 的唯一来源，不再是恒 null。
+    fs.buffer_us.push(std::max<int64_t>(0, jf.wait_us));
+    decode_one(jf.codec, jf.frag_count, {jf.payload.data(), jf.payload.size()});
+    // 卡顿按「帧与帧」的间隔算：与这一帧能否解出来无关（解不出来的帧同样占时间轴），
+    // 所以放在解码之后统一观察，而不是塞进解码分支（跳过/失败会漏掉间隔）。
+    fs.observe_gap(jf.pts_us, now_rel, stall_threshold_us);
+  };
+
+  // 抖动缓冲的时间驱动：主循环顶部、每个数据报之后、以及 poll 超时都走这里，
+  // 保证"等待预算"是按时间生效的，而不是按"下一个包什么时候来"生效。
+  auto drain_jb = [&](int64_t now) {
+    for (const auto& jf : jb.poll(now)) deliver(jf);
+  };
+
+  // 帧完成结算：所有分片到齐就计入帧数/重组分位/丢包窗口，然后**进抖动缓冲**。
+  // 「收到多少帧」在这里结算（与旧口径一致）；「什么时候能交付」由抖动缓冲决定。
+  auto finish_if_complete = [&](uint32_t fid, FrameAcc& fa) {
+    for (const auto& pp : fa.parts) {
+      if (pp.empty()) return false;
+    }
+    const int64_t now_done = cue::now_us();
+    ++frames;
     // 重组段：首片到达 → 整帧完成。这是 probe 自己能测的"重组开销"。
     fs.reassembly_us.push(std::max<int64_t>(0, now_done - fa.first_seen_us));
     if (!have_completed || fid > max_completed) max_completed = fid;
     have_completed = true;
     settle(win, fa);
-    const uint64_t pts_us = fa.pts_us;
-    const uint8_t codec = fa.codec;
-    const uint16_t frag_count = fa.count;
-    std::vector<uint8_t> frame = assemble(fa);
+    cue::media::JitterFrame jf;
+    jf.pts_us = fa.pts_us;
+    jf.frame_id = fid;
+    jf.frag_count = fa.count;
+    jf.codec = fa.codec;
+    jf.payload = assemble(fa);
     pending.erase(fid);
-    decode_one(codec, frag_count, {frame.data(), frame.size()});
-    // 卡顿按「帧与帧」的间隔算：与这一帧能否解出来无关（解不出来的帧同样占时间轴），
-    // 所以放在解码之后统一观察，而不是塞进解码分支（跳过/失败会漏掉间隔）。
-    fs.observe_gap(pts_us, cue::now_us(), stall_threshold_us);
+    for (const auto& ready : jb.push(std::move(jf), now_done)) deliver(ready);
     return true;
   };
 
@@ -894,6 +949,9 @@ int main(int argc, char** argv) {
   for (;;) {
     // ---- 周期任务放在循环顶部：FEC 分支 / 完全没包时都不会被跳过 ----
     const int64_t now_tick = cue::now_us();
+    // 抖动缓冲的到期帧先放行：后面的周期任务（清理/窗口/指标行）这一拍就该看到它们，
+    // 否则 buffer_us 的采样与 jb_depth 会慢一拍。
+    drain_jb(now_tick);
     if (now_tick >= next_stats_us) {
       if (stats_burst_left == kStatsBurst) clk.begin_batch();  // 批首：批内取 RTT 最小者
       send_stats_request(now_tick);
@@ -952,6 +1010,11 @@ int main(int argc, char** argv) {
           static_cast<unsigned long long>(fs.decode_skips),
           static_cast<unsigned long long>(fs.stalls),
           double(fs.max_stall_us) / 1000.0);
+      std::printf("jb depth=%zu lvl=%zu tgt=%zu sw=%llu skip=%llu late=%llu ",
+                  jb.stats().depth, jb.stats().level, jb.stats().target_frames,
+                  static_cast<unsigned long long>(jb.stats().switches),
+                  static_cast<unsigned long long>(jb.stats().skipped),
+                  static_cast<unsigned long long>(jb.stats().late_dropped));
       if (!clk.have) {
         std::printf("lat=unsynced(no clock offset yet, stats_req=%llu)\n",
                     static_cast<unsigned long long>(stats_reqs));
@@ -996,11 +1059,17 @@ int main(int argc, char** argv) {
           // 四段分解（微秒分位）：没样本 → null
           {"recv_us", seg_or_null(fs.recv_us)},
           {"reassembly_us", seg_or_null(fs.reassembly_us)},
-          // 抖动缓冲等待：cued 侧抖动缓冲尚未实现（另一批任务在做），接收端没有这一段
-          // 可测，所以这里恒为 null 并带上原因。等 cued 真的插入抖动缓冲后，
-          // 等待时长会随下行帧一起带过来（协议加字段），这一段才可能有数。
-          {"buffer_us", json(nullptr)},
-          {"buffer_reason", "cued_jitter_buffer_unimplemented"},
+          // 抖动缓冲等待：帧在**接收端**抖动缓冲里真实等了多久（进队 → 放行）。
+          // 没样本（这一秒没有帧被放行）仍然是 null——"没测到"不能写 0。
+          {"buffer_us", seg_or_null(fs.buffer_us)},
+          // 抖动缓冲档位（自适应）：jb_level 是当前档位，jb_switches 是切换次数，
+          // jb_skipped/jb_late 是累计计数。深度本身进 jb_depth。
+          {"jb_depth", jb.stats().depth},
+          {"jb_level", jb.stats().level},
+          {"jb_switches", jb.stats().switches},
+          {"jb_target_frames", jb.stats().target_frames},
+          {"jb_skipped", jb.stats().skipped},
+          {"jb_late", jb.stats().late_dropped},
           {"decode_us", seg_or_null(fs.decode_us)},
           {"decode_ms_p50", fs.decode_us.size() ? json(double(fs.decode_us.percentile(0.50)) / 1000.0)
                                                 : json(nullptr)},
@@ -1020,14 +1089,22 @@ int main(int argc, char** argv) {
       fs.decode_us.clear();
       fs.recv_us.clear();
       fs.reassembly_us.clear();
+      fs.buffer_us.clear();
       frames_prev = frames;
       decoded_prev = fs.decoded;
       t_last_report = now_tick;
     }
 
-    // ---- 等一个数据报：200 ms 超时保证上面的周期任务准时跑（无流时也能报指标） ----
+    // ---- 等一个数据报：超时取 min(200 ms, 抖动缓冲队首到期时刻) ----
+    // 200 ms 的上限保证周期任务（指标行/时钟对齐/NACK 节流）在无流时照常跑；
+    // 队首到期时刻更小时以它为准，否则"等待预算"只能等下一个包到达才生效。
+    int poll_timeout_ms = 200;
+    if (const int64_t deadline = jb.next_deadline_us(); deadline > 0) {
+      const int64_t wait_us = deadline - cue::now_us();
+      poll_timeout_ms = static_cast<int>(std::clamp<int64_t>(wait_us / 1000, 0, 200));
+    }
     pollfd pfd{udp_fd, POLLIN, 0};
-    const int pr = ::poll(&pfd, 1, 200);
+    const int pr = ::poll(&pfd, 1, poll_timeout_ms);
     if (pr <= 0) continue;
     sockaddr_in from{};
     int64_t recv_us_sample = -1;
@@ -1083,6 +1160,9 @@ int main(int argc, char** argv) {
         have_completed = false;
         dec.params = ParamSets{};
         dec.reset();
+        // 抖动缓冲同样要清：上一代的 PTS 基线还在的话，新流前几帧会被判成"迟到"丢掉，
+        // 那些帧里往往正好包含新编码器的 IDR/SPS。
+        jb.reset();
         emit("probe.stream_reset",
              json{{"reason", new_stream ? "new_stream" : "peer_switch"},
                   {"old_max_frame", old_max},

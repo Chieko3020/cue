@@ -106,14 +106,18 @@ add_library(cue_proto INTERFACE)
 target_include_directories(cue_proto INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ---- media 侧可执行：WS 接收 → 重组 → UDP 发送 ----
-add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp)
+# media/jitter_buffer：cued 与 probe 共用同一份实现（两侧的「buffer」段口径必须一致，
+# 否则两张图上的抖动缓冲延迟没法互相对照）。
+add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp
+  src/media/jitter_buffer.cpp)
 target_link_libraries(cued PRIVATE cue_proto Boost::system Threads::Threads PkgConfig::FFMPEG)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 
 # ---- cue-probe：下行接收端（UDP 重组 + H.264 软解 + 帧统计/端到端指标）----
 # probe 复用 media/h264_decoder（不另写一个解码器）：同一份 libavcodec 封装在
 # cued 与 probe 两侧的行为必须一致，否则两边的"解码耗时"没法对照。
-add_executable(cue-probe apps/cue-probe.cpp src/media/h264_decoder.cpp)
+add_executable(cue-probe apps/cue-probe.cpp src/media/h264_decoder.cpp
+  src/media/jitter_buffer.cpp)
 target_link_libraries(cue-probe PRIVATE cue_proto Threads::Threads PkgConfig::FFMPEG)
 target_compile_options(cue-probe PRIVATE -Wno-deprecated-declarations)
 
@@ -247,6 +251,12 @@ add_executable(test_sandbox tests/test_sandbox.cpp)
 target_link_libraries(test_sandbox PRIVATE cue_sandbox)
 add_test(NAME sandbox COMMAND test_sandbox)
 
+# media/jitter_buffer（技术设计文档 §13.1）：乱序重排 / 缺帧等待预算 / 超时跳帧 / 深度自适应
+# + 关键帧保护。纯组件（无线程、不读时钟），所以直接链实现文件，不需要额外静态库。
+add_executable(test_jitter_buffer tests/test_jitter_buffer.cpp src/media/jitter_buffer.cpp)
+target_link_libraries(test_jitter_buffer PRIVATE cue_proto)
+add_test(NAME jitter_buffer COMMAND test_jitter_buffer)
+
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
 # 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。
@@ -264,7 +274,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # "ASan runtime does not come first"，也不会被 ASan 的 shadow 映射撞坏 RLIMIT_AS。
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
-  foreach(_t wire agent context eval state compare console cassette probe sandbox)
+  foreach(_t wire agent context eval state compare console cassette probe sandbox jitter_buffer)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
 endif()

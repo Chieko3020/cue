@@ -62,9 +62,19 @@ struct ProbeMetrics {
   int64_t offset_us = 0;   // cued_clock − probe_clock
   int64_t updated_us = 0;  // 最近一条指标的本进程单调时刻
   uint64_t samples = 0;    // 收到过多少条 probe.metric 行（0 = 还没有任何样本）
-  // buffer 段无样本的**原因**：不是"测出来是 0"，是这一段在接收端根本不存在。
-  // 当前 cued 的抖动缓冲未实现，probe 只能如实输出 null 并带上这条说明。
+  // buffer 段无样本的**原因**（可选）：不是"测出来是 0"，而是这一段这次确实没有样本。
+  // T-04 之后 probe 自己就有抖动缓冲，正常情况下不再带原因；字段保留是为了旧录制
+  // （里面写着 cued_jitter_buffer_unimplemented）仍能原样回放，不被当成"0 样本"。
   std::string buffer_reason;
+  // 抖动缓冲（FR-PROBE.4）：档位、切换次数、目标深度、跳帧与迟到（累计）。
+  // 与 buffer_us 一起回答"抖动缓冲在干什么"：buffer 段涨 + jb_level 涨 = 升档换平滑；
+  // buffer 段涨 + jb_skipped 涨 = 帧真的丢了，等也等不回来。
+  uint64_t jb_level = 0;
+  uint64_t jb_switches = 0;
+  uint64_t jb_target_frames = 0;
+  uint64_t jb_depth = 0;
+  uint64_t jb_skipped = 0;
+  uint64_t jb_late = 0;
   // 不可用原因（进程没起 / 起不来 / 起来了但一条指标都没上报）。空 = 没有异常。
   // 评测侧据此报 probe_unavailable，而不是退回 cued 指标假装有端到端数据。
   std::string unavailable_reason;
@@ -93,6 +103,12 @@ inline nlohmann::json probe_metrics_to_json(const ProbeMetrics& p) {
       {"reassembly_us", seg(p.reassembly)},
       {"buffer_us", seg(p.buffer)},
       {"decode_us", seg(p.decode)},
+      {"jb_level", p.jb_level},
+      {"jb_switches", p.jb_switches},
+      {"jb_target_frames", p.jb_target_frames},
+      {"jb_depth", p.jb_depth},
+      {"jb_skipped", p.jb_skipped},
+      {"jb_late", p.jb_late},
       {"lat_p50_ms", pct(p.lat_p50_ms)},
       {"lat_p95_ms", pct(p.lat_p95_ms)},
       {"lat_p99_ms", pct(p.lat_p99_ms)},
@@ -202,7 +218,10 @@ inline bool probe_metrics_from_json(const nlohmann::json& j, ProbeMetrics& out,
       !num_alias("lat_p99_ms", "lat_p99", out.lat_p99_ms) || !cnt("frames", out.frames) ||
       !cnt("decoded", out.decoded) || !cnt("decode_errors", out.decode_errors) ||
       !cnt("decode_skips", out.decode_skips) || !cnt("stalls", out.stalls) ||
-      !cnt("samples", out.samples) || !seg("recv_us", out.recv) ||
+      !cnt("samples", out.samples) || !cnt("jb_level", out.jb_level) ||
+      !cnt("jb_switches", out.jb_switches) || !cnt("jb_target_frames", out.jb_target_frames) ||
+      !cnt("jb_depth", out.jb_depth) || !cnt("jb_skipped", out.jb_skipped) ||
+      !cnt("jb_late", out.jb_late) || !seg("recv_us", out.recv) ||
       !seg("reassembly_us", out.reassembly) || !seg("buffer_us", out.buffer) ||
       !seg("decode_us", out.decode)) {
     return false;
