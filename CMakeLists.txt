@@ -110,7 +110,8 @@ target_include_directories(cue_proto INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 # 否则两张图上的抖动缓冲延迟没法互相对照）。
 add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp
   src/media/jitter_buffer.cpp)
-target_link_libraries(cued PRIVATE cue_proto Boost::system Threads::Threads PkgConfig::FFMPEG)
+target_link_libraries(cued PRIVATE cue_proto cue_control Boost::system Threads::Threads
+  PkgConfig::FFMPEG)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 
 # ---- cue-probe：下行接收端（UDP 重组 + H.264 软解 + 帧统计/端到端指标）----
@@ -130,6 +131,16 @@ add_custom_target(web ALL SOURCES web/index.html web/app.js)
 add_library(cue_sandbox STATIC src/sandbox/sandbox.cpp)
 target_link_libraries(cue_sandbox PUBLIC cue_proto Threads::Threads)
 
+# ---- 控制通道（cued ⇄ cue 的 UDS 控制面，技术设计 §4.3）----
+# 独立成库：传输层（seqpacket/stream 分帧、64 KiB 上限、id 回填）与控制语义
+# （运行期参数存储、op 分发、订阅广播）都要能在没有 cued/FFmpeg 的情况下测。
+# cued 与 cue_pipeline 共用同一份实现——两端各写一份，迟早有一边漏掉上限。
+add_library(cue_control STATIC
+  src/pipeline/control_channel.cpp
+  src/pipeline/control_plane.cpp)
+target_link_libraries(cue_control PUBLIC
+  cue_proto nlohmann_json::nlohmann_json Threads::Threads)
+
 # ---- 分层静态库（SPEC §7.3）----
 # pipeline 只向下依赖 proto；agent 不认识 media/pipeline；eval 依赖两者。
 add_library(cue_pipeline STATIC
@@ -140,7 +151,7 @@ add_library(cue_pipeline STATIC
   src/pipeline/tools.cpp)
 # libcurl：HttpServicePipeline（REST 后端）是 pipeline 层的一部分，链接随之公开
 target_link_libraries(cue_pipeline PUBLIC
-  cue_proto nlohmann_json::nlohmann_json PkgConfig::CURL Threads::Threads)
+  cue_proto cue_control nlohmann_json::nlohmann_json PkgConfig::CURL Threads::Threads)
 # run_shell 的实现依赖沙箱层；头文件不暴露 sandbox，故 PRIVATE
 target_link_libraries(cue_pipeline PRIVATE cue_sandbox)
 
@@ -256,6 +267,13 @@ add_test(NAME sandbox COMMAND test_sandbox)
 add_executable(test_jitter_buffer tests/test_jitter_buffer.cpp src/media/jitter_buffer.cpp)
 target_link_libraries(test_jitter_buffer PRIVATE cue_proto)
 add_test(NAME jitter_buffer COMMAND test_jitter_buffer)
+
+# T-05 UDS 控制通道：两种 socket 类型的往返/id 回填、坏请求不带走服务端、
+# set_param 不重建编码器、超长消息被拒但连接保留、重连后 id 从 1 重新开始。
+# 只链 cue_control：不需要 cued/FFmpeg，所以 ctest 里毫秒级跑完。
+add_executable(test_control_channel tests/test_control_channel.cpp)
+target_link_libraries(test_control_channel PRIVATE cue_control)
+add_test(NAME control_channel COMMAND test_control_channel)
 
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：

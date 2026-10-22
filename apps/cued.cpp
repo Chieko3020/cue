@@ -23,8 +23,10 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <iomanip>
 #include <mutex>
 #include <span>
+#include <sstream>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -33,6 +35,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <limits>
 #include <map>
 #include <string>
 #include <string_view>
@@ -44,6 +47,7 @@ extern "C" {
 
 #include "cue/common/clock.h"
 #include "cue/media/encoder.h"
+#include "cue/pipeline/control_plane.h"
 #include "cue/media/h264_decoder.h"
 #include "cue/media/jitter_buffer.h"
 #include "cue/proto/wire.h"
@@ -65,12 +69,30 @@ int64_t unix_us() {
       .count();
 }
 
+// 控制面指针（T-05）。为什么用全局而不是层层传参：emit_event 在媒体循环、NACK 线程、
+// 控制线程三处都被调用，而 UDS 订阅者看到的必须是**同一份**事件流。全局只在 main 里
+// 赋一次值，之后只读；读到的 nullptr 表示控制通道没建起来（stdout 降级模式）。
+std::atomic<cue::pipeline::ControlPlane*> g_control{nullptr};
+// pipeline.stop（UDS 控制）与 SIGTERM 走同一条退出路径，这个标记只用于把事件里的
+// reason 写成 control 而不是 signal——两种退出在报告里必须能分开。
+std::atomic<bool> g_stop_from_control{false};
+// 帧水位（进程级、单调）：每秒的 metric.sample 看不出 200 ms 的停顿，而"改了参数有没有
+// 断流"恰恰要用 10 ms 级的分辨率才量得出来。这两个计数每帧推进，metrics.query 原样带出。
+std::atomic<uint64_t> g_frames_in_total{0};
+std::atomic<uint64_t> g_frames_out_total{0};
+
 // 单行结构化事件： [cue-event] {"ev":"<type>","t":<unix_us>,"data":{...}}
 // 与 [cued]/[probe] 人读行共存：现有解析器只认整行前缀，互不干扰。
 // 外层用 ordered_json：键序固定为 ev/t/data（SPEC §5 的格式），不随字段名排序漂移。
+//
+// 一个出口写两处（stdout 行 + UDS 订阅推送）：两处各写一遍必然漂移，
+// 而事件流是 agent/SSE 的权威来源——订阅者看到的必须与 harness 读到的同源。
 void emit_event(std::string_view ev, const json& data) {
   nlohmann::ordered_json body{{"ev", std::string(ev)}, {"t", unix_us()}, {"data", data}};
   cue::proto::emit_event_line(body.dump());
+  if (auto* ctl = g_control.load(std::memory_order_acquire)) {
+    ctl->publish(json{{"ev", std::string(ev)}, {"t", body["t"]}, {"data", data}});
+  }
 }
 
 // ---------------------------------------------------------------- codec_config(0x03)
@@ -185,20 +207,19 @@ inline uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-class Injector {
- public:
-  Injector(uint64_t seed, double drop_pct)
-      : seed_(seed), permille_(static_cast<uint64_t>(drop_pct * 10.0)) {}
-  bool drop(uint64_t seq) const {
-    if (permille_ == 0) return false;
-    return (splitmix64(seed_ * 0x9E3779B97F4A7C15ULL + seq) % 1000) < permille_;
-  }
-  uint64_t permille() const { return permille_; }
+// 注入判定是纯函数：(seed, seq, 千分比) → 是否丢，所以不留可变状态。
+// 千分比每帧从参数快照里取，控制面改值立刻生效——旧实现把 permille 存进 Injector，
+// 于是「改一次注入」只能重启进程，那正是 T-05 要删掉的行为。
+// 换算保持 `pct * 10` 的截断语义不变：--inject-trace 的逐包判定必须与旧实现逐位一致。
+inline uint64_t permille_from_pct(double pct) {
+  const double clamped = std::clamp(pct, 0.0, 100.0);
+  return static_cast<uint64_t>(clamped * 10.0);
+}
 
- private:
-  uint64_t seed_;
-  uint64_t permille_;
-};
+inline bool should_drop_pkt(uint64_t seed, uint64_t permille, uint64_t seq) {
+  if (permille == 0) return false;
+  return (splitmix64(seed * 0x9E3779B97F4A7C15ULL + seq) % 1000) < permille;
+}
 
 // 最近 N 帧的分片缓存，供 NACK 重传
 class RetransmitCache {
@@ -233,7 +254,13 @@ class TokenBucket {
   static constexpr double kPacketBytes =
       double(cue::proto::kMaxUdpPayload + cue::proto::kDatagramHeaderSize);
 
-  explicit TokenBucket(double bits_per_sec) : rate_pkts_(bits_per_sec / 8.0 / kPacketBytes) {}
+  explicit TokenBucket(double bits_per_sec) { set_rate(bits_per_sec); }
+
+  // 运行期改速率上限（fault.set kind=rate）：速率是令牌桶唯一的可变量，
+  // 原地改不会丢令牌、也不打乱突发——所以这一步不需要重建任何东西。
+  void set_rate(double bits_per_sec) {
+    rate_pkts_.store(bits_per_sec / 8.0 / kPacketBytes, std::memory_order_relaxed);
+  }
 
   // 非关键帧：令牌不够就丢（不排队）
   bool take_nonkey(std::size_t pkts, int64_t now_us) {
@@ -256,10 +283,12 @@ class TokenBucket {
     // 时间回拨（NTP/CLOCK_MONOTONIC 不会，但参数注入的假时钟可能）不能让 dt 变负
     const double dt = now_us > last_us_ ? double(now_us - last_us_) / 1e6 : 0.0;
     last_us_ = now_us;
-    tokens_ = std::min(kBurstPackets, tokens_ + dt * rate_pkts_);
+    tokens_ = std::min(kBurstPackets, tokens_ + dt * rate_pkts_.load(std::memory_order_relaxed));
   }
 
-  double rate_pkts_;
+  // 控制线程写、媒体线程读：atomic<double> 在 x86-64 上无锁，读到的要么是旧速率
+  // 要么是新速率，不会出现"半个 double"（那会让令牌桶按乱码速率灌令牌）。
+  std::atomic<double> rate_pkts_{0.0};
   double tokens_ = kBurstPackets;
   int64_t last_us_ = 0;
 };
@@ -298,6 +327,7 @@ struct Counters {
   uint64_t encode_errors = 0;  // 编码失败（尺寸/格式/编码器错误），不再混进"轻丢帧"
   uint64_t encode_delays = 0;  // 编码器内部延迟：正常路径，无可发数据
   uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
+  uint64_t queue_dropped = 0;  // 排队策略切换时被丢弃的积压帧（见 process_frame 里的注释）
   // 音频只计数：上行 type=0x02 的包被接收、被计数、出现在指标行里，但不进解码、
   // 不写下行。audio_decoded 恒 false 是这条链路的真实状态（原因见 METRICS 行的
   // audio_decode_reason 与处理分支处注释），不是没填的占位值。
@@ -312,6 +342,7 @@ void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counte
   for (auto it = pending.begin(); it != pending.end();) {
     if (now_us - it->second.first_seen_us > 2'000'000) {
       ++c.frames_in;  // 帧在"完成或超时"处结算，重复首片/缺首片都不会再算错
+      g_frames_in_total.fetch_add(1, std::memory_order_relaxed);
       ++c.frames_dropped;
       it = pending.erase(it);
     } else {
@@ -329,41 +360,158 @@ json stage_ms(const Ring& r, double p) {
   return double(r.pct(p)) / 1000.0;
 }
 
+// 进程启动时刻（obs.fetch procs 的 uptime 用）。由 main 第一行写入：
+// 过去用函数内 static，结果"第一次问 uptime"的时候才初始化 → 恒为 0，
+// 一个假读数比没有读数更坏。
+int64_t g_process_start_us = 0;
+
+int64_t process_uptime_ms() {
+  if (g_process_start_us <= 0) return 0;
+  return (cue::now_us() - g_process_start_us) / 1000;
+}
+
+// 控制面读的指标快照（metrics.query / obs.fetch frames 的数据源）。
+//
+// 与 METRICS 行是**同一份 JSON**（键名一字不改）：UDS 查到的数与 stdout 每秒那行
+// 必须同口径，否则"同一时刻两个读数"迟早对不上。没有样本时写 samples=0 + 原因，
+// 绝不拿默认值 0 冒充"fps=0"。
+class MetricsView {
+ public:
+  void set(json metrics, nlohmann::ordered_json counters) {
+    std::lock_guard<std::mutex> lk(mu_);
+    metrics_ = std::move(metrics);
+    counters_ = std::move(counters);
+    updated_us_ = cue::now_us();
+    ++samples_;
+    times_.push_back(updated_us_);
+    while (times_.size() > kHist) times_.pop_front();
+  }
+
+  json query(int window_ms) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    json out = metrics_.is_object() ? metrics_ : json::object();
+    const int64_t window_us = int64_t(window_ms) * 1000;
+    std::size_t in_window = 0;
+    for (const int64_t t : times_) {
+      if (updated_us_ - t <= window_us) ++in_window;
+    }
+    out["samples"] = samples_;
+    out["t_us"] = updated_us_;
+    out["window_ms"] = window_ms;
+    // samples_in_window 是从**报点时刻**数的，不是从计数器的取值区间算的：
+    // cued 的计数器是"本次会话累计"，窗口内能做的是"这段窗口里采过几个点"。
+    out["samples_in_window"] = in_window;
+    out["available_window_ms"] = times_.empty() ? 0 : (updated_us_ - times_.front()) / 1000;
+    // 帧水位：不是"窗口内的值"，是进程累计值。调用方自己差分（高频轮询时它比
+    // samples_in_window 细得多）。
+    out["frames_in_total"] = g_frames_in_total.load(std::memory_order_relaxed);
+    out["frames_out_total"] = g_frames_out_total.load(std::memory_order_relaxed);
+    if (samples_ == 0) {
+      out["unavailable_reason"] = "还没有任何 metric.sample（启动不足 1 s 或没有媒体流）";
+    }
+    return out;
+  }
+
+  nlohmann::ordered_json counters() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return counters_;
+  }
+
+ private:
+  static constexpr std::size_t kHist = 60;  // 最近 60 个报点（≈60 s）
+  mutable std::mutex mu_;
+  json metrics_ = json::object();
+  nlohmann::ordered_json counters_{};
+  int64_t updated_us_ = 0;
+  uint64_t samples_ = 0;
+  std::deque<int64_t> times_;
+};
+
+// 进程自述（obs.fetch procs）：pid / RSS / 线程数 / 运行时长 + 编码档位。
+// 注入值（inject_drop / inject_ingress_drop / send_mbps / queue_fps）**故意不出现**：
+// agent 必须从指标推断根因，把"标准答案"写进观测等于给它抄（沿用旧 observation(procs) 的约定）。
+nlohmann::ordered_json procs_json(const cue::pipeline::ParamStore& params) {
+  nlohmann::ordered_json out;
+  out["pid"] = static_cast<long long>(::getpid());
+  out["running"] = true;
+  long rss_pages = -1;
+  if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+    long total_pages = 0;
+    if (std::fscanf(f, "%ld %ld", &total_pages, &rss_pages) != 2) rss_pages = -1;
+    std::fclose(f);
+  }
+  if (rss_pages >= 0) {
+    const long page_kb = ::sysconf(_SC_PAGESIZE) / 1024;
+    out["rss_kb"] = static_cast<long long>(rss_pages) * page_kb;
+  } else {
+    out["rss_kb"] = nullptr;  // 读不到写 null：0 KB 会被读成"没有内存"
+  }
+  long threads = -1;
+  if (FILE* f = std::fopen("/proc/self/status", "r")) {
+    char line[256];
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+      if (std::strncmp(line, "Threads:", 8) == 0) {
+        threads = std::strtol(line + 8, nullptr, 10);
+        break;
+      }
+    }
+    std::fclose(f);
+  }
+  if (threads >= 0) {
+    out["threads"] = threads;
+  } else {
+    out["threads"] = nullptr;
+  }
+  out["uptime_ms"] = process_uptime_ms();
+  const json enc = params.encoder_json();
+  for (auto it = enc.begin(); it != enc.end(); ++it) out[it.key()] = it.value();
+  if (auto* ctl = g_control.load(std::memory_order_acquire)) {
+    out["control_channel"] = ctl->channel_tag();
+    out["control_ops"] = ctl->ops();
+  } else {
+    // 控制通道没建起来：如实写 stdout，而不是留空让人以为没这个概念
+    out["control_channel"] = "stdout";
+    out["control_ops"] = 0;
+  }
+  return out;
+}
+
 void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
-            uint64_t& frames_prev, const cue::media::JitterBufferStats& jb) {
+            uint64_t& frames_prev, const cue::media::JitterBufferStats& jb, MetricsView& view) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
   const double fps = double(df) / dt;
-  std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu bkt=%llu serr=%llu enc_err=%llu "
-              "dec=%llu dec_err=%llu dec_drop=%llu rej=%llu aud=%llu MB=%.2f",
-              fps, static_cast<unsigned long long>(c.frames_in),
-              static_cast<unsigned long long>(c.frames_out), static_cast<unsigned long long>(c.frames_dropped),
-              static_cast<unsigned long long>(c.injected_drops),
-              static_cast<unsigned long long>(c.budget_drops),
-              static_cast<unsigned long long>(c.send_errors),
-              static_cast<unsigned long long>(c.encode_errors),
-              static_cast<unsigned long long>(c.frames_decoded),
-              static_cast<unsigned long long>(c.decode_errors),
-              static_cast<unsigned long long>(c.decode_drops),
-              static_cast<unsigned long long>(c.rejected),
-              static_cast<unsigned long long>(c.audio_frames_in),
-              double(c.bytes_in) / (1024.0 * 1024.0));
+  // 人读行先拼成字符串再一次性写出：同一份文本还要喂给 obs.fetch(logs)，
+  // 各 printf 一次的话两处格式必然漂移（改了一处忘了另一处）。
+  std::ostringstream human;
+  human.setf(std::ios::fixed);
+  human << "[cued] fps=" << std::setprecision(1) << fps
+        << " in=" << c.frames_in << " out=" << c.frames_out << " drop=" << c.frames_dropped
+        << " inj=" << c.injected_drops << " bkt=" << c.budget_drops
+        << " serr=" << c.send_errors << " enc_err=" << c.encode_errors
+        << " dec=" << c.frames_decoded << " dec_err=" << c.decode_errors
+        << " dec_drop=" << c.decode_drops << " rej=" << c.rejected
+        << " aud=" << c.audio_frames_in << " MB=" << std::setprecision(2)
+        << double(c.bytes_in) / (1024.0 * 1024.0);
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
-      std::printf("  %s=-", kStageNames[i]);
+      human << "  " << kStageNames[i] << "=-";
     } else {
-      std::printf("  %s=%.3f/%.3f/%.3f", kStageNames[i],
-                  double(rings[i].pct(0.50)) / 1000.0, double(rings[i].pct(0.95)) / 1000.0,
-                  double(rings[i].pct(0.99)) / 1000.0);
+      human << std::setprecision(3) << "  " << kStageNames[i] << "="
+            << double(rings[i].pct(0.50)) / 1000.0 << "/" << double(rings[i].pct(0.95)) / 1000.0
+            << "/" << double(rings[i].pct(0.99)) / 1000.0;
     }
   }
-  std::printf(" ms(p50/p95/p99)");
+  human << " ms(p50/p95/p99)";
   // 抖动缓冲的状态单列：jb_depth 是"现在压着几帧"，jb_skipped/jb_late 是累计计数，
   // 与六段一样每秒一行，agent 才能把「buffer 段涨」和「队列在涨」关联起来。
-  std::printf("  jb depth=%zu lvl=%zu tgt=%zu sw=%llu skip=%llu late=%llu\n", jb.depth, jb.level,
-              jb.target_frames, static_cast<unsigned long long>(jb.switches),
-              static_cast<unsigned long long>(jb.skipped),
-              static_cast<unsigned long long>(jb.late_dropped));
+  human << "  jb depth=" << jb.depth << " lvl=" << jb.level << " tgt=" << jb.target_frames
+        << " sw=" << jb.switches << " skip=" << jb.skipped << " late=" << jb.late_dropped;
+  const std::string human_line = human.str();
+  std::fwrite(human_line.data(), 1, human_line.size(), stdout);
+  std::fputc('\n', stdout);
+  std::fflush(stdout);
+  if (auto* ctl_log = g_control.load(std::memory_order_acquire)) ctl_log->push_log(human_line);
   // 结构化指标行：process_control 只认这一行（严格整行前缀 "METRICS "），不再靠裸子串
   // 匹配 "in="/"dec="（cued 多打一个 frames_in= 就会串味，review #29）。
   // 六段里未被采样的段写 null：报告里显示 n/a，不能被 0 冒充实测。
@@ -380,6 +528,7 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
          {"encode_errors", c.encode_errors},
          {"encode_delays", c.encode_delays},
          {"decode_drops", c.decode_drops},
+         {"queue_dropped", c.queue_dropped},
          // 音频（FR-DEV.6）：收包侧只计数。audio_decoded=false 与原因一起进指标行，
          // 因为「音频包在流」和「音频被解出来能播」是两件事，混成一句就是谎报。
          // 注意 MB 仍然只算视频载荷（bytes_in），音频字节单列，两类带宽不混在一个数里。
@@ -408,10 +557,31 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
                                {"p99", double(rings[i].pct(0.99)) / 1000.0}};
     }
   }
+  // 控制面可观测字段（FR-PIPE.5）：通道类型与累计处理的控制请求数。
+  // 降级时必须写 stdout——「看起来有控制面、其实没有」是最坏的一种谎报。
+  const auto* ctl = g_control.load(std::memory_order_acquire);
+  const char* ctl_tag = ctl != nullptr ? ctl->channel_tag() : "stdout";
+  const uint64_t ctl_ops = ctl != nullptr ? ctl->ops() : 0;
+  m["control_channel"] = ctl_tag;
+  m["control_ops"] = ctl_ops;
   const std::string line = "METRICS " + m.dump();
   std::fwrite(line.data(), 1, line.size(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
+  // 控制面读同一份快照（metrics.query / obs.fetch frames）：UDS 与 stdout 两个读数
+  // 因此永远是同一次 report() 的产物，不会出现"刚改完参数，两边数字不一样"。
+  view.set(m, nlohmann::ordered_json{{"frames_in", c.frames_in},
+                                     {"frames_out", c.frames_out},
+                                     {"dropped", c.frames_dropped},
+                                     {"injected", c.injected_drops},
+                                     {"decoded", c.frames_decoded},
+                                     {"decode_errors", c.decode_errors},
+                                     {"rejected", c.rejected},
+                                     {"budget_drops", c.budget_drops},
+                                     {"send_errors", c.send_errors},
+                                     {"encode_errors", c.encode_errors},
+                                     {"decode_drops", c.decode_drops},
+                                     {"audio_frames_in", c.audio_frames_in}});
   // 事件流里的同一份数字（SSE / 前端 / agent 事件缓存用）。未采样的段必须是 null。
   json sample{{"fps", fps},
               {"frames_in", c.frames_in},
@@ -478,6 +648,7 @@ bool parse_double(std::string_view s, double lo, double hi, double& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  g_process_start_us = cue::now_us();
   uint16_t ws_port = 9000;
   // WS 监听地址默认只回环：cued 没有鉴权，默认对外等于把解码/转码入口交给整个网络。
   // 跨机演示必须显式 --bind 0.0.0.0（并在报告/README 里说明）。
@@ -637,6 +808,25 @@ int main(int argc, char** argv) {
   // 帧间隔由 PTS 增量的 EWMA 自估（浏览器/转码的帧率不一定是 --fps），这里只给起点。
   jb_cfg.nominal_interval_us = 1'000'000 / std::max<int>(out_fps, 1);
 
+  // 启动参数 → 运行期参数对象。这些值同时出现在两个地方：
+  //  - 命令行参数（评测脚本依赖 "启动即生效"：--inject-drop 5 就是带着故障上电）；
+  //  - ParamStore 的初值（控制面之后可以改它，改了不重启）。
+  // 两者必须一致，否则"启动时的档位"和"第一帧看到的档位"会分叉。
+  cue::pipeline::RuntimeParams initial_params;
+  initial_params.transcode = transcode_enabled;
+  initial_params.width = out_w;
+  initial_params.height = out_h;
+  initial_params.bitrate_kbps = out_kbps;
+  initial_params.fps = out_fps;
+  initial_params.gop = out_gop;
+  initial_params.threads = out_threads;
+  initial_params.preset = preset;
+  initial_params.send_mbps = send_mbps;
+  initial_params.queue_fps = queue_fps;
+  initial_params.inject_drop = inject_drop;
+  initial_params.inject_ingress_drop = inject_ingress_drop;
+  initial_params.inject_seed = inject_seed;
+
   cue::media::H264Decoder decoder;
   {
     std::string err;
@@ -662,13 +852,79 @@ int main(int argc, char** argv) {
     int sig = 0;
     if (sigwait(&term_set, &sig) != 0) return;
     emit_event("pipeline.stopped",
-               json{{"reason", "signal"}, {"signal", sig}, {"pid", ::getpid()}});
+               json{{"reason", g_stop_from_control.load() ? "control" : "signal"},
+                    {"signal", sig},
+                    {"pid", ::getpid()}});
+    // 退出前把控制面收干净：_exit 不跑析构，不在这里 stop 就会把
+    // /tmp/cue/<pid>/control.sock（和它那个 0700 目录）留在原地。
+    if (auto* c = g_control.exchange(nullptr)) c->stop();
     std::fflush(nullptr);
     _exit(sig == SIGINT ? 130 : 143);
   }).detach();
 
+  // ---- 控制面（T-05）：UDS 上的运行期控制 ----
+  // 为什么放在 sigmask 之后：控制面的 accept/连接线程会继承主线程的信号屏蔽，
+  // SIGTERM 必须继续留给 sigwait 线程——否则 pipeline.stop 会把进程直接打死，
+  // 连一条 pipeline.stopped 事件都来不及打。
+  //
+  // 为什么参数对象与快照都在这里：写者只有控制线程（改 ParamStore），读者只有媒体
+  // 循环（每帧取一次快照）。编码器/解码器/WS 会话永远只有媒体线程在碰，所以
+  // 「改参数不断流」是结构上成立的，而不是靠"小心一点"。
+  cue::pipeline::ParamStore params(initial_params);
+  MetricsView view;
+
+  cue::pipeline::ControlPlane::Providers ctl_providers;
+  ctl_providers.metrics = [&view](int window_ms) { return view.query(window_ms); };
+  ctl_providers.frames = [&view] { return view.counters(); };
+  ctl_providers.procs = [&params] { return procs_json(params); };
+  // 控制面产生的事件必须走 cued 自己的事件出口（stdout 行 + 订阅推送），
+  // 否则 agent/SSE 会看到「参数改了但事件流里没有」的分叉。
+  ctl_providers.emit = [](const std::string& ev, const json& data) { emit_event(ev, data); };
+  // pipeline.stop：延时线程只做"给自己发 SIGTERM"这一件事，事件由 sigwait 线程统一打
+  // （延迟 50 ms 是为了让 ok 响应先离开 socket，见 control_plane.cpp）。
+  ctl_providers.on_stop = [] {
+    g_stop_from_control.store(true);
+    ::kill(::getpid(), SIGTERM);
+  };
+  cue::pipeline::ControlPlane control(params, ctl_providers);
+  // 先挂全局指针再 start：start 之后随时可能有请求进来，procs/emit 都要能用到它
+  g_control.store(&control, std::memory_order_release);
+  {
+    // socket 路径按 pid 分目录：同机跑多个 cued（不同端口）也不会互相踩。
+    // 目录由 ControlServer 建成 0700，其他用户既连不上也换不掉 socket 文件。
+    const std::string ctl_path = "/tmp/cue/" +
+                                 std::to_string(static_cast<long long>(::getpid())) +
+                                 "/control.sock";
+    std::string ctl_err;
+    if (control.start(ctl_path, ctl_err)) {
+      std::fprintf(stderr, "[cued] control channel %s -> %s\n", control.channel_detail(),
+                   ctl_path.c_str());
+      control.push_log(std::string("[cued] control channel ") + control.channel_detail() + " -> " +
+                       ctl_path);
+    } else {
+      // 降级路径必须是**响的**：stderr 一行 + 一条事件 + 指标里的 control_channel=stdout。
+      // start() 仍然成功返回——"控制面没建起来"不等于"媒体管线不能用"，但 harness 会从
+      // 指标里看到降级，并明确拒绝"免重启改参数"（而不是退回去偷偷重启 cued）。
+      std::fprintf(stderr, "[cued] 控制通道不可用（降级到 stdout 模式）：%s\n", ctl_err.c_str());
+      emit_event("control.degraded", json{{"reason", ctl_err}, {"channel", "stdout"}});
+      control.push_log("[cued] control degraded to stdout: " + ctl_err);
+    }
+  }
+
   cue::media::TranscodeChain chain;
   bool chain_ready = false;
+  // 编码器/发送侧配置的"已应用版本"：只有媒体线程读写，所以用普通变量。
+  //  - last_gen：令牌桶速率的已应用版本（改速率不需要重建任何东西）；
+  //  - last_enc_gen：编码参数的已应用版本（变了就关编码器，下一帧懒重建）；
+  //  - chain_failed_gen：上一代配置失败的版本号（避免每帧重试同一份坏配置刷屏）。
+  //    它的初值必须是哨兵：generation 从 0 起，若这里也用 0，第一帧就会把 0 当成
+  //    "这一代已经失败过"而跳过配置——实测症状是 transcode=on 却恒为透传、
+  //    encode 段全 null（这一版真踩过）。
+  // last_* 的初值 = 初始 generation（0）：第一帧不必重建，只需按初值配置一次。
+  constexpr uint64_t kNoGeneration = ~0ULL;
+  uint64_t last_gen = 0;
+  uint64_t last_enc_gen = 0;
+  uint64_t chain_failed_gen = kNoGeneration;
   // 10 Mbps / 64 包突发（SPEC §7.2）：包速率按 1224 B/包折算，头开销一并计入
   TokenBucket bucket(send_mbps * 1e6);
 
@@ -705,10 +961,9 @@ int main(int argc, char** argv) {
   probe_addr.sin_family = AF_INET;
   probe_addr.sin_port = htons(probe_port);
   ::inet_pton(AF_INET, probe_host.c_str(), &probe_addr.sin_addr);
-  const Injector injector(inject_seed, inject_drop);
-  // 上行注入用同一 seed 的派生值：两条链路的丢弃序列互不相关，但同一 (seed, pct)
-  // 仍然完全可复现（splitmix64 按包序号直接判定）。
-  const Injector ingress_injector(inject_seed ^ 0xD1B54A32D192ED03ULL, inject_ingress_drop);
+  // 注入不再是对象状态：每条判定都从参数快照里的 (seed, pct) 现算（见 inject_drop），
+  // 所以控制面改注入值立刻生效，不需要重启进程。上行注入用同一 seed 的派生值：
+  // 两条链路的丢弃序列互不相关，但同一 (seed, pct) 仍然完全可复现。
   FILE* trace_fp = nullptr;
   if (!inject_trace.empty()) {
     trace_fp = std::fopen(inject_trace.c_str(), "w");
@@ -825,6 +1080,10 @@ int main(int argc, char** argv) {
                   {"fec", fec_enabled ? "on" : "off"},
                   {"inject_drop", inject_drop},
                   {"inject_seed", inject_seed},
+                  {"control_channel", control.channel_tag()},
+                  {"control_socket", control.degraded()
+                                         ? std::string()
+                                         : "/tmp/cue/" + std::to_string(::getpid()) + "/control.sock"},
                   {"jitter", jitter_enabled ? "on" : "off"},
                   {"jitter_target_frames", jitter_target_frames},
                   {"jitter_max_frames", jitter_max_frames},
@@ -886,7 +1145,9 @@ int main(int argc, char** argv) {
     };
     std::deque<QueuedSend> sendq;
     int64_t send_due_us = 0;
-    const double queue_period_us = queue_fps > 0.0 ? 1e6 / queue_fps : 0.0;
+    // 已应用的排队节奏（NaN = 还没应用过，第一帧只记录不清理）。
+    // 排队节奏不再在连接建立时定死：每帧从参数快照算（fault.set kind=backlog 运行期可改）。
+    double applied_queue_fps = std::numeric_limits<double>::quiet_NaN();
     constexpr std::size_t kSendQueueMax = 8192;  // 兜底：队列不能无限涨（约 4.5 min @30fps）
 
     // sendto 的返回值与 errno 不能丢：ENOBUFS/EMSGSIZE 会被算成「已发送」（review #16）
@@ -908,7 +1169,10 @@ int main(int argc, char** argv) {
         for (const auto& d : sendq.front().datagrams) {
           if (!send_dgram(d)) ok = false;
         }
-        if (ok) ++c.frames_out;
+        if (ok) {
+          ++c.frames_out;
+          g_frames_out_total.fetch_add(1, std::memory_order_relaxed);
+        }
         sendq.pop_front();
       }
     };
@@ -920,6 +1184,58 @@ int main(int argc, char** argv) {
       const uint64_t pts_us = jf.pts_us;
       const uint32_t frame_id = jf.frame_id;
       bool keyframe = jf.keyframe;
+      // 每帧取一次参数快照（几十字节的拷贝）：整帧内编码器、注入、排队看到的是**同一个
+      // 版本**，不会出现「bitrate 换了但 gop 还是旧的」这种半截配置。
+      const auto snap = params.snapshot();
+      const cue::pipeline::RuntimeParams& rp = snap.params;
+      if (snap.generation != last_gen) {
+        // 令牌桶速率原地改：速率是纯状态，改它不丢令牌、不打乱突发
+        bucket.set_rate(rp.send_mbps * 1e6);
+        last_gen = snap.generation;
+      }
+      if (snap.encoder_generation != last_enc_gen) {
+        // 编码参数变了：先关掉编码器，下一帧懒重建。**WS 会话、解码器、抖动缓冲全都原地
+        // 保留**——FR-PIPE.5「切换时不断流」就落在这里。注入类改动不会走这条路
+        // （ParamStore 只在编码相关键上推进 encoder_generation）。
+        const int64_t t_rebuild0 = cue::now_us();
+        chain.close();
+        chain_ready = false;
+        chain_failed_gen = kNoGeneration;
+        last_enc_gen = snap.encoder_generation;
+        emit_event("pipeline.encoder_rebuild",
+                   json{{"reason", "param_change"},
+                        {"elapsed_us", cue::now_us() - t_rebuild0},
+                        {"bitrate_kbps", rp.bitrate_kbps},
+                        {"gop", rp.gop},
+                        {"preset", rp.preset},
+                        {"transcode", rp.transcode ? "on" : "off"}});
+      }
+      // 注入与排队参数每帧从快照现算：这两个值是"下一包怎么处理"，不涉及任何重建
+      const uint64_t out_permille = permille_from_pct(rp.inject_drop);
+      const double queue_period_us = rp.queue_fps > 0.0 ? 1e6 / rp.queue_fps : 0.0;
+      if (std::isnan(applied_queue_fps) || rp.queue_fps != applied_queue_fps) {
+        // 排队策略变了（例如 fault.set backlog=12 → 清除）：队列里的旧帧**按过期丢弃**。
+        // 为什么不能留着慢慢排：队尾可能排着十几秒前的帧（每帧把 due 往后推一个周期），
+        // 它们会和"此刻"的实时帧交错发出 → PTS 乱序 → 接收端抖动缓冲把延迟越推越高
+        // （实测：改回 0 之后 probe 的 e2e p99 从 2.4 s 一路爬到 2.7 s，而 fps 反而冲到 42）。
+        // 直播链路里十几秒前的帧没有发送价值，丢掉并记账比"按序补发"更诚实。
+        if (!sendq.empty()) {
+          const std::size_t n = sendq.size();
+          sendq.clear();
+          send_due_us = 0;
+          // 只记 queue_dropped，不记 dropped：dropped 的语义是「媒体链路里丢掉的帧」
+          // （重组超时/切片失败/令牌桶），而这里是**控制面切换策略**时主动丢弃的积压。
+          // 两者的处置完全不同（一个要查网络/码控，一个是你刚改的排队节奏），混在一起
+          // 会让「改了个参数」看起来像「链路在丢包」。
+          c.queue_dropped += n;
+          emit_event("pipeline.queue_flushed",
+                     json{{"dropped", n},
+                          {"from_fps", std::isnan(applied_queue_fps) ? json(nullptr)
+                                                                     : json(applied_queue_fps)},
+                          {"to_fps", rp.queue_fps}});
+        }
+        applied_queue_fps = rp.queue_fps;
+      }
       // buffer 段：这一帧在抖动缓冲里真实等了多久（= 放行时刻 − 进队时刻）。
       // recv 段只含重组，两段从此不再同口径——旧实现两段都写重组耗时，buffer 等于没有。
       rings[1].push(jf.wait_us);
@@ -945,18 +1261,35 @@ int main(int argc, char** argv) {
       int64_t enc_us = 0;      // 编码段真实耗时（review #3：不再无条件记 0）
       bool enc_sampled = false;  // transcode 关闭时该段不采样，报告里显示 "-"
 
-      if (transcode_enabled && decoded) {
-        if (!chain_ready) {
-          const int dw = out_w > 0 ? out_w : decoded->width;
-          const int dh = out_h > 0 ? out_h : decoded->height;
+      if (rp.transcode && decoded) {
+        if (!chain_ready && chain_failed_gen != snap.encoder_generation) {
+          const int dw = rp.width > 0 ? rp.width : decoded->width;
+          const int dh = rp.height > 0 ? rp.height : decoded->height;
           std::string cerr;
-          if (chain.configure(dw, dh, out_kbps, out_fps, out_gop, preset, cerr, out_threads)) {
+          // 重建耗时（close + configure）：这是「改编码参数」付出的全部停顿，
+          // 事件里如实报出来（单位 µs），报告里"断流多少 ms"直接引用这个数。
+          const int64_t t_cfg0 = cue::now_us();
+          const bool cfg_ok =
+              chain.configure(dw, dh, rp.bitrate_kbps, rp.fps, rp.gop, rp.preset, cerr, rp.threads);
+          const int64_t cfg_us = cue::now_us() - t_cfg0;
+          if (cfg_ok) {
             chain_ready = true;
-            std::fprintf(stderr, "[cued] transcode on: %dx%d %dkbps gop=%d preset=%s\n", dw, dh,
-                         out_kbps, out_gop, preset.c_str());
+            emit_event("pipeline.encoder",
+                       json{{"phase", "configured"},
+                            {"elapsed_us", cfg_us},
+                            {"width", dw},
+                            {"height", dh},
+                            {"bitrate_kbps", rp.bitrate_kbps},
+                            {"gop", rp.gop},
+                            {"preset", rp.preset}});
           } else {
-            transcode_enabled = false;
-            std::fprintf(stderr, "[cued] transcode configure failed: %s\n", cerr.c_str());
+            // 配置失败**不**再偷偷把 transcode 改成 off（旧实现的静默降级）：
+            // 参数仍按用户要求保持 on，失败按"这一代失败"记账，等参数再变时重试。
+            chain_failed_gen = snap.encoder_generation;
+            (void)cfg_us;
+            ++c.encode_errors;
+            emit_event("pipeline.encoder_error", json{{"reason", cerr}});
+            err_log.log(cue::now_us(), "transcode configure failed: " + cerr);
           }
         }
         if (chain_ready) {
@@ -1024,7 +1357,7 @@ int main(int argc, char** argv) {
         std::size_t pk = 0;
         for (const auto& d : datagrams) {
           const std::size_t cur_pk = pk++;
-          if (injector.drop(pkt_seq++)) {
+          if (should_drop_pkt(rp.inject_seed, out_permille, pkt_seq++)) {
             ++c.injected_drops;
             if (trace_fp) std::fprintf(trace_fp, "%u %zu\n", frame_id, cur_pk);
             continue;
@@ -1064,7 +1397,9 @@ int main(int argc, char** argv) {
           const auto phb = cue::proto::encode(ph);
           fpkt.insert(fpkt.end(), phb.begin(), phb.end());
           fpkt.insert(fpkt.end(), parity.begin(), parity.end());
-          if (!injector.drop(pkt_seq++)) outgoing.push_back(std::move(fpkt));
+          if (!should_drop_pkt(rp.inject_seed, out_permille, pkt_seq++)) {
+            outgoing.push_back(std::move(fpkt));
+          }
         }
 
         if (queue_period_us > 0.0) {
@@ -1087,7 +1422,10 @@ int main(int argc, char** argv) {
           for (const auto& d : outgoing) {
             if (!send_dgram(d)) all_sent = false;
           }
-          if (all_sent) ++c.frames_out;
+          if (all_sent) {
+            ++c.frames_out;
+            g_frames_out_total.fetch_add(1, std::memory_order_relaxed);
+          }
         }
       }
       rings[5].push(cue::now_us() - t_send0);
@@ -1112,12 +1450,12 @@ int main(int argc, char** argv) {
         }
         // 报告同样不能挂在「帧完成」上：整帧持续丢尾片时 fps/丢帧仍要可见
         if (now_tick - t_last_report >= 1'000'000) {
-          if (queue_period_us > 0.0) drain_sendq(now_tick);  // 报点前先把到期帧发出去
+          drain_sendq(now_tick);  // 报点前先把到期帧发出去
           // 报点前同样先放行抖动缓冲里的到期帧：否则这一秒的 jb_depth 会把"其实已经到期"
           // 的帧算成积压，buffer 段也会少采样几帧。
           for (auto& ready : jb.poll(now_tick)) process_frame(std::move(ready));
           c.decode_drops = decoder.stats().dropped;
-          report(rings, c, now_tick, t_last_report, frames_prev, jb.stats());
+          report(rings, c, now_tick, t_last_report, frames_prev, jb.stats(), view);
         }
       }
 
@@ -1225,7 +1563,11 @@ int main(int argc, char** argv) {
       // frames_in/frames_out 都不计它，于是只有 fps 掉下来——dropped 保持 0；
       // 多分片帧丢失非首片时会留在 pending 里，2 s 后由 cleanup_stale 结算成 dropped。
       // 两种形状都只涨 injected，与出向注入（fps 不动）正好可以区分开。
-      if (ingress_injector.drop(in_seq++)) {
+      // 上行注入：每包现取一次快照（30 fps 的帧数级开销；换来"改注入立刻生效"）。
+      // 用同一个 seed 派生值：两条链路的丢弃序列互不相关，但同一 (seed, pct) 可复现。
+      const auto isnap = params.snapshot();
+      if (should_drop_pkt(isnap.params.inject_seed ^ 0xD1B54A32D192ED03ULL,
+                          permille_from_pct(isnap.params.inject_ingress_drop), in_seq++)) {
         ++c.injected_drops;
         continue;
       }
@@ -1259,6 +1601,7 @@ int main(int argc, char** argv) {
       }
       if (!complete) continue;
       ++c.frames_in;  // 帧在「完成或超时」处结算（#35）
+      g_frames_in_total.fetch_add(1, std::memory_order_relaxed);
 
       const int64_t t_reasm_done = cue::now_us();
       // recv 段：数据报到达 → 本帧重组完成。段意保持原样，**不再**把重组耗时灌进 buffer：

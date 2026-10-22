@@ -251,6 +251,9 @@ struct PipelineMetrics {
   uint64_t encode_errors = 0;  // 编码失败（尺寸/格式/编码器错误）
   uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
   uint64_t budget_drops = 0;   // 令牌桶不足丢的帧
+  // 排队策略切换（fault.set kind=backlog 改了发送节奏）时主动丢弃的积压帧。
+  // 与 dropped 分开：那一刻丢弃是控制面的策略决定，不是链路故障。
+  uint64_t queue_dropped = 0;
   // 六段 p50（ms）。NaN = 这一段没有样本（cued 的 METRICS 对应段是 null）：
   // "没采到"与"花了 0 ms"是两件事，消费者必须输出 null/n/a，不能用 0 冒充。
   double recv_p50 = kNoSample, buffer_p50 = kNoSample, decode_p50 = kNoSample,
@@ -263,6 +266,10 @@ struct PipelineMetrics {
   bool alive = false;
   // 指标属于哪个 cued 会话（同一个 cue 进程内可能重启过多代）；消费者据此判断跨进程拼接（#25）
   pid_t pid = 0;
+  // 控制通道（T-05）：cued 侧实际生效的通道 "uds" / "stdout"，以及它累计处理的控制
+  // 请求数。空字符串 = 这行 METRICS 来自没有该字段的旧 cued（不要读成"没有控制面"）。
+  std::string control_channel;
+  uint64_t control_ops = 0;
 };
 
 }  // namespace cue::pipeline

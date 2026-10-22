@@ -37,6 +37,10 @@ constexpr std::size_t kLogTailMax = 200;
 constexpr int kMaxRestarts = 3;
 constexpr auto kRestartBackoff = std::chrono::milliseconds(200);
 constexpr auto kReapPoll = std::chrono::milliseconds(50);
+// 等 cued 的 UDS socket 出现（spawn 之后）的预算：cued 起来到 bind 控制 socket 只做
+// 解码器 open 与配置校验，正常是几十 ms；3 s 足够覆盖 2 vCPU 上被抢占的情况，
+// 又不至于让一次 start() 在降级路径上卡 10 s。
+constexpr int kControlConnectTimeoutMs = 3000;
 
 // cued 的每秒指标行前缀。严格整行前缀匹配（不是子串），cued 哪天多打一个
 // frames_in= 也不会串味（review #29）。
@@ -50,6 +54,33 @@ int64_t unix_us() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
+}
+
+// 把 cued 回来的编码档位镜像进 cfg_：cfg_ 是「下一次 spawn 的命令行参数」，
+// 不是运行期真值（真值在 cued 的 ParamStore 里，metrics.query 的 params 是权威）。
+// 只镜像存在的键：cued 少给一个字段时保留本地值，而不是把它写成默认值。
+void apply_encoder_params_json(const nlohmann::json& p, PipelineEndpoint& cfg) {
+  if (p.contains("transcode") && p["transcode"].is_string()) {
+    cfg.transcode = p["transcode"].get<std::string>() == "on";
+  }
+  if (p.contains("width") && p["width"].is_number_integer()) {
+    cfg.width = p["width"].get<int>();
+  }
+  if (p.contains("height") && p["height"].is_number_integer()) {
+    cfg.height = p["height"].get<int>();
+  }
+  if (p.contains("bitrate_kbps") && p["bitrate_kbps"].is_number_integer()) {
+    cfg.bitrate_kbps = p["bitrate_kbps"].get<int>();
+  }
+  if (p.contains("fps") && p["fps"].is_number_integer()) {
+    cfg.fps = p["fps"].get<int>();
+  }
+  if (p.contains("gop") && p["gop"].is_number_integer()) {
+    cfg.gop = p["gop"].get<int>();
+  }
+  if (p.contains("preset") && p["preset"].is_string()) {
+    cfg.preset = p["preset"].get<std::string>();
+  }
 }
 
 std::string describe_status(int status) {
@@ -170,6 +201,154 @@ ProcessPipelineControl::~ProcessPipelineControl() {
   if (supervisor_.joinable()) supervisor_.join();
 }
 
+// ---------------------------------------------------------------- 控制通道（UDS）
+
+std::string ProcessPipelineControl::control_socket_path(pid_t pid) {
+  // 路径由 cued 决定（/tmp/cue/<pid>/control.sock）：按 pid 分目录，同机多个 cued 不互踩。
+  // 不走命令行参数：控制 socket 的位置必须是"可推导的"，否则两端又多一个要同步的配置项。
+  return "/tmp/cue/" + std::to_string(static_cast<long long>(pid)) + "/control.sock";
+}
+
+ProcessPipelineControl::Config ProcessPipelineControl::cfg_snapshot() const {
+  std::lock_guard<std::mutex> lk(cfg_mu_);
+  return cfg_;
+}
+
+ProcessPipelineControl::Config ProcessPipelineControl::config() const { return cfg_snapshot(); }
+
+std::string ProcessPipelineControl::control_channel() const {
+  return control_channel_tag(ctl_kind_.load());
+}
+
+std::string ProcessPipelineControl::last_control_error() const {
+  std::lock_guard<std::mutex> lk(ctl_mu_);
+  return last_control_error_;
+}
+
+void ProcessPipelineControl::close_control_locked() {
+  std::lock_guard<std::mutex> lk(ctl_mu_);
+  if (ctl_) {
+    ctl_->close();
+    ctl_.reset();
+  }
+  ctl_kind_.store(ControlChannelKind::None);
+}
+
+bool ProcessPipelineControl::connect_control_locked(std::string& err) {
+  close_control_locked();
+  const pid_t pid = pid_.load();
+  if (pid == 0) {
+    err = "cued 未运行（没有 pid，推不出控制 socket 路径）";
+    return false;
+  }
+  const std::string path = control_socket_path(pid);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(kControlConnectTimeoutMs);
+  std::string last = "socket 未出现";
+  for (;;) {
+    if (pid_.load() != pid) {
+      last = "cued 在等控制 socket 时退出了";
+      break;
+    }
+    if (::access(path.c_str(), F_OK) == 0) {
+      auto client = std::make_unique<ControlClient>();
+      std::string cerr;
+      if (client->connect(path, 300, cerr)) {
+        {
+          std::lock_guard<std::mutex> lk(ctl_mu_);
+          ctl_ = std::move(client);
+          last_control_error_.clear();
+          ctl_kind_.store(ctl_->kind());
+        }
+        // 启动参数下发：一次 pipeline.start 的 args 批量应用。
+        // 为什么不是一组 set_param：
+        //  1) set_param 一次只改一个键，中间态（width 改了 height 还没改）会被正在跑的
+        //     媒体循环看到并重建一次编码器；pipeline.start 的 args 是原子的一批；
+        //  2) 命令行参数仍然原样下传（评测脚本依赖 --inject-drop 的"启动即生效"语义），
+        //     这里是"命令行为初值、控制面确认一次"，同值幂等（不推进 generation）。
+        const ProcessPipelineControl::Config cfg = cfg_snapshot();
+        json args{{"bitrate_kbps", cfg.bitrate_kbps},
+                  {"gop", cfg.gop},
+                  {"preset", cfg.preset},
+                  {"transcode", cfg.transcode ? "on" : "off"},
+                  {"fps", cfg.fps}};
+        // width/height 只在成对有效时下发：单给一维本身非法，不该让整批失败。
+        if (cfg.width > 0 && cfg.height > 0) {
+          args["width"] = cfg.width;
+          args["height"] = cfg.height;
+        } else if (cfg.width == 0 && cfg.height == 0) {
+          args["width"] = 0;
+          args["height"] = 0;
+        }
+        json res;
+        std::string serr;
+        if (!control_call("pipeline.start", args, res, serr)) {
+          // 控制通道通了但参数确认失败：不假装成功，留一条日志与事件（参数的实际来源
+          // 仍是命令行，所以不把 start() 判成失败）。
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            push_log_locked("[control] 启动参数下发失败：" + serr);
+          }
+          emit_local_event("control.error", json{{"op", "pipeline.start"}, {"reason", serr}});
+        }
+        return true;
+      }
+      last = cerr;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  err = "等待控制 socket " + path + " 超时（" + std::to_string(kControlConnectTimeoutMs) +
+        " ms）：" + last;
+  {
+    std::lock_guard<std::mutex> lk(ctl_mu_);
+    last_control_error_ = "控制连接不可用：" + err;
+    ctl_kind_.store(ControlChannelKind::None);
+  }
+  // 降级不是静默的：事件 + 日志 + (指标里的) control_channel=stdout 三处都要能看见
+  emit_local_event("control.degraded", json{{"reason", err}, {"channel", "stdout"}});
+  return false;
+}
+
+bool ProcessPipelineControl::control_call(const char* op, const json& args, json& result,
+                                          std::string& err) const {
+  std::lock_guard<std::mutex> lk(ctl_mu_);
+  if (!ctl_) {
+    // 懒重连：只在 socket 还在（cued 还活着）时试一次。这恢复的是**控制连接本身**，
+    // 进程、会话、媒体流都不动——与"重启 cued 让它重新读命令行"是两回事。
+    const pid_t pid = pid_.load();
+    if (pid != 0) {
+      const std::string path = control_socket_path(pid);
+      if (::access(path.c_str(), F_OK) == 0) {
+        auto client = std::make_unique<ControlClient>();
+        std::string cerr;
+        if (client->connect(path, 200, cerr)) {
+          ctl_ = std::move(client);
+          ctl_kind_.store(ctl_->kind());
+          last_control_error_.clear();
+        }
+      }
+    }
+  }
+  if (!ctl_) {
+    err = last_control_error_.empty() ? "控制连接不可用（UDS 未建立）" : last_control_error_;
+    err += "；降级到 stdout 模式，改参数需要重启 cued（本版不会为此自动重启）";
+    return false;
+  }
+  json resp;
+  if (!ctl_->call(op, args, resp, err)) {
+    if (!ctl_->connected()) {
+      // 断了：丢掉客户端并留下原因；下一次调用会先试一次重连
+      last_control_error_ = "控制连接不可用：" + err;
+      ctl_.reset();
+      ctl_kind_.store(ControlChannelKind::None);
+    }
+    return false;
+  }
+  result = std::move(resp);
+  return true;
+}
+
 bool ProcessPipelineControl::spawn(std::string& err) {
   std::lock_guard<std::mutex> lk(spawn_mu_);
   return spawn_locked(err);
@@ -215,35 +394,38 @@ bool ProcessPipelineControl::spawn_cued_locked(std::string& err) {
     log_fd_ = -1;
   }
 
+  // 快照一次：cfg_ 会被控制线程改（set_param / inject_fault 成功后镜像），
+  // 边读边被改会拼出"新码率 + 旧 GOP"这种命令行。
+  const ProcessPipelineControl::Config cfg = cfg_snapshot();
   std::vector<std::string> args{
-      cfg_.cued_bin, "--ws-port", std::to_string(cfg_.ws_port),
-      "--probe-port", std::to_string(cfg_.probe_port),
-      "--bitrate", std::to_string(cfg_.bitrate_kbps),
-      "--fps", std::to_string(cfg_.fps),
-      "--gop", std::to_string(cfg_.gop),
-      "--preset", cfg_.preset,
-      "--send-mbps", std::to_string(cfg_.send_mbps),
-      "--inject-drop", std::to_string(cfg_.inject_drop),
-      "--inject-seed", std::to_string(cfg_.inject_seed),
-      "--fec", cfg_.fec ? "on" : "off",
+      cfg.cued_bin, "--ws-port", std::to_string(cfg.ws_port),
+      "--probe-port", std::to_string(cfg.probe_port),
+      "--bitrate", std::to_string(cfg.bitrate_kbps),
+      "--fps", std::to_string(cfg.fps),
+      "--gop", std::to_string(cfg.gop),
+      "--preset", cfg.preset,
+      "--send-mbps", std::to_string(cfg.send_mbps),
+      "--inject-drop", std::to_string(cfg.inject_drop),
+      "--inject-seed", std::to_string(cfg.inject_seed),
+      "--fec", cfg.fec ? "on" : "off",
   };
   // 上行注入与发送排队只在开启时下传：不带这两个参数时 cued 的行为与 M2 完全一致
-  if (cfg_.inject_ingress_drop > 0.0) {
+  if (cfg.inject_ingress_drop > 0.0) {
     args.push_back("--inject-ingress-drop");
-    args.push_back(std::to_string(cfg_.inject_ingress_drop));
+    args.push_back(std::to_string(cfg.inject_ingress_drop));
   }
-  if (cfg_.queue_fps > 0.0) {
+  if (cfg.queue_fps > 0.0) {
     args.push_back("--queue-fps");
-    args.push_back(std::to_string(cfg_.queue_fps));
+    args.push_back(std::to_string(cfg.queue_fps));
   }
-  if (cfg_.transcode) {
+  if (cfg.transcode) {
     args.push_back("--transcode");
     args.push_back("on");
-    if (cfg_.width > 0 && cfg_.height > 0) {
+    if (cfg.width > 0 && cfg.height > 0) {
       args.push_back("--width");
-      args.push_back(std::to_string(cfg_.width));
+      args.push_back(std::to_string(cfg.width));
       args.push_back("--height");
-      args.push_back(std::to_string(cfg_.height));
+      args.push_back(std::to_string(cfg.height));
     }
   }
 
@@ -263,6 +445,14 @@ bool ProcessPipelineControl::spawn_cued_locked(std::string& err) {
   pid_.store(cued.pid);
   stop_reader_.store(false);
   reader_ = std::thread([this] { reader_loop(); });
+  // 控制通道：cued 起来之后才有 socket。这里等（轮询 + 超时），失败**不阻断启动**——
+  // 「控制面没建起来」不等于「管线不能用」，但降级事实必须一路传出去：
+  // last_control_error_ + 日志 + control.degraded 事件，且 set_param 会明确拒绝。
+  std::string cerr;
+  if (!connect_control_locked(cerr)) {
+    std::lock_guard<std::mutex> lk(mu_);
+    push_log_locked("[control] 降级到 stdout：" + cerr);
+  }
   return true;
 }
 
@@ -279,17 +469,18 @@ bool ProcessPipelineControl::spawn_probe_locked(std::string& err) {
     ::close(probe_fd_);
     probe_fd_ = -1;
   }
+  const ProcessPipelineControl::Config cfg = cfg_snapshot();
   std::vector<std::string> args{
-      cfg_.probe_bin, "--port", std::to_string(cfg_.probe_port),
-      "--bind", cfg_.probe_host,
+      cfg.probe_bin, "--port", std::to_string(cfg.probe_port),
+      "--bind", cfg.probe_host,
       // 标称帧率只用来推卡顿阈值（stall_factor × 1/fps），不是测量值
-      "--fps", std::to_string(cfg_.fps),
+      "--fps", std::to_string(cfg.fps),
   };
-  if (!cfg_.probe_report_addrs.empty()) {
+  if (!cfg.probe_report_addrs.empty()) {
     // 跨机模式：harness 与 probe 不在同一台机器上时，指标走 TCP JSON-line 上报；
     // 本机模式下这条通道为空，probe 只打 stdout（我们直接读管道）。
     args.push_back("--report-addrs");
-    args.push_back(cfg_.probe_report_addrs);
+    args.push_back(cfg.probe_report_addrs);
   }
   const Child probe = spawn_child(args);
   if (probe.pid == 0) {
@@ -310,7 +501,7 @@ bool ProcessPipelineControl::spawn_probe_locked(std::string& err) {
   stop_probe_reader_.store(false);
   probe_reader_ = std::thread([this] { probe_reader_loop(); });
   emit_local_event("probe.spawned",
-                   json{{"pid", probe.pid}, {"port", cfg_.probe_port}, {"bin", cfg_.probe_bin}});
+                   json{{"pid", probe.pid}, {"port", cfg.probe_port}, {"bin", cfg.probe_bin}});
   return true;
 }
 
@@ -359,19 +550,10 @@ void ProcessPipelineControl::stop() {
   // 倒序收下游：cued 停了以后 probe 已经没有数据来源，先停 cued 再停它，
   // 避免"探针先死、cued 还在往死端口发包"这段窗口里的假计数。
   kill_probe_locked();
+  close_control_locked();
   restarts_ = 0;
   probe_restarts_ = 0;
   stopping_.store(false);
-}
-
-bool ProcessPipelineControl::restart_cued(std::string& err) {
-  std::lock_guard<std::mutex> lk(spawn_mu_);
-  // stopping_ 只在这一小段置位：监督线程据此知道"pid 归零是控制面在改档，不是崩溃"，
-  // 否则它会把这次重启当成崩溃再叠一次自动重启。
-  stopping_.store(true);
-  kill_cued_locked();
-  stopping_.store(false);
-  return spawn_cued_locked(err);
 }
 
 void ProcessPipelineControl::kill_cued_locked() {
@@ -408,6 +590,9 @@ void ProcessPipelineControl::kill_cued_locked() {
     // 控制面主动停：与 cued 自己被 SIGTERM 时的 pipeline.stopped(origin=process) 区分开
     emit_local_event("pipeline.stopped", json{{"reason", "control"}, {"pid", pid}});
   }
+  // 控制连接属于这一代 cued：进程没了，fd 立刻失效，留着只会让下一次请求
+  // 拿到 EPIPE 才发现。这里主动断开，并保留原因（observation 会带出去）。
+  close_control_locked();
   // 先让读线程醒过来退出，再关 fd：旧顺序 close 在前，读线程可能正阻塞在同一 fd 上，
   // 拿到 EBADF 或（fd 号被复用后）读到别人的数据（review #24）
   stop_reader_.store(true);
@@ -567,6 +752,91 @@ void ProcessPipelineControl::reader_loop() { read_loop(log_fd_, stop_reader_); }
 
 void ProcessPipelineControl::probe_reader_loop() { read_loop(probe_fd_, stop_probe_reader_); }
 
+// METRICS 行与 UDS metrics.query 的响应共用这一份解析：同一个 PipelineMetrics 口径，
+// 两个数据源。分开写两份的后果是"stdout 读数"与"UDS 读数"迟早对不上，而它们本应
+// 是同一份 report() 的产物。
+//
+// from_uds=true 时额外做两件事：
+//  1) 只要不**比缓存新**就什么都不改（cued 与本进程在同一台机器上，steady_clock 可比；
+//     否则 refresh 会让 updated_us/age_ms 来回跳）；
+//  2) samples 不递增（那是"解析到几条 stdout METRICS 行"的计数），只在缓存为空时
+//     采纳 cued 自报的 samples。
+bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
+  if (!j.is_object()) return false;
+  PipelineMetrics m;  // 分位默认 NaN：cued 打 null 的段保持"无样本"
+  // 计数一律按"键存在且是非负整数"解析：value() 遇到 null/类型不符会抛异常，
+  // 而 METRICS 行来自子进程，任何字段形态都可能出现（不让它穿透 reader 线程）。
+  auto count = [&j](const char* key) -> uint64_t {
+    const auto it = j.find(key);
+    if (it == j.end() || !it->is_number_integer()) return 0;
+    const int64_t v = it->get<int64_t>();
+    return v > 0 ? static_cast<uint64_t>(v) : 0;
+  };
+  const auto fps_it = j.find("fps");
+  m.fps = (fps_it != j.end() && fps_it->is_number()) ? fps_it->get<double>() : 0.0;
+  m.frames_in = count("frames_in");
+  m.frames_out = count("frames_out");
+  m.dropped = count("dropped");
+  m.injected = count("injected");
+  m.decoded = count("decoded");
+  m.decode_errors = count("decode_errors");
+  m.rejected = count("rejected");
+  m.send_errors = count("send_errors");
+  m.encode_errors = count("encode_errors");
+  m.decode_drops = count("decode_drops");
+  m.budget_drops = count("budget_drops");
+  m.queue_dropped = count("queue_dropped");
+  // 段分位：cued 写 null（本秒没有样本）或整段缺失 → 保持 NaN，绝不写成 0
+  auto stage = [&j](const char* key, double& p50, double& p95, double& p99) {
+    const auto it = j.find(key);
+    if (it == j.end() || !it->is_object()) return;
+    auto num = [&it](const char* k, double& out) {
+      const auto f = it->find(k);
+      if (f == it->end() || !f->is_number()) return;
+      out = f->get<double>();
+    };
+    num("p50", p50);
+    num("p95", p95);
+    num("p99", p99);
+  };
+  double sink_p95 = kNoSample;  // p95 目前没有消费者，丢弃但不污染 p99
+  stage("recv", m.recv_p50, sink_p95, sink_p95);
+  stage("buffer", m.buffer_p50, sink_p95, sink_p95);
+  stage("decode", m.decode_p50, sink_p95, m.decode_p99);
+  stage("op", m.op_p50, sink_p95, m.op_p99);
+  stage("encode", m.encode_p50, sink_p95, m.encode_p99);
+  stage("send", m.send_p50, sink_p95, sink_p95);
+  // 控制面字段（T-05）：通道类型与 cued 累计处理的控制请求数
+  if (const auto it = j.find("control_channel"); it != j.end() && it->is_string()) {
+    m.control_channel = it->get<std::string>();
+  }
+  m.control_ops = count("control_ops");
+  const int64_t remote_t = (j.contains("t_us") && j["t_us"].is_number_integer())
+                               ? j["t_us"].get<int64_t>()
+                               : 0;
+  m.pid = pid_.load();
+  m.alive = true;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (from_uds) {
+      if (remote_t != 0 && remote_t <= metrics_.updated_us) return true;
+      m.samples = metrics_.samples;
+      if (m.samples == 0) {
+        const auto s_it = j.find("samples");
+        if (s_it != j.end() && s_it->is_number_integer()) {
+          const int64_t v = s_it->get<int64_t>();
+          if (v > 0) m.samples = static_cast<uint64_t>(v);
+        }
+      }
+    } else {
+      m.samples = metrics_.samples + 1;
+    }
+    m.updated_us = std::max(now_us(), remote_t);
+    metrics_ = m;
+  }
+  return true;
+}
+
 void ProcessPipelineControl::parse_line(const std::string& line) {
   // 结构化事件行：整行标签匹配，与 [cued] 人读行 / METRICS 行互不干扰
   if (line.rfind(cue::proto::kEventTag, 0) == 0) {
@@ -579,54 +849,9 @@ void ProcessPipelineControl::parse_line(const std::string& line) {
       push_log("[pipeline] METRICS 行不是合法 JSON: " + line);
       return;
     }
-    PipelineMetrics m;  // 分位默认 NaN：cued 打 null 的段保持"无样本"
-    // 计数一律按"键存在且是非负整数"解析：value() 遇到 null/类型不符会抛异常，
-    // 而 METRICS 行来自子进程，任何字段形态都可能出现（不让它穿透 reader 线程）。
-    auto count = [&j](const char* key) -> uint64_t {
-      const auto it = j.find(key);
-      if (it == j.end() || !it->is_number_integer()) return 0;
-      const int64_t v = it->get<int64_t>();
-      return v > 0 ? static_cast<uint64_t>(v) : 0;
-    };
-    const auto fps_it = j.find("fps");
-    m.fps = (fps_it != j.end() && fps_it->is_number()) ? fps_it->get<double>() : 0.0;
-    m.frames_in = count("frames_in");
-    m.frames_out = count("frames_out");
-    m.dropped = count("dropped");
-    m.injected = count("injected");
-    m.decoded = count("decoded");
-    m.decode_errors = count("decode_errors");
-    m.rejected = count("rejected");
-    m.send_errors = count("send_errors");
-    m.encode_errors = count("encode_errors");
-    m.decode_drops = count("decode_drops");
-    m.budget_drops = count("budget_drops");
-    // 段分位：cued 写 null（本秒没有样本）或整段缺失 → 保持 NaN，绝不写成 0
-    auto stage = [&j](const char* key, double& p50, double& p95, double& p99) {
-      const auto it = j.find(key);
-      if (it == j.end() || !it->is_object()) return;
-      auto num = [&it](const char* k, double& out) {
-        const auto f = it->find(k);
-        if (f == it->end() || !f->is_number()) return;
-        out = f->get<double>();
-      };
-      num("p50", p50);
-      num("p95", p95);
-      num("p99", p99);
-    };
-    double sink_p95 = kNoSample;  // p95 目前没有消费者，丢弃但不污染 p99
-    stage("recv", m.recv_p50, sink_p95, sink_p95);
-    stage("buffer", m.buffer_p50, sink_p95, sink_p95);
-    stage("decode", m.decode_p50, sink_p95, m.decode_p99);
-    stage("op", m.op_p50, sink_p95, m.op_p99);
-    stage("encode", m.encode_p50, sink_p95, m.encode_p99);
-    stage("send", m.send_p50, sink_p95, sink_p95);
-    m.updated_us = now_us();
-    m.pid = pid_.load();
-    std::lock_guard<std::mutex> lk(mu_);
-    m.samples = metrics_.samples + 1;
-    m.alive = true;
-    metrics_ = m;
+    if (!apply_metrics_json(j, /*from_uds=*/false)) {
+      push_log("[pipeline] METRICS 行不是对象: " + line);
+    }
     return;
   }
   // 人的可读行留在 log_tail_，但每秒的 fps 摘要行不再重复堆进去（指标已结构化）
@@ -763,138 +988,113 @@ PipelineMetrics ProcessPipelineControl::latest() const {
   std::lock_guard<std::mutex> lk(mu_);
   PipelineMetrics m = metrics_;
   m.alive = pid_.load() != 0;
+  // 旧版 cued 的 METRICS 行没有 control_channel：按控制面实际状态填。
+  // 留空会被读成"没有控制面"，而事实上它只是"这版没上报"。
+  if (m.control_channel.empty()) m.control_channel = control_channel_tag(ctl_kind_.load());
   return m;
 }
 
-bool ProcessPipelineControl::set_param(const std::string& key, const std::string& value, std::string& err) {
-  Config next = cfg_;
-  try {
-    if (key == "bitrate_kbps") next.bitrate_kbps = std::stoi(value);
-    else if (key == "gop") next.gop = std::stoi(value);
-    else if (key == "preset") next.preset = value;
-    else if (key == "transcode") next.transcode = (value == "on" || value == "true" || value == "1");
-    // SPEC §7.4 的 key 枚举含 width/height：档位表驱动的「降分辨率」必须能执行
-    else if (key == "width") next.width = std::stoi(value);
-    else if (key == "height") next.height = std::stoi(value);
-    else {
-      err = "unsupported key: " + key;
-      return false;
-    }
-  } catch (const std::exception&) {
-    err = "invalid value for " + key + ": " + value;
+bool ProcessPipelineControl::refresh_metrics(std::string& err) {
+  json result;
+  if (!control_call("metrics.query", json{{"window_ms", 1000}}, result, err)) return false;
+  if (!apply_metrics_json(result, /*from_uds=*/true)) {
+    err = "metrics.query 的响应不是 JSON 对象";
     return false;
   }
-  // 语义校验
-  if (next.bitrate_kbps < 100 || next.bitrate_kbps > 20000) {
-    err = "bitrate_kbps out of range [100, 20000]";
-    return false;
-  }
-  if (next.gop < 1 || next.gop > 300) {
-    err = "gop out of range [1, 300]";
-    return false;
-  }
-  // 0/0 表示「沿用解码尺寸」；只给一个维度没有意义（cued 侧无法推断另一边）
-  if ((next.width == 0) != (next.height == 0)) {
-    err = "width/height must be set together (0/0 = follow decoded size)";
-    return false;
-  }
-  if (next.width > 0) {
-    if (next.width < 16 || next.width > 4096 || next.height < 16 || next.height > 4096) {
-      err = "width/height out of range [16, 4096]";
-      return false;
-    }
-    if (next.width % 2 != 0 || next.height % 2 != 0) {
-      err = "width/height must be even (x264 I420 requirement)";
-      return false;
-    }
-  }
-  // 幂等：配置没变就不重启（重启会断流，agent 反复 set 同值会空转）
-  if (next.bitrate_kbps == cfg_.bitrate_kbps && next.gop == cfg_.gop && next.preset == cfg_.preset &&
-      next.transcode == cfg_.transcode && next.width == cfg_.width && next.height == cfg_.height) {
-    return true;
-  }
-  cfg_ = next;
-  if (!restart_cued(err)) return false;
-  emit_local_event("pipeline.restart", json{{"reason", "config_change"},
-                                            {"key", key},
-                                            {"value", value},
-                                            {"pid", pid_.load()}});
   return true;
 }
 
-bool ProcessPipelineControl::inject_fault(const std::string& kind, double value, std::string& err) {
+bool ProcessPipelineControl::set_param(const std::string& key, const std::string& value,
+                                      std::string& err) {
+  json result;
+  if (!control_call("pipeline.set_param", json{{"key", key}, {"value", value}}, result, err)) {
+    // 失败原因原样透出：cued 的校验文案（"gop 超出范围…"）比"内部错误"有用得多；
+    // 控制面不可用时 control_call 已经在 err 里写明"降级 → 需要重启 cued"。
+    return false;
+  }
+  // 成功：把生效后的编码档位镜像进 cfg_（下一次 spawn 的命令行参数）。
+  if (result.contains("params") && result["params"].is_object()) {
+    std::lock_guard<std::mutex> lk(cfg_mu_);
+    apply_encoder_params_json(result["params"], cfg_);
+  }
+  // 这里**不发** pipeline.restart 事件：cued 侧会发 pipeline.param（带 encoder_rebuild），
+  // 两处各发一条会让 agent 在事件流里看到两次"参数变了"。
+  return true;
+}
+
+bool ProcessPipelineControl::inject_fault(const std::string& kind, double value,
+                                          std::string& err) {
   // 四种注入对应四种不同的可观测量（real-faults 的五类里四类由此而来）：
   //   drop          出向丢包（%）：只涨 injected；丢弃发生在 frames_out 结算之后 → fps 不动
   //   ingress_drop  上行丢包（%）：帧重组超时 → dropped 涨、frames_out 掉
   //   rate          发送速率上限（Mbps）：令牌桶不足 → budget_drops 涨、帧被丢
   //   backlog       发送排队节奏（帧/s）：不丢包，队列积压 → frames_in−frames_out 涨
-  if (kind != "drop" && kind != "ingress_drop" && kind != "rate" && kind != "backlog") {
-    err = "不支持的注入类型 \"" + kind + "\"（可用：drop / ingress_drop / rate / backlog）";
+  json result;
+  if (!control_call("fault.set", json{{"kind", kind}, {"value", value}}, result, err)) {
     return false;
   }
-  if (!(value >= 0.0 && value <= 100.0)) {  // 同时挡掉 NaN
-    err = "注入值超出范围 [0, 100]（0 = 清除全部注入）";
-    return false;
+  // respawn 是 cued 回传的"下次重启该用的档位"：注入是全局的（value=0 会一并清掉
+  // rate/backlog），清除规则只允许有一份，所以镜像它而不是在这里重写一遍。
+  if (result.contains("respawn") && result["respawn"].is_object()) {
+    const json& r = result["respawn"];
+    std::lock_guard<std::mutex> lk(cfg_mu_);
+    if (r.contains("inject_drop") && r["inject_drop"].is_number()) {
+      cfg_.inject_drop = r["inject_drop"].get<double>();
+    }
+    if (r.contains("inject_ingress_drop") && r["inject_ingress_drop"].is_number()) {
+      cfg_.inject_ingress_drop = r["inject_ingress_drop"].get<double>();
+    }
+    if (r.contains("send_mbps") && r["send_mbps"].is_number()) {
+      cfg_.send_mbps = r["send_mbps"].get<double>();
+    }
+    if (r.contains("queue_fps") && r["queue_fps"].is_number()) {
+      cfg_.queue_fps = r["queue_fps"].get<double>();
+    }
   }
-  if (kind == "rate" && value > 0.0 && value < 0.1) {
-    err = "rate 注入值必须在 [0.1, 100] Mbps（cued 的 --send-mbps 下限是 0.1）";
-    return false;
-  }
-  // value=0 = 清除**全部**注入：工具面只有一个「注入丢包计数」读数，agent 不该被要求
-  // 先猜是哪一路注入才能撤销（见 real_ops_system_prompt 的说明）。
-  const bool clearing = value <= 0.0;
-  Config next = cfg_;
-  if (clearing) {
-    next.inject_drop = 0.0;
-    next.inject_ingress_drop = 0.0;
-    next.send_mbps = 10.0;  // SPEC §7.2 的默认链路：10 Mbps / 64 包突发
-    next.queue_fps = 0.0;
-  } else if (kind == "drop") {
-    next.inject_drop = value;
-  } else if (kind == "ingress_drop") {
-    next.inject_ingress_drop = value;
-  } else if (kind == "rate") {
-    next.send_mbps = value;
-  } else {
-    next.queue_fps = value;
-  }
-  if (next.inject_drop == cfg_.inject_drop &&
-      next.inject_ingress_drop == cfg_.inject_ingress_drop &&
-      next.send_mbps == cfg_.send_mbps && next.queue_fps == cfg_.queue_fps) {
-    return true;  // 幂等：注入值没变不重启
-  }
-  cfg_ = next;
-  if (!restart_cued(err)) return false;
-  emit_local_event("pipeline.restart", json{{"reason", "fault_change"}, {"pid", pid_.load()}});
-  // 施加故障由 cued 自己报（fault.applied，scope=cued_start）；取消故障 cued 侧无从得知
-  // （它只是以未注入的档位启动），所以 cleared 只能由控制面补上。
-  if (clearing) {
-    emit_local_event("fault.cleared",
-                     json{{"kind", kind}, {"value", value}, {"pid", pid_.load()}});
-  }
+  // fault.applied / fault.cleared 由 cued 自己发（它才知道注入到底生效了没有）；
+  // 父进程不再补发，否则事件流里同一件事出现两次。
   return true;
 }
 
-std::string ProcessPipelineControl::observation(const std::string& source, int tail, std::string& err) const {
+std::string ProcessPipelineControl::observation(const std::string& source, int tail,
+                                                std::string& err) const {
   if (source != "logs" && source != "procs" && source != "frames" && source != "events") {
     err = "unsupported source: " + source;
     return {};
   }
+  json result;
+  std::string cerr;
+  const bool via_uds =
+      control_call("obs.fetch", json{{"source", source}, {"tail", tail}}, result, cerr);
+  if (via_uds && result.contains("text") && result["text"].is_string()) {
+    return result["text"].get<std::string>();
+  }
+  // 降级：控制通道不可用时用 stdout 解析出来的本地缓存（数据仍然真实，只是不是实时的）。
+  // 第一行必须写明"这一份走的是 stdout"——把缓存当实时快照是最容易骗过自己的那种报告，
+  // 但**不能**因此返回空：运维在看进程还在不在的时候，旧数据也比没有强。
+  std::string text = local_observation(source, tail);
+  const std::string why =
+      cerr.empty() ? std::string("obs.fetch 响应缺 text 字段") : cerr;
+  return "control_channel=stdout reason=" + why + "\n" + text;
+}
+
+std::string ProcessPipelineControl::local_observation(const std::string& source, int tail) const {
   std::lock_guard<std::mutex> lk(mu_);
+  const ProcessPipelineControl::Config cfg = cfg_snapshot();
   std::ostringstream oss;
   if (source == "procs") {
     // 注意：不暴露真实注入值——那是"标准答案"，agent 必须从指标推断
     // running=false + pid=0 是 cued 已不在的可靠信号（监督线程负责回收）
     const pid_t pid = pid_.load();
     oss << "cued pid=" << pid << " running=" << (pid != 0 ? "true" : "false")
-        << " restarts=" << restarts_ << " transcode=" << (cfg_.transcode ? "on" : "off")
-        << " bitrate=" << cfg_.bitrate_kbps << "kbps gop=" << cfg_.gop;
+        << " restarts=" << restarts_ << " transcode=" << (cfg.transcode ? "on" : "off")
+        << " bitrate=" << cfg.bitrate_kbps << "kbps gop=" << cfg.gop;
     // 编码器实际档位：agent 判断「编码段慢」到底是 preset 太慢还是输出像素太多，
     // 必须能读到这两项（它们与 bitrate/gop 同属配置面，不是答案）。
     oss << " size="
-        << (cfg_.width > 0 ? std::to_string(cfg_.width) + "x" + std::to_string(cfg_.height)
+        << (cfg.width > 0 ? std::to_string(cfg.width) + "x" + std::to_string(cfg.height)
                           : std::string("follow"))
-        << " preset=" << cfg_.preset;
+        << " preset=" << cfg.preset;
     return oss.str();
   }
   if (source == "events") {
@@ -924,8 +1124,10 @@ std::string ProcessPipelineControl::observation(const std::string& source, int t
   if (log_tail_.empty()) return {};
   const int n = std::max(1, std::min<int>(tail <= 0 ? 20 : tail, static_cast<int>(log_tail_.size())));
   // 空 log_tail_ 时 size-n 会变成 -1（越界读，ASan 实测 SEGV）
-  const int start = std::max(0, static_cast<int>(log_tail_.size()) - n);
-  for (int i = start; i < static_cast<int>(log_tail_.size()); ++i) oss << log_tail_[static_cast<std::size_t>(i)] << '\n';
+  const int begin = std::max(0, static_cast<int>(log_tail_.size()) - n);
+  for (int i = begin; i < static_cast<int>(log_tail_.size()); ++i) {
+    oss << log_tail_[static_cast<std::size_t>(i)] << '\n';
+  }
   return oss.str();
 }
 

@@ -73,7 +73,17 @@ class IServicePipeline {
   virtual bool set_param(const std::string& key, const std::string& value, std::string& err) = 0;
   virtual bool inject_fault(const std::string& kind, double value, std::string& err) = 0;
   virtual std::string observation(const std::string& source, int tail, std::string& err) const = 0;
+  // 主动查一次指标快照（Process 后端走 UDS 的 metrics.query；其余后端默认不支持）。
+  // 默认 false 而不是回退 latest()：调用方要能区分「这份数是刚查的」与「这是 1 Hz 缓存」，
+  // 而 latest() 被监控线程/SSE 高频调用，不能让它变成一次可能超时的网络往返。
+  virtual bool refresh_metrics(std::string& err);
 };
+
+// 默认实现（定义在 service_pipeline.cpp）：后端不支持主动查询时返回 false 并写原因。
+inline bool IServicePipeline::refresh_metrics(std::string& err) {
+  err = "该后端不支持主动查询指标（用 latest() 的 1 Hz 缓存）";
+  return false;
+}
 
 // 按端点类型造实现：Process → ProcessPipelineControl（子进程 + stdout 解析），
 // Http → HttpServicePipeline（REST 控制协议，见 pipeline/http_pipeline.h）。

@@ -49,7 +49,13 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"encode_errors", m.encode_errors},
               {"decode_drops", m.decode_drops},
               {"budget_drops", m.budget_drops},
+              {"queue_dropped", m.queue_dropped},
               {"samples", m.samples},
+              // 控制面（T-05）：通道类型与 cued 侧累计处理的控制请求数。旧版 cued 不上报
+              // 时 control_channel 为 null——"不知道"不能写成 "stdout"。
+              {"control_channel", m.control_channel.empty() ? json(nullptr)
+                                                            : json(m.control_channel)},
+              {"control_ops", m.control_ops},
               {"age_ms", age_us < 0 ? -1 : age_us / 1000}};
 }
 
@@ -347,10 +353,18 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
                                      .min = 200,
                                      .max = 60000}}},
           [&pipe, trace](const json&) {
+            // 先主动查一次（Process 后端走 UDS metrics.query）：拿到的才是"此刻"，
+            // 而 latest() 是 1 Hz 的 stdout 缓存。查询失败不致命——缓存里如果有数，
+            // 仍然可用，age_ms 会如实告诉 agent 它有多旧。
+            // 返回值不参与判定：失败就用缓存，缓存有多旧由 metrics_json 的 age_ms 说明。
+            std::string qerr;
+            (void)pipe.refresh_metrics(qerr);
             const auto m = pipe.latest();
             if (m.samples == 0) {
+              std::string why = "尚无采样（cued 未收到媒体流）";
+              if (!qerr.empty()) why += "；主动查询：" + qerr;
               return record(trace, "query_metrics",
-                            tool::ToolResult{false, "尚无采样（cued 未收到媒体流）", json::object()});
+                            tool::ToolResult{false, why, json::object()});
             }
             json j = metrics_json(m, now_us());
             add_probe_metrics(j, pipe.probe_latest());
@@ -358,7 +372,8 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
           });
 
   reg.add(tool::ToolSpec{.name = "pipeline_set_param",
-                         .desc = "修改媒体管线参数（生效方式为重启管线，会造成短暂断流）",
+                         .desc = "修改媒体管线参数（走 UDS 控制通道，运行期生效、不重启进程；"
+                                 "改编码参数会在下一帧重建编码器）",
                          .risk = tool::Risk::Mutating,
                          .params = {{.name = "key",
                                      .type = "string",
@@ -383,7 +398,7 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
                             tool::ToolResult{false, "设置失败: " + err, json::object()});
             }
             return action_result(trace, "pipeline_set_param",
-                                 "已设置 " + k + "=" + v + "（管线已重启）", pipe);
+                                 "已设置 " + k + "=" + v + "（运行期生效，未重启 cued）", pipe);
           });
 
   reg.add(tool::ToolSpec{.name = "inject_fault",
