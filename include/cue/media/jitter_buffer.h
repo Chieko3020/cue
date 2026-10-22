@@ -84,10 +84,13 @@ struct JitterBufferConfig {
   int clean_windows_needed = 3;
 };
 
-// 档位阶梯（帧）。索引即 jb_level：0=2 帧，1=4 帧，2=8 帧，3=16 帧。
-// 30 fps 下分别对应约 33 / 100 / 233 / 500 ms 的驻留延迟——档位越高代价越大，
-// 所以探针默认只允许升到 2 档（8 帧），16 帧档要显式 --jitter-max-level 3 才启用。
-inline constexpr std::size_t kDepthLadder[] = {2, 4, 8, 16};
+// 档位阶梯（帧）。索引即 jb_level。**0 档必须是 1 帧 = 零驻留**：
+// hold_us() 在 target <= 1 时返回 0，release_ready() 于是不按深度拦，只在 PTS 空洞上
+// 等预算——干净网络下这就是"立即放行"，额外延迟为 0。
+// 早期版本从 2 帧起步，实测在 30 fps 干净链路上把端到端从 0.4 ms 抬到 41.6 ms
+// （p99 65.8 ms），等于给实时流白送一帧延迟。乱序纠正靠的是 budget 窗口，不是恒定驻留。
+// 30 fps 下四档驻留约 0 / 33 / 100 / 233 ms；探针默认最高 2 档，3 档要显式开。
+inline constexpr std::size_t kDepthLadder[] = {1, 2, 4, 8};
 inline constexpr std::size_t kDepthLadderSize = sizeof(kDepthLadder) / sizeof(kDepthLadder[0]);
 
 struct JitterBufferStats {

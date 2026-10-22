@@ -152,7 +152,7 @@ int main() {
     JitterBufferConfig c = base_cfg();
     c.adaptive = true;
     c.min_level = 0;
-    c.max_level = 2;  // 2/4/8 帧
+    c.max_level = 2;  // 1/2/4 帧
     c.window_frames = 8;
     c.clean_windows_needed = 2;
     c.budget_us = 30'000;
@@ -168,8 +168,8 @@ int main() {
       return out;
     };
 
-    check(jb.stats().level == 0, "自适应：起始档位为 0（2 帧）");
-    check(jb.target_frames() == 2, "自适应：0 档 = 2 帧");
+    check(jb.stats().level == 0, "自适应：起始档位为 0（1 帧 = 零驻留）");
+    check(jb.target_frames() == 1, "自适应：0 档 = 1 帧，干净网络不额外驻留");
 
     int64_t now = 0;
     uint64_t pts = 0;
@@ -182,11 +182,11 @@ int main() {
       pts += static_cast<uint64_t>(kInterval);
     }
     const auto dirty = jb.stats();
-    check(dirty.level == 2, "自适应：高丢包序列后档位升到上限（2 档 = 8 帧）");
+    check(dirty.level == 2, "自适应：高丢包序列后档位升到上限（2 档 = 4 帧）");
     check(dirty.switches >= 2, "自适应：升档被计数（switches>=2）");
     check(dirty.skipped > 0, "自适应：空洞被计数");
     check(released > 0, "自适应：脏序列也在出帧（不会因为丢包卡死）");
-    check(jb.target_frames() == 8, "自适应：2 档 = 8 帧");
+    check(jb.target_frames() == 4, "自适应：2 档 = 4 帧");
 
     // 干净序列：PTS 与到达时间都严格对齐，丢包率 0、抖动 0
     const int64_t up_switches = static_cast<int64_t>(dirty.switches);

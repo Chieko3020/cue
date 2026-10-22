@@ -422,6 +422,10 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
               {"serr", c.send_errors},
               {"audio_frames_in", c.audio_frames_in},
               {"audio_decoded", false},
+              // recv 段：数据报到达 → 本帧重组完成。此前 rings[0] 一直在算却没进 METRICS，
+              // 六段里只有五段可读（FR-PIPE.6 要求六段都可读）。
+              {"recv_p50", stage_ms(rings[0], 0.50)},
+              {"recv_p99", stage_ms(rings[0], 0.99)},
               {"buffer_p50", stage_ms(rings[1], 0.50)},
               {"buffer_p99", stage_ms(rings[1], 0.99)},
               {"jb_depth", jb.depth},
@@ -496,7 +500,7 @@ int main(int argc, char** argv) {
   bool jitter_enabled = true;
   long long jitter_max_frames = 8;     // 队列容量硬上限（帧）
   long long jitter_budget_ms = 40;     // 缺帧等待预算
-  long long jitter_target_frames = 2;  // 固定目标深度（帧）
+  long long jitter_target_frames = 1;  // 固定目标深度（帧）；1 = 不驻留，只靠空洞预算纠乱序
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
