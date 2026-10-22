@@ -15,6 +15,16 @@ int64_t clamp_interval(int64_t v) {
   return v;
 }
 
+// 覆盖当前抖动所需的最低档位。分界按 kDepthLadder = {1,2,4,8} 帧取：
+// 0 档（1 帧驻留）能吃下半帧以内的抖动，1 档（2 帧）吃 1.5 帧以内，依此类推。
+// 分界取半个档位而不是整数档位，是为了让"刚好在边界"的抖动不至于把档位顶上去。
+std::size_t want_level(double jitter_frames) {
+  if (jitter_frames < 0.5) return 0;
+  if (jitter_frames < 1.5) return 1;
+  if (jitter_frames < 3.5) return 2;
+  return 3;
+}
+
 }  // namespace
 
 JitterBuffer::JitterBuffer(JitterBufferConfig cfg) : cfg_(cfg) {
@@ -147,27 +157,27 @@ void JitterBuffer::maybe_adapt() {
       stats_.level = level + 1;
       ++stats_.switches;
     }
-  } else {
-    if (loss <= cfg_.loss_down && jitter_frames <= cfg_.jitter_down_frames) {
+  } else if (level > cfg_.min_level) {
+    // 降档目标 = 「覆盖当前抖动所需的最低档位」，而不是「等到固定门限再降一档」。
+    // 旧判据用的是 jitter_down_frames（0.30 帧 ≈ 10 ms@30fps）这个绝对值，
+    // 而真实链路常驻抖动就有 5~15 ms——门限永远够不到，档位就卡在 1 档不下来，
+    // 端到端 p50 恒被 1 帧驻留顶到 33~40 ms。实测这就是 AC-15 里 queue_backlog
+    // 偶尔 p50 超 30 ms 的原因（基线与本版都能复现，与延迟注入无关）。
+    // want_level 用 kDepthLadder 的档位深度做分界，EWMA 已经把抖动平滑过，
+    // 所以一个窗口（window_frames 帧）就够确认，不需要再多窗口滞回。
+    const std::size_t want = want_level(jitter_frames);
+    if (want < level) {
       ++clean_windows_;
+      if (clean_windows_ >= 1) {
+        stats_.level = want < cfg_.min_level ? cfg_.min_level : want;
+        ++stats_.switches;
+        clean_windows_ = 0;
+      }
     } else {
-      clean_windows_ = 0;  // 中性窗口：既不算干净也不算坏，连续干净窗口重新计数
+      clean_windows_ = 0;  // 当前抖动还需要这个档位，不算干净窗口
     }
-    if (clean_windows_ >= cfg_.clean_windows_needed && stats_.level > cfg_.min_level) {
-      --stats_.level;
-      ++stats_.switches;
-      clean_windows_ = 0;
-    } else if (cfg_.fast_down && stats_.level > cfg_.min_level && loss <= cfg_.loss_down &&
-               jitter_frames <= cfg_.jitter_down_frames * 0.25) {
-      // 快降：抖动低到降档门限的 1/4 以下且零丢包时，一个干净窗口就回到底。
-      // 慢降是为了防档位锯齿（在门限边界来回切），但"抖动只剩门限的四分之一"
-      // 说明问题已经消失，继续维持高档位只是在为不存在的问题付延迟。
-      // 实测背景：queue_backlog 恢复后需要 6 个干净窗口才从 2 档回到 0 档，
-      // MTTR 被拖到 2.5 s，端到端 p50 在 SLA 重测窗口里仍然超标。
-      stats_.level = cfg_.min_level;
-      ++stats_.switches;
-      clean_windows_ = 0;
-    }
+  } else {
+    clean_windows_ = 0;  // 已在最低档
   }
   window_pushed_ = 0;
   window_skipped_ = 0;

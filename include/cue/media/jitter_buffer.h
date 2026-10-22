@@ -80,12 +80,11 @@ struct JitterBufferConfig {
   // 降档门限：窗口丢包率 <= loss_down 且抖动 <= jitter_down_frames，连续 clean_windows_needed 个窗口。
   // 降档比升档迟钝得多：档位来回抖会把延迟变成一条锯齿，比稳定在偏高的一档更糟。
   double loss_down = 0.005;
+  // 降档不再用"固定门限"判定，而是按 want_level()（覆盖当前抖动所需的最低档位）降。
+  // 这两个字段保留只为兼容既有配置与测试；clean_windows_needed 现在恒按 1 个窗口确认
+  // （EWMA 已平滑过抖动，多窗口滞回只会拖慢恢复）。
   double jitter_down_frames = 0.30;
   int clean_windows_needed = 3;
-  // 快降：抖动 <= jitter_down_frames * 0.25 且零丢包时，一个窗口直接回 min_level。
-  // 慢降 3 窗口 × 每窗口 60 帧，从 2 档降到 0 档要 6 个窗口（约 12 s@30fps），
-  // 恢复期比"问题本身持续的时间"还长——延迟在抖动消失后仍然被收着。
-  bool fast_down = true;
 };
 
 // 档位阶梯（帧）。索引即 jb_level。**0 档必须是 1 帧 = 零驻留**：
