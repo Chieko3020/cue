@@ -82,6 +82,10 @@ struct JitterBufferConfig {
   double loss_down = 0.005;
   double jitter_down_frames = 0.30;
   int clean_windows_needed = 3;
+  // 快降：抖动 <= jitter_down_frames * 0.25 且零丢包时，一个窗口直接回 min_level。
+  // 慢降 3 窗口 × 每窗口 60 帧，从 2 档降到 0 档要 6 个窗口（约 12 s@30fps），
+  // 恢复期比"问题本身持续的时间"还长——延迟在抖动消失后仍然被收着。
+  bool fast_down = true;
 };
 
 // 档位阶梯（帧）。索引即 jb_level。**0 档必须是 1 帧 = 零驻留**：

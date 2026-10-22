@@ -196,7 +196,9 @@ int main() {
     }
     const auto clean = jb.stats();
     check(clean.level == 0, "自适应：干净序列后档位回落到最低档");
-    check(static_cast<int64_t>(clean.switches) >= up_switches + 2, "自适应：降档也被计数");
+    // 快降（fast_down，默认开）在"抖动低到降档门限 1/4 且零丢包"时一步回到底，
+    // 所以这里只保证"至少发生了一次降档"；降档被计数由 switches 增加证明。
+    check(static_cast<int64_t>(clean.switches) >= up_switches + 1, "自适应：降档也被计数");
     check(clean.loss_rate == 0.0, "自适应：干净窗口的丢包率为 0");
   }
 

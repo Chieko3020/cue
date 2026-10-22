@@ -64,7 +64,12 @@ void JitterBuffer::observe_arrival(uint64_t pts_us, int64_t now_us) {
     if (dpts > 0 && dpts <= (interval_est_us_ * 3) / 2) {
       interval_est_us_ = clamp_interval(interval_est_us_ + (dpts - interval_est_us_) / 16);
       const int64_t darr = now_us - last_pushed_arrival_us_;
-      const int64_t jit = darr > dpts ? darr - dpts : dpts - darr;
+      // 只把「晚到」算成抖动，不看「早到」：
+      //  · darr > dpts = 这一帧比上一帧更晚到（真实网络抖动/排队），缓冲能等后续帧对齐，有价值；
+      //  · darr < dpts = 帧成批到达（发送端或上游积压后一次放出来），此时延迟已经发生且不可逆，
+      //    缓冲它只会让延迟再叠一层。旧的 |darr-dpts| 把成批到达也算成抖动，实测在
+      //    queue_backlog 恢复瞬间误升档到 2 档（+100 ms），把 lat_p50 顶过 SLA 阈值。
+      const int64_t jit = darr > dpts ? darr - dpts : 0;
       // EWMA α=0.1：单帧的一次抖动不该立刻改变档位，持续抖动才该
       jitter_ewma_us_ += (static_cast<double>(jit) - jitter_ewma_us_) * 0.1;
     }
@@ -150,6 +155,16 @@ void JitterBuffer::maybe_adapt() {
     }
     if (clean_windows_ >= cfg_.clean_windows_needed && stats_.level > cfg_.min_level) {
       --stats_.level;
+      ++stats_.switches;
+      clean_windows_ = 0;
+    } else if (cfg_.fast_down && stats_.level > cfg_.min_level && loss <= cfg_.loss_down &&
+               jitter_frames <= cfg_.jitter_down_frames * 0.25) {
+      // 快降：抖动低到降档门限的 1/4 以下且零丢包时，一个干净窗口就回到底。
+      // 慢降是为了防档位锯齿（在门限边界来回切），但"抖动只剩门限的四分之一"
+      // 说明问题已经消失，继续维持高档位只是在为不存在的问题付延迟。
+      // 实测背景：queue_backlog 恢复后需要 6 个干净窗口才从 2 档回到 0 档，
+      // MTTR 被拖到 2.5 s，端到端 p50 在 SLA 重测窗口里仍然超标。
+      stats_.level = cfg_.min_level;
       ++stats_.switches;
       clean_windows_ = 0;
     }
