@@ -62,8 +62,15 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   endif()
 
   # -fno-omit-frame-pointer：sanitizer 的栈回溯依赖帧指针，RelWithDebInfo 默认会省掉。
-  # -g：没有行号时报告只能给地址，定位不到源码行。
-  add_compile_options(${_cue_san_flags} -fno-omit-frame-pointer -g)
+  # 调试信息级别用 CUE_SAN_DEBUG_FLAGS 控制，默认 -g：
+  #   · -g  完整调试信息，本地开发用；
+  #   · -g1 只有行表、没有局部变量与宏，仍能报「文件:行号」——CI 的 runner 有
+  #          MemoryHigh=700M 的 cgroup 软限制，完整 -g 会让每个 TU 的 .o 膨胀近 20 倍
+  #         （实测 0.52 MB → 9.43 MB），构建贴着限制被节流到跑不完。
+  # 之所以做成变量而不是让外部用 CMAKE_CXX_FLAGS 覆盖：add_compile_options 排在后面，
+  # 硬编码的 -g 会把外部传的 -g1 顶掉（这个坑实际踩过，构建日志里同时出现 -g -g1）。
+  set(CUE_SAN_DEBUG_FLAGS "-g" CACHE STRING "sanitizer 构建的调试信息级别（-g 或 -g1）")
+  add_compile_options(${_cue_san_flags} -fno-omit-frame-pointer ${CUE_SAN_DEBUG_FLAGS})
   add_link_options(${_cue_san_flags})
   # UBSan 默认「报告后继续」，那样 ctest 会绿着漏过 UB；这里让 undefined 直接终止，
   # AC-12 的「ASan/UBSan 无报告」才有可执行的判据。ASan 本身就是致命信号，无需重复。
@@ -76,7 +83,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
     message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}：强制关闭 CUE_WERROR（避免告警阻塞 sanitizer 验证）")
   endif()
   set(CUE_WERROR OFF)
-  message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}：flags=${_cue_san_flags} -fno-omit-frame-pointer -g")
+  message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}：flags=${_cue_san_flags} -fno-omit-frame-pointer ${CUE_SAN_DEBUG_FLAGS}")
 endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)

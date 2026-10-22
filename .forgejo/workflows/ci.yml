@@ -90,7 +90,7 @@ jobs:
       - name: 配置（ASan+UBSan，自动关 -Werror）
         # -g1 而不是 -g：仍能报文件:行号，但调试信息量小一个量级——
         # sanitizer 构建本来就吃内存，完整 -g 在 700M 的 cgroup 里会被节流到跑不完。
-        run: cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1" -DCUE_SANITIZE=address,undefined
+        run: cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1" -DCUE_SAN_DEBUG_FLAGS="-g1" -DCUE_SANITIZE=address,undefined
 
       - name: 构建（-j1）
         run: cmake --build build-asan -j1
@@ -115,7 +115,7 @@ jobs:
             || echo "::warning::无 sudo 权限，未能下调 vm.mmap_rnd_bits；若 tsan 报 unexpected memory mapping，请以 root 执行 sysctl -w vm.mmap_rnd_bits=28"
 
       - name: 配置（TSan 单独一个构建目录）
-        run: cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1" -DCUE_SANITIZE=thread
+        run: cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1" -DCUE_SAN_DEBUG_FLAGS="-g1" -DCUE_SANITIZE=thread
 
       - name: 构建（-j1）
         run: cmake --build build-tsan -j1
