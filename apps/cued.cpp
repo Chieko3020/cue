@@ -424,19 +424,30 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
               {"audio_decoded", false},
               // recv 段：数据报到达 → 本帧重组完成。此前 rings[0] 一直在算却没进 METRICS，
               // 六段里只有五段可读（FR-PIPE.6 要求六段都可读）。
+              // 每段都给 p50/p95/p99 三档：FR-PIPE.6 的原文就是三档，
+              // 只给 p50/p99 会让"长尾"和"中等偏慢"分不开。
               {"recv_p50", stage_ms(rings[0], 0.50)},
+              {"recv_p95", stage_ms(rings[0], 0.95)},
               {"recv_p99", stage_ms(rings[0], 0.99)},
               {"buffer_p50", stage_ms(rings[1], 0.50)},
+              {"buffer_p95", stage_ms(rings[1], 0.95)},
               {"buffer_p99", stage_ms(rings[1], 0.99)},
               {"jb_depth", jb.depth},
               {"jb_skipped", jb.skipped},
               {"jb_late", jb.late_dropped},
               {"jb_level", jb.level},
               {"decode_p50", stage_ms(rings[2], 0.50)},
+              {"decode_p95", stage_ms(rings[2], 0.95)},
               {"decode_p99", stage_ms(rings[2], 0.99)},
               {"op_p50", stage_ms(rings[3], 0.50)},
+              {"op_p95", stage_ms(rings[3], 0.95)},
+              {"op_p99", stage_ms(rings[3], 0.99)},
               {"encode_p50", stage_ms(rings[4], 0.50)},
-              {"send_p50", stage_ms(rings[5], 0.50)}};
+              {"encode_p95", stage_ms(rings[4], 0.95)},
+              {"encode_p99", stage_ms(rings[4], 0.99)},
+              {"send_p50", stage_ms(rings[5], 0.50)},
+              {"send_p95", stage_ms(rings[5], 0.95)},
+              {"send_p99", stage_ms(rings[5], 0.99)}};
   emit_event("metric.sample", sample);
   frames_prev = c.frames_out;
   t_last = now_us;
