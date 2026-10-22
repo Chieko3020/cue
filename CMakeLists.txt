@@ -108,6 +108,15 @@ if(NOT CURL_FOUND)
   message(FATAL_ERROR "缺少 libcurl 开发包，执行：\n  sudo apt install -y libcurl4-openssl-dev")
 endif()
 
+# spdlog（FR-OBS.1：异步 sink + 文件轮转）+ 它的 fmt。
+# 用系统包而不是 header-only：Ubuntu 的 libspdlog-dev 是**编译版**且 tweakme.h 强制
+# SPDLOG_FMT_EXTERNAL（同包的 libfmt9），pkg-config 会带出 -DSPDLOG_COMPILED_LIB /
+# -DSPDLOG_FMT_EXTERNAL / -lspdlog -lfmt。混用 header-only 会 ODR 冲突，别试。
+pkg_check_modules(SPDLOG IMPORTED_TARGET spdlog)
+if(NOT SPDLOG_FOUND)
+  message(FATAL_ERROR "缺少 spdlog 开发包，执行：\n  sudo apt install -y libspdlog-dev libfmt-dev")
+endif()
+
 # ---- proto：纯头文件，编解码规则集中在一处 ----
 add_library(cue_proto INTERFACE)
 target_include_directories(cue_proto INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -164,6 +173,18 @@ add_library(cue_control STATIC
 target_link_libraries(cue_control PUBLIC
   cue_proto nlohmann_json::nlohmann_json Threads::Threads)
 
+# ---- 结构化日志（FR-OBS.1 / 技术设计 §12.1）----
+# 独立成库：spdlog 的头只出现在 src/common/log.cpp 一处，别处只 include cue/common/log.h。
+# cued/cue-probe 不链它——它们的 stdout 是 harness 的解析输入，保持原格式（见 log.h 头注释）。
+add_library(cue_log STATIC src/common/log.cpp)
+target_link_libraries(cue_log PUBLIC
+  cue_proto nlohmann_json::nlohmann_json PkgConfig::SPDLOG Threads::Threads)
+
+# ---- 配置文件（FR-OBS.5）----
+# 只有配置解析与校验：JSON 用 nlohmann（已是硬依赖），行号换算与合法范围都在这里。
+add_library(cue_config STATIC src/common/config.cpp)
+target_link_libraries(cue_config PUBLIC cue_log nlohmann_json::nlohmann_json)
+
 # ---- 分层静态库（SPEC §7.3）----
 # pipeline 只向下依赖 proto；agent 不认识 media/pipeline；eval 依赖两者。
 add_library(cue_pipeline STATIC
@@ -196,7 +217,15 @@ add_library(cue_eval STATIC
   src/eval/compare.cpp)
 target_link_libraries(cue_eval PUBLIC cue_agent cue_pipeline PkgConfig::CURL)
 
-# SPEC §7.3：agent/tool/llm 不得 include media/ 或 pipeline/ 头文件。
+# ---- CLI 选项（FR-OBS.5 的优先级规则在这里落地）----
+# 拆两个库是为了不让 cue-serve 被拖上 cue_eval：评测的选项结构体里有 RunConfig。
+add_library(cue_cli_serve STATIC src/cli/serve_options.cpp)
+target_link_libraries(cue_cli_serve PUBLIC cue_config)
+
+add_library(cue_cli_eval STATIC src/cli/eval_options.cpp)
+target_link_libraries(cue_cli_eval PUBLIC cue_config cue_eval)
+
+# SPEC §7.3：agent/tool/llm 不得 include media/ 或 pipeline 头文件。
 # include/ 目前共用一个根目录，无法靠 target_include_directories 物理隔离，
 # 所以在配置期扫描（eval 的分层债见上，暂不纳入）。
 set(CUE_UPPER_LAYER_FILES)
@@ -219,13 +248,14 @@ add_executable(cue apps/cue.cpp)
 target_link_libraries(cue PRIVATE cue_agent cue_pipeline)
 
 add_executable(cue-eval apps/cue-eval.cpp)
-target_link_libraries(cue-eval PRIVATE cue_eval)
+target_link_libraries(cue-eval PRIVATE cue_eval cue_cli_eval)
 
 # ---- M5 控制台后端 ----
 # 独立 target（而非 cue 的子命令）：serve 是长期驻留进程，信号/退出码语义与一次性 CLI 不同；
 # 它复用 cue_pipeline（事件源）与 cue_agent（Registry/工具/审批），不另起一套管线控制。
 add_executable(cue-serve apps/cue-serve.cpp)
-target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline Boost::system Threads::Threads)
+target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline cue_cli_serve
+  Boost::system Threads::Threads)
 
 # ---- M7 假域服务（AC-16）----
 # 只依赖 Beast + nlohmann：不链接 cue_pipeline（指标 JSON 字段是按 metrics_json 的键名
@@ -340,6 +370,22 @@ add_executable(test_capture tests/test_capture.cpp)
 target_link_libraries(test_capture PRIVATE cue_capture)
 add_test(NAME capture COMMAND test_capture)
 
+# T-15（FR-OBS.5）：配置文件解析、命令行覆盖、行号正确性、互斥项、未知键。
+# 全是纯函数（临时文件读写，不起进程），失败信息里直接写出"期望第 N 行"。
+add_executable(test_config tests/test_config.cpp)
+target_link_libraries(test_config PRIVATE cue_cli_serve cue_cli_eval)
+add_test(NAME config COMMAND test_config)
+set_tests_properties(config PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# T-12/T-13（FR-OBS.1/3）：/metrics 的 JSON 结构与 /proc 解析，以及 JSON-line 的字段集、
+# 1 万行异步不丢非 debug、级别过滤。不起 HTTP，也不依赖本机有没有起 cued。
+add_executable(test_metrics tests/test_metrics.cpp)
+target_include_directories(test_metrics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+target_link_libraries(test_metrics PRIVATE cue_pipeline cue_log
+  nlohmann_json::nlohmann_json Threads::Threads)
+add_test(NAME metrics COMMAND test_metrics)
+set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
 # 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。
@@ -358,7 +404,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
   foreach(_t wire agent context eval state compare console cassette probe sandbox jitter_buffer
-            control_channel tools delay_injector nack capture)
+            control_channel tools delay_injector nack capture config metrics)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
 endif()

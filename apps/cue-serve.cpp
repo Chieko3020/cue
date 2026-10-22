@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -43,6 +44,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <poll.h>
@@ -50,9 +52,12 @@
 #include <unistd.h>
 
 #include "console/approval_queue.h"
+#include "console/metrics_report.h"
 #include "console/report_index.h"
 #include "console/sse_hub.h"
+#include "cue/cli/serve_options.h"
 #include "cue/common/clock.h"
+#include "cue/common/log.h"
 #include "cue/pipeline/process_control.h"
 #include "cue/pipeline/tools.h"
 #include "cue/tool/tool.h"
@@ -72,140 +77,11 @@ std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
 
 // ---------------------------------------------------------------- 参数
-
-struct Options {
-  std::string bind = "127.0.0.1";
-  int port = 8080;
-  std::string web_dir;  // 空 = 自动探测 web/dist → web
-  std::string cued_bin = "./build/cued";
-  std::string runs_dir = "./runs";
-  std::string approval = "ask";  // ask | auto | deny
-  int ws_port = 9000;
-  int probe_port = 9001;
-  int approval_timeout_s = 30;   // 超时自动拒绝（任务 A.2）
-  bool no_pipeline = false;
-  int bitrate_kbps = 1500;
-  int gop = 60;
-  std::string preset = "veryfast";
-  bool transcode = false;
-  double inject_drop = 0.0;
-  bool help = false;
-};
-
-void print_usage() {
-  std::printf(
-      "usage: cue-serve [options]\n"
-      "  --bind ADDR            监听地址（默认 127.0.0.1，仅回环）\n"
-      "  --port N               监听端口（默认 8080）\n"
-      "  --web DIR              静态目录（默认自动：web/dist 存在则用它，否则 web/）\n"
-      "  --cued BIN             cued 可执行文件（默认 ./build/cued）\n"
-      "  --runs DIR             评测产物目录（默认 ./runs）\n"
-      "  --approval MODE        ask（默认，审批 UI 决定）/ auto（自动批准）/ deny（拒绝非只读）\n"
-      "  --ws-port N            cued 的 WS 端口（默认 9000）\n"
-      "  --probe-port N         cued 的 UDP 目标端口（默认 9001）\n"
-      "  --approval-timeout S   审批超时秒数（默认 30，超时自动拒绝）\n"
-      "  --no-pipeline          不启动 cued（只用控制台看状态/评测）\n"
-      "  --bitrate-kbps N       初始码率（默认 1500）\n"
-      "  --gop N                初始 GOP（默认 60）\n"
-      "  --preset NAME          初始 x264 preset（默认 veryfast）\n"
-      "  --transcode            初始打开转码\n"
-      "  --inject-drop PCT      启动时注入丢包百分比（默认 0）\n"
-      "  --help                 打印本帮助\n"
-      "\n"
-      "退出：Ctrl-C / SIGTERM。会先停 cued 再关闭监听（不留孤儿进程）。\n");
-}
-
-bool take_value(int argc, char** argv, int& i, const std::string& opt, std::string& out) {
-  if (i + 1 >= argc) {
-    std::fprintf(stderr, "参数 %s 缺少取值\n", opt.c_str());
-    return false;
-  }
-  out = argv[++i];
-  return true;
-}
-
-bool parse_int(const std::string& s, int& out, int lo, int hi) {
-  if (s.empty()) return false;
-  char* end = nullptr;
-  errno = 0;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (errno != 0 || end == nullptr || *end != '\0' || v < lo || v > hi) return false;
-  out = static_cast<int>(v);
-  return true;
-}
-
-bool parse_double(const std::string& s, double& out, double lo, double hi) {
-  if (s.empty()) return false;
-  char* end = nullptr;
-  errno = 0;
-  const double v = std::strtod(s.c_str(), &end);
-  if (errno != 0 || end == nullptr || *end != '\0' || !(v >= lo) || !(v <= hi)) return false;
-  out = v;
-  return true;
-}
-
-bool parse_args(int argc, char** argv, Options& o) {
-  for (int i = 1; i < argc; ++i) {
-    const std::string a = argv[i];
-    std::string v;
-    if (a == "--help" || a == "-h") {
-      o.help = true;
-      return true;
-    } else if (a == "--bind") {
-      if (!take_value(argc, argv, i, a, o.bind)) return false;
-    } else if (a == "--port") {
-      if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_int(v, o.port, 1, 65535)) {
-        std::fprintf(stderr, "--port 取值非法：%s\n", v.c_str());
-        return false;
-      }
-    } else if (a == "--web") {
-      if (!take_value(argc, argv, i, a, o.web_dir)) return false;
-    } else if (a == "--cued") {
-      if (!take_value(argc, argv, i, a, o.cued_bin)) return false;
-    } else if (a == "--runs") {
-      if (!take_value(argc, argv, i, a, o.runs_dir)) return false;
-    } else if (a == "--approval") {
-      if (!take_value(argc, argv, i, a, o.approval)) return false;
-      if (o.approval != "ask" && o.approval != "auto" && o.approval != "deny") {
-        std::fprintf(stderr, "--approval 只能是 ask|auto|deny，收到：%s\n", o.approval.c_str());
-        return false;
-      }
-    } else if (a == "--ws-port") {
-      if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_int(v, o.ws_port, 1, 65535)) return false;
-    } else if (a == "--probe-port") {
-      if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_int(v, o.probe_port, 1, 65535)) return false;
-    } else if (a == "--approval-timeout") {
-      if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_int(v, o.approval_timeout_s, 1, 600)) {
-        std::fprintf(stderr, "--approval-timeout 取值非法：%s\n", v.c_str());
-        return false;
-      }
-    } else if (a == "--no-pipeline") {
-      o.no_pipeline = true;
-    } else if (a == "--bitrate-kbps") {
-      if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_int(v, o.bitrate_kbps, 100, 20000)) return false;
-    } else if (a == "--gop") {
-      if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_int(v, o.gop, 1, 300)) return false;
-    } else if (a == "--preset") {
-      if (!take_value(argc, argv, i, a, o.preset)) return false;
-    } else if (a == "--transcode") {
-      o.transcode = true;
-    } else if (a == "--inject-drop") {
-      if (!take_value(argc, argv, i, a, v)) return false;
-      if (!parse_double(v, o.inject_drop, 0.0, 100.0)) return false;
-    } else {
-      std::fprintf(stderr, "未知参数：%s\n", a.c_str());
-      print_usage();
-      return false;
-    }
-  }
-  return true;
-}
+//
+// 选项与优先级（命令行 > 配置文件 > 内置默认值）在 cue/cli/serve_options.h 里，
+// 这样"配置文件写 8080、命令行写 9999 → 9999"这条规则能被单测直接驱动，
+// 不必起一个真进程去验。
+using Options = cue::cli::ServeOptions;
 
 // ---------------------------------------------------------------- 控制台状态
 
@@ -305,6 +181,42 @@ class ConsoleApp {
     return out;
   }
 
+  // GET /metrics：文档 §12.3 的 10 项 + FR-OBS.3 的进程级读数（RSS/CPU/队列深度/连接数）。
+  // 生成逻辑在 console/metrics_report.h（纯函数，单测直接断言 JSON 结构）；
+  // 这里只负责把各路数据源凑齐：管线快照、probe 事件、工具计数、/proc 采样。
+  json metrics(std::size_t connections) {
+    cow::MetricsInput in;
+    in.proc = "cue-serve";
+    in.ts_us = cow::wall_us();
+    in.pipe = pipe_->latest();
+    in.probe = pipe_->probe_latest();
+    // nack_sent / fec_recovered 只在 probe.metric 事件里：取最近一条（缓存按时间序）。
+    const auto events = pipe_->recent_events(0);
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+      if (it->type == "probe.metric" && it->data.is_object()) {
+        in.probe_event = it->data;
+        break;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lk(stats_mu_);
+      for (const auto& [key, n] : tool_calls_) {
+        in.tool_calls.push_back(cow::ToolCallCount{key[0], key[1], key[2], n});
+      }
+    }
+    in.eval_cases = cow::latest_eval_cases(opt_.runs_dir);
+    // 三个进程的 pid 都从管线接口拿：cued 的 pid 在 PipelineMetrics 里，probe 的在
+    // ProbeMetrics 里，cue-serve 是自己。拿不到（进程没起）就如实写 null + 0。
+    in.procs.push_back(sampler_.sample("cued", in.pipe.pid));
+    in.procs.push_back(sampler_.sample("cue-probe", in.probe.pid));
+    in.procs.push_back(sampler_.sample("cue-serve", ::getpid()));
+    in.log_queue_depth = cue::log::queue_depth();
+    in.log_dropped_debug = cue::log::dropped_debug();
+    in.connections = connections;
+    in.sse_clients = hub_.subscriber_count();
+    return cow::build_metrics_json(in);
+  }
+
   // POST /api/action：唯一入口。所有动作都经过 Registry::call_guarded，
   // Ask 模式下非只读工具会阻塞等待审批（超时自动拒绝）。
   json handle_action(const json& body) {
@@ -378,7 +290,8 @@ class ConsoleApp {
                                  {"risk", tool::risk_name(gr.risk)},
                                  {"error", reply.value("error", std::string())},
                                  {"content", content}});
-    record_action(tool_name, tool_args, status, ok, reply.value("error", std::string()));
+    record_action(tool_name, tool::risk_name(gr.risk), tool_args, status, ok,
+                  reply.value("error", std::string()));
     return reply;
   }
 
@@ -524,16 +437,20 @@ class ConsoleApp {
     return arr;
   }
 
-  void record_action(const std::string& name, const json& args, const std::string& status, bool ok,
-                     const std::string& error) {
+  // 累计计数（/metrics 的 cue_tool_calls_total{tool,risk,result}）+ 最近 64 条明细
+  // （/api/state 的 actions）。两者都在一把锁下更新：计数与明细不能对不上。
+  void record_action(const std::string& name, const std::string& risk, const json& args,
+                     const std::string& status, bool ok, const std::string& error) {
     std::lock_guard<std::mutex> lk(stats_mu_);
     actions_.push_back({{"t_us", cow::wall_us()},
                         {"tool", name},
+                        {"risk", risk},
                         {"args", args},
                         {"status", status},
                         {"ok", ok},
                         {"error", error}});
     while (actions_.size() > 64) actions_.pop_front();
+    ++tool_calls_[std::array<std::string, 3>{name, risk.empty() ? "unknown" : risk, status}];
     if (ok) ++ok_actions_;
   }
 
@@ -568,7 +485,9 @@ class ConsoleApp {
 
   json action_reply(const std::string& status, const std::string& tool_name, const json& args,
                     const std::string& error) {
-    record_action(tool_name, args, status, false, error);
+    // 请求在进 Registry 之前就被拒了：没有风险等级可言，统一记 "unknown"，
+    // 不编一个看起来像真的 risk（指标是要被当证据用的）。
+    record_action(tool_name, "unknown", args, status, false, error);
     hub_.publish("tool.result", {{"tool", tool_name},
                                  {"status", status},
                                  {"ok", false},
@@ -584,6 +503,8 @@ class ConsoleApp {
   cow::ApprovalQueue approvals_;
   mutable std::mutex stats_mu_;
   std::deque<json> actions_;
+  std::map<std::array<std::string, 3>, uint64_t> tool_calls_;  // tool/risk/result → 累计次数
+  cow::ProcSampler sampler_;                                  // /proc 采样（CPU 需要上一拍）
   uint64_t ok_actions_ = 0;
 };
 
@@ -754,7 +675,14 @@ class Server {
     }
   }
 
+  struct ConnGuard {
+    std::atomic<std::size_t>& n;
+    explicit ConnGuard(std::atomic<std::size_t>& c) : n(c) { n.fetch_add(1); }
+    ~ConnGuard() { n.fetch_sub(1); }
+  };
+
   void serve_conn(const std::shared_ptr<tcp::socket>& sp) {
+    ConnGuard guard(connections_);
     beast::flat_buffer buffer;
     for (;;) {
       http::request<http::string_body> req;
@@ -790,6 +718,20 @@ class Server {
     const bool is_get = req.method() == http::verb::get;
     const bool is_post = req.method() == http::verb::post;
 
+    // FR-OBS.3：/healthz 是给探活脚本/反代的纯文本，/api/health 是给前端的 JSON。
+    // 两者并存是有意的：前端要结构，脚本只想要一个能 grep 的 "ok"。
+    if (target == "/healthz") {
+      if (!is_get) return json_res({{"ok", false}, {"error", "method not allowed"}}, req,
+                                   http::status::method_not_allowed);
+      return make_res(http::status::ok, "ok\n", req, "text/plain; charset=utf-8");
+    }
+    // FR-OBS.3 / 技术设计 §12.3：默认 JSON（前端直读），不做特殊放行——绑定策略
+    // （默认 127.0.0.1）就是暴露边界，这条路由和别的路由遵守同一条规矩。
+    if (target == "/metrics") {
+      if (!is_get) return json_res({{"ok", false}, {"error", "method not allowed"}}, req,
+                                   http::status::method_not_allowed);
+      return json_res(app_.metrics(connections_.load()), req);
+    }
     if (target == "/api/health") {
       if (!is_get) return json_res({{"ok", false}, {"error", "method not allowed"}}, req,
                                    http::status::method_not_allowed);
@@ -968,17 +910,30 @@ class Server {
   tcp::acceptor acceptor_;
   std::mutex mu_;
   std::vector<ThreadRec> threads_;
+  // 在线连接数（/metrics 的 cue_serve_connections）：工作线程进出 serve_conn 时加减，
+  // 用原子量而不是去 threads_ 里数——threads_ 只在 accept/stop 时持锁，读它要抢同一把锁。
+  std::atomic<std::size_t> connections_{0};
 };
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  Options opt;
-  if (!parse_args(argc, argv, opt)) return 2;
+  auto parsed = cue::cli::parse_serve_options(argc, argv);
+  if (!parsed) {
+    std::fprintf(stderr, "%s\n", parsed.error().text().c_str());
+    return 2;
+  }
+  Options opt = std::move(*parsed);
   if (opt.help) {
-    print_usage();
+    cue::cli::print_serve_usage();
     return 0;
   }
+  opt.log.proc = "cue-serve";
+  if (auto ok = cue::log::init(opt.log); !ok) {
+    std::fprintf(stderr, "cue-serve: %s\n", ok.error().c_str());
+    return 2;
+  }
+  cue::log::set_session_id(std::to_string(::getpid()));
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
@@ -988,27 +943,43 @@ int main(int argc, char** argv) {
   Server server(app, app.bind_addr(), app.port());
   std::string err;
   if (!server.listen(err)) {
-    std::fprintf(stderr, "[cue-serve] %s\n", err.c_str());
+    cue::log::error("serve", "listen_failed", err);
+    cue::log::shutdown();
     return 1;
   }
-  std::printf("[cue-serve] http://%s:%d/ （静态目录：%s，审批模式：%s，审批超时 %d s）\n",
-              app.bind_addr().c_str(), app.port(), app.web_dir().c_str(), opt.approval.c_str(),
-              opt.approval_timeout_s);
-  std::printf("[cue-serve] SSE: /events  API: /api/state /api/action /api/approve /api/runs\n");
+  cue::log::info("serve", "startup",
+                 "监听 http://" + opt.bind + ":" + std::to_string(opt.port) + "/（静态目录：" +
+                     app.web_dir() + "，审批模式：" + opt.approval + "，审批超时 " +
+                     std::to_string(opt.approval_timeout_s) + " s）");
+  cue::log::info("serve", "routes",
+                 "SSE: /events  API: /api/state /api/action /api/approve /api/runs  "
+                 "运维: /healthz /metrics");
+  // 一行 debug：`--log-level debug` 时能确认级别真的生效（否则"没看到 debug 行"会
+  // 被误读成日志系统没起来）。
+  cue::log::debug("serve", "options",
+                  "config=" + (opt.config_path.empty() ? std::string("(无)") : opt.config_path) +
+                      " log_file=" + (opt.log.file.empty() ? std::string("(无)") : opt.log.file) +
+                      " log_level=" + opt.log.level + " queue=" +
+                      std::to_string(opt.log.queue_size));
 
   if (opt.no_pipeline) {
-    std::printf("[cue-serve] --no-pipeline：不启动 cued（只读状态/评测）\n");
+    cue::log::info("serve", "pipeline_skipped", "--no-pipeline：不启动 cued（只读状态/评测）");
   } else if (!app.start_pipeline(err)) {
-    std::fprintf(stderr, "[cue-serve] 管线启动失败：%s（控制台仍可用，可稍后点\"启动\"）\n", err.c_str());
+    // 控制台仍可用：这条是 warn 不是 error，因为进程的整体状态是"能用但不完整"。
+    cue::log::warn("serve", "pipeline_start_failed",
+                   "管线启动失败，控制台仍可用，可稍后点「启动」", err);
   } else {
-    std::printf("[cue-serve] cued 已启动（ws=%d，udp=%d，cued=%s）\n", opt.ws_port, opt.probe_port,
-                opt.cued_bin.c_str());
+    cue::log::info("serve", "pipeline_started",
+                   "cued 已启动（ws=" + std::to_string(opt.ws_port) +
+                       "，udp=" + std::to_string(opt.probe_port) + "，cued=" + opt.cued_bin + "）");
   }
 
   server.run();
-  std::printf("\n[cue-serve] 收到退出信号，正在停止管线与连接…\n");
+  cue::log::info("serve", "shutdown", "收到退出信号，正在停止管线与连接…");
   app.shutdown();
   server.stop();
-  std::printf("[cue-serve] 已退出\n");
+  cue::log::info("serve", "shutdown_done",
+                 "已退出（日志丢弃 debug 行数=" + std::to_string(cue::log::dropped_debug()) + "）");
+  cue::log::shutdown();
   return 0;
 }

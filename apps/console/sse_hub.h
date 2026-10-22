@@ -98,6 +98,13 @@ class SseHub {
     return next_id_ - 1;
   }
 
+  // 当前在线订阅者数（/metrics 的 cue_serve_sse_clients）。慢消费者被丢弃的帧数不在这里：
+  // 那是每条连接自己的 deque（Server::Sink::dropped），口径不同，不能混成一个数。
+  std::size_t subscriber_count() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return subs_.size();
+  }
+
   // 关闭：先清订阅（等 SSE 线程退订/退出），再通知所有还挂着的订阅者收到空串
   void shutdown() {
     std::vector<std::function<void(const std::string&)>> cbs;

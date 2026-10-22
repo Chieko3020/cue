@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include "cue/cli/eval_options.h"
+#include "cue/common/log.h"
 #include "cue/eval/compare.h"
 #include "cue/eval/eval.h"
 #include "cue/eval/generator.h"
@@ -36,44 +38,6 @@ namespace {
 std::atomic<bool> g_cancel{false};
 
 void on_signal(int) { g_cancel.store(true); }
-
-int usage() {
-  std::printf(
-      "cue-eval — Cue 评测 CLI\n"
-      "\n"
-      "  cue-eval --suite <path> [--mode scripted|real] [--repeat k] [--max-yuan N]\n"
-      "           [--out dir] [--warmup s] [--model name] [--cued path] [--probe path]\n"
-      "           [--sla-settle-ms N] [--endpoint URL]\n"
-      "           [--replay|--live] [--record] [--cassette-dir dir]\n"
-      "  cue-eval --gen <matrix.json> [--out dir]           # 矩阵批量生成 case（默认写到\n"
-      "                  suites/generated/；拒绝覆盖非生成物）\n"
-      "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
-      "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
-      "\n"
-      "  --endpoint URL 被测管线改为 HTTP 服务（实现 GET /api/state + POST /api/action），\n"
-      "                 不再起 cued；warmup 等待也跳过（假域无需等外部推流）。\n"
-      "  --baseline <run_id>  指定回归清单的对照 run（report.md 的「回归清单」节）。\n"
-      "                 默认自动找 --out 下同 suite / mode / repeat 的最近一个 run；\n"
-      "                 找不到就写「本次没有 baseline，跳过」，绝不拿别的 run 冒充。\n"
-      "  --no-baseline  关闭自动 baseline 发现（只跑本次、不做对比）。\n"
-      "  --record-tools DIR  把每个 case 的工具观测录到 DIR/<case_id>.tools.jsonl；\n"
-  "  --replay-tools DIR  只回放该录制：不 spawn cued、不连 endpoint，miss 明确报错。\n"
-  "                      两者互斥；--replay-tools 不能与 --endpoint 同时给。\n"
-      "  --probe path    cue-probe 二进制（默认与 --cued 同目录的 cue-probe）。探针由\n"
-      "                  harness 托管：起不来/没有样本时该 case 记 run_error=probe_unavailable，\n"
-      "                  端到端 SLA 绝不退回 cued 指标判分。\n"
-  "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
-      "  real 模式的 LLM 传输默认 replay：只读 cassette，零成本；缺录制直接报错\n"
-      "  （run_error=cassette_miss，不静默走网络）。--live 才用真实网络（需 CUE_API_KEY /\n"
-      "  CUE_BASE_URL），配 --record 把每次成功调用录进 --cassette-dir（默认 cassettes/）。\n"
-      "  --replay / --live 隐含 --mode real，除非显式 --mode scripted。\n"
-      "  CUE_RECORD=1 / CUE_CASSETTE_DIR 可替代对应开关。\n"
-      "  单价可用 CUE_YUAN_PER_MTOK 覆盖（估算，不是账单）。\n"
-      "\n"
-      "  退出码：0 全过 / 1 有未通过 / 2 用法或无法产出 / 3 diff 不可比 /\n"
-      "          4 diff case 集变动 / 5 写入失败 / 130 被取消\n");
-  return 0;
-}
 
 std::string header_str(const nlohmann::json& h, const char* key) {
   if (!h.is_object() || !h.contains(key) || !h[key].is_string()) return {};
@@ -235,7 +199,7 @@ int do_diff(const std::string& run_a, const std::string& run_b, const std::strin
     return 5;
   }
   std::printf("%s", md.c_str());
-  std::printf("[eval] diff 已写入 %s\n", path.c_str());
+  cue::log::info("eval", "diff_written", "diff 已写入 " + path);
   if (d.new_failures > 0) return 1;            // 有回归：CI 拦截
   if (!d.comparable) return 3;                 // 配置不同：差异不可归因
   if (d.only_a > 0 || d.only_b > 0) return 4;  // case 集变了：不能让 CI 静默通过
@@ -249,106 +213,42 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
-  eval::RunConfig cfg;
-  std::string diff_a, diff_b;
-  std::string gen_path;
-  std::string baseline_id;  // --baseline：显式对照 run
-  bool no_baseline = false;
-  bool out_set = false;
-  bool suite_set = false;
-  bool mode_set = false;
-  bool repeat_set = false;
-  bool replay_flag = false;
-  bool live_flag = false;
-  bool record_flag = false;
-  bool record_cli = false;
-
-  for (int i = 1; i < argc; ++i) {
-    const std::string a = argv[i];
-    auto next = [&]() -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
-    if (a == "--suite") {
-      cfg.suite_path = next();
-      suite_set = true;
-    } else if (a == "--mode") {
-      cfg.agent_mode = next();
-      mode_set = true;
-    } else if (a == "--replay") {
-      replay_flag = true;
-    } else if (a == "--live") {
-      live_flag = true;
-    } else if (a == "--record") {
-      record_flag = true;
-      record_cli = true;
-    } else if (a == "--cassette-dir") {
-      cfg.cassette_dir = next();
-      if (cfg.cassette_dir.empty()) {
-        std::fprintf(stderr, "--cassette-dir 需要目录名\n");
-        return 2;
-      }
-    } else if (a == "--repeat") {
-      cfg.repeat = std::max(1, std::atoi(next().c_str()));
-      repeat_set = true;
-    } else if (a == "--baseline") {
-      baseline_id = next();
-      if (baseline_id.empty()) {
-        std::fprintf(stderr, "--baseline 需要 run_id\n");
-        return 2;
-      }
-    } else if (a == "--no-baseline") {
-      no_baseline = true;
-    } else if (a == "--max-yuan") {
-      cfg.max_yuan = std::atof(next().c_str());
-    } else if (a == "--gen") {
-      gen_path = next();
-      if (gen_path.empty()) {
-        std::fprintf(stderr, "--gen 需要矩阵文件路径\n");
-        return 2;
-      }
-    } else if (a == "--out") {
-      cfg.out_dir = next();
-      out_set = true;
-    } else if (a == "--warmup") {
-      cfg.warmup_s = std::max(0, std::atoi(next().c_str()));
-    } else if (a == "--sla-settle-ms") {
-      // SLA 重测前的收敛期。0 = 立即采样（复现"恢复期尖峰"这种问题时会用到）。
-      cfg.sla_settle_ms = std::max(0, std::atoi(next().c_str()));
-    } else if (a == "--model") {
-      cfg.model = next();
-    } else if (a == "--cued") {
-      cfg.cued_bin = next();
-    } else if (a == "--probe") {
-      cfg.probe_bin = next();
-    } else if (a == "--endpoint") {
-      cfg.endpoint = next();
-      if (cfg.endpoint.rfind("http://", 0) != 0 && cfg.endpoint.rfind("https://", 0) != 0) {
-        std::fprintf(stderr, "--endpoint 需要 http(s):// 开头的 URL（收到：%s）\n",
-                     cfg.endpoint.empty() ? "(空)" : cfg.endpoint.c_str());
-        return 2;
-      }
-    } else if (a == "--record-tools") {
-      cfg.record_tools_dir = next();
-      if (cfg.record_tools_dir.empty()) {
-        std::fprintf(stderr, "--record-tools 需要目录\n");
-        return 2;
-      }
-    } else if (a == "--replay-tools") {
-      cfg.replay_tools_dir = next();
-      if (cfg.replay_tools_dir.empty()) {
-        std::fprintf(stderr, "--replay-tools 需要目录\n");
-        return 2;
-      }
-    } else if (a == "--resume") {
-      cfg.resume_run_id = next();
-    } else if (a == "--diff") {
-      diff_a = next();
-      diff_b = next();
-    } else if (a == "--help" || a == "-h") {
-      return usage();
-    } else {
-      std::fprintf(stderr, "未知参数: %s\n", a.c_str());
-      return 2;
-    }
+  auto parsed = cue::cli::parse_eval_options(argc, argv);
+  if (!parsed) {
+    std::fprintf(stderr, "%s\n", parsed.error().text().c_str());
+    return 2;
   }
+  cue::cli::EvalOptions opts = std::move(*parsed);
+  if (opts.help) {
+    cue::cli::print_eval_usage();
+    return 0;
+  }
+  opts.log.proc = "cue-eval";
+  if (auto ok = cue::log::init(opts.log); !ok) {
+    std::fprintf(stderr, "cue-eval: %s\n", ok.error().c_str());
+    return 2;
+  }
+  // 所有 return 分支都要刷盘，所以用 RAII；散在各个 return 前面迟早会漏一个。
+  struct LogGuard {
+    ~LogGuard() { cue::log::shutdown(); }
+  } log_guard;
+
+  // 选项解析（含配置文件合并）在 cue/cli/eval_options.h；这里保留原来的局部变量名，
+  // 让后面的校验逻辑一行都不用改，也就不会悄悄改变既有语义。
+  eval::RunConfig cfg = std::move(opts.cfg);
+  std::string diff_a = std::move(opts.diff_a);
+  std::string diff_b = std::move(opts.diff_b);
+  std::string gen_path = std::move(opts.gen_path);
+  std::string baseline_id = std::move(opts.baseline_id);
+  bool no_baseline = opts.no_baseline;
+  bool out_set = opts.out_set;
+  bool suite_set = opts.suite_set;
+  bool mode_set = opts.mode_set;
+  bool repeat_set = opts.repeat_set;
+  bool replay_flag = opts.replay_flag;
+  bool live_flag = opts.live_flag;
+  bool record_flag = opts.record_flag;
+  bool record_cli = opts.record_cli;
 
   // FR-EVAL.5：--gen 是独立模式（只展开矩阵、写 suite，不跑 case）。
   // 与 --diff/--resume 同给会让"这次到底产出了什么"不可解释，直接拒绝。
@@ -381,7 +281,7 @@ int main(int argc, char** argv) {
     }
     auto gen = eval::generate_from_files(gen_path);
     if (!gen) {
-      std::fprintf(stderr, "[gen] 生成失败: %s\n", gen.error().c_str());
+      cue::log::error("gen", "generate_failed", "生成失败", gen.error());
       return 2;
     }
     const std::string dir = out_set ? cfg.out_dir : std::string("suites/generated");
@@ -389,7 +289,7 @@ int main(int argc, char** argv) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (ec) {
-      std::fprintf(stderr, "[gen] 无法创建输出目录 %s: %s\n", dir.c_str(), ec.message().c_str());
+      cue::log::error("gen", "mkdir_failed", "无法创建输出目录 " + dir, ec.message());
       return 5;
     }
     const std::string path = dir + "/" + name + ".json";
@@ -399,22 +299,22 @@ int main(int argc, char** argv) {
       std::ifstream old(path);
       std::string text((std::istreambuf_iterator<char>(old)), std::istreambuf_iterator<char>());
       if (text.find("cue-eval --gen") == std::string::npos) {
-        std::fprintf(stderr,
-                     "[gen] 拒绝覆盖 %s：它不是 --gen 生成的 suite（手写 suite 不允许被生成器改写）\n",
-                     path.c_str());
+        cue::log::error("gen", "refuse_overwrite",
+                        "拒绝覆盖 " + path +
+                            "：它不是 --gen 生成的 suite（手写 suite 不允许被生成器改写）");
         return 2;
       }
     }
     {
       std::ofstream out(path);
       if (!out) {
-        std::fprintf(stderr, "[gen] 无法写入 %s\n", path.c_str());
+        cue::log::error("gen", "write_failed", "无法写入 " + path);
         return 5;
       }
       out << gen->suite.dump(2) << "\n";
       out.flush();
       if (!out) {
-        std::fprintf(stderr, "[gen] 写 %s 失败\n", path.c_str());
+        cue::log::error("gen", "write_failed", "写 " + path + " 失败");
         return 5;
       }
     }
@@ -436,9 +336,10 @@ int main(int argc, char** argv) {
       why_joined += (i == 0 ? "" : "；") + rejections[i];
     }
     const std::string why_text = why_joined.empty() ? "" : "（" + why_joined + "）";
-    std::printf("[gen] 生成 %zu 个 case → %s（%s）；组合 %zu 个、排除 %zu 个非法%s\n",
-                st.generated, path.c_str(), joined.c_str(), st.combinations, st.rejected,
-                why_text.c_str());
+    cue::log::info("gen", "generated",
+                   "生成 " + std::to_string(st.generated) + " 个 case → " + path + "（" + joined +
+                       "）；组合 " + std::to_string(st.combinations) + " 个、排除 " +
+                       std::to_string(st.rejected) + " 个非法" + why_text);
     return 0;
   }
 
@@ -483,7 +384,7 @@ int main(int argc, char** argv) {
   cfg.llm_mode = live_flag ? "live" : "replay";
   cfg.record = record_flag && !replay_flag;
   if (replay_flag && record_flag) {
-    std::fprintf(stderr, "[eval] --replay 忽略 CUE_RECORD（回放不写 cassette）\n");
+    cue::log::warn("cli", "replay_record_conflict", "--replay 忽略 CUE_RECORD（回放不写 cassette）");
   }
   // 两个传输开关都隐含「跑 real agent」；显式 --mode scripted 时只有 replay 可降级为无操作。
   if (!mode_set && (live_flag || replay_flag)) cfg.agent_mode = "real";
@@ -492,7 +393,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (replay_flag && cfg.agent_mode == "scripted") {
-    std::fprintf(stderr, "[eval] --replay 对 scripted 模式无影响（ScriptedClient 本就不联网）\n");
+    cue::log::info("cli", "replay_scripted",
+                   "--replay 对 scripted 模式无影响（ScriptedClient 本就不联网）");
   }
   if (cfg.record && cfg.llm_mode != "live") {
     if (cfg.agent_mode == "real") {
@@ -500,8 +402,8 @@ int main(int argc, char** argv) {
       return 2;
     }
     // 环境变量 CUE_RECORD=1 可能是全局设置的：scripted 下静默降级并说明，不打乱自检
-    std::fprintf(stderr, "[eval] %s 模式下不录制（ScriptedClient 不录）；要录制请用 --live --record\n",
-                 cfg.agent_mode.c_str());
+    cue::log::warn("cli", "record_ignored",
+                   cfg.agent_mode + " 模式下不录制（ScriptedClient 不录）；要录制请用 --live --record");
     cfg.record = false;
   }
 
@@ -554,16 +456,17 @@ int main(int argc, char** argv) {
       return 2;
     }
     cfg.repeat = std::max(1, h_repeat);
-    std::printf("[eval] 续跑沿用原 run 配置：suite=%s mode=%s repeat=%d\n", cfg.suite_path.c_str(),
-                cfg.agent_mode.c_str(), cfg.repeat);
+    cue::log::info("eval", "resume_config",
+                   "续跑沿用原 run 配置：suite=" + cfg.suite_path + " mode=" + cfg.agent_mode +
+                       " repeat=" + std::to_string(cfg.repeat));
   }
 
   if (!suite_set && cfg.suite_path.empty()) {
     // 默认给诊断集（不是 m2 的 manual_only 集）：仍会打 scripted banner，
     // 避免"没说跑哪个 suite"时拿一份不可判的集糊出 100%
     cfg.suite_path = "suites/m4-diagnosis.json";
-    std::fprintf(stderr, "[eval] 未指定 --suite，使用默认 %s（scripted 只是引擎自检）\n",
-                 cfg.suite_path.c_str());
+    cue::log::info("eval", "default_suite",
+                   "未指定 --suite，使用默认 " + cfg.suite_path + "（scripted 只是引擎自检）");
   }
 
   auto cases = eval::load_suite(cfg.suite_path);
@@ -571,18 +474,21 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "加载 suite 失败: %s\n", cases.error().c_str());
     return 1;
   }
-  std::printf("[eval] suite=%s cases=%zu mode=%s repeat=%d\n", cfg.suite_path.c_str(), cases->size(),
-              cfg.agent_mode.c_str(), cfg.repeat);
+  cue::log::info("eval", "run_start",
+                 "suite=" + cfg.suite_path + " cases=" + std::to_string(cases->size()) +
+                     " mode=" + cfg.agent_mode + " repeat=" + std::to_string(cfg.repeat));
   if (cfg.agent_mode == "real") {
-    std::printf("[eval] LLM=%s cassette=%s%s\n", cfg.llm_mode.c_str(), cfg.cassette_dir.c_str(),
-                cfg.record ? "（录制中）" : "");
+    cue::log::info("eval", "llm_transport",
+                   "LLM=" + cfg.llm_mode + " cassette=" + cfg.cassette_dir +
+                       (cfg.record ? "（录制中）" : ""));
   }
   if (!cfg.record_tools_dir.empty()) {
-    std::printf("[eval] 工具观测录制到 %s（miss 会报错）\n", cfg.record_tools_dir.c_str());
+    cue::log::info("eval", "tools_record",
+                   "工具观测录制到 " + cfg.record_tools_dir + "（miss 会报错）");
   }
   if (!cfg.replay_tools_dir.empty()) {
-    std::printf("[eval] 工具观测回放 %s（不 spawn cued、不连网络）\n",
-                cfg.replay_tools_dir.c_str());
+    cue::log::info("eval", "tools_replay",
+                   "工具观测回放 " + cfg.replay_tools_dir + "（不 spawn cued、不连网络）");
   }
 
   cfg.cancel = &g_cancel;
@@ -590,7 +496,7 @@ int main(int argc, char** argv) {
   auto report = engine.run(*cases);
   if (!report.fatal_error.empty()) {
     // 不能写 report.md：resume 失败时会把原 run 的报告覆盖成 0 分（review-eval.md #8）
-    std::fprintf(stderr, "[eval] 未产出结果：%s\n", report.fatal_error.c_str());
+    cue::log::error("eval", "fatal", "未产出结果", report.fatal_error);
     // 终端摘要照样给（走 fatal 分支）：读者要知道"这次没有结果"，而不是只看到一行 stderr
     std::printf("%s", engine.render_terminal_summary(report).c_str());
     return 2;
@@ -602,6 +508,15 @@ int main(int argc, char** argv) {
   const std::string json_path = cfg.out_dir + "/" + report.run_id + "/report.json";
   report.report_path = report_path;
   report.report_json_path = json_path;
+  // 从这里开始，后续日志都带上 run_id（JSON-line 的固定字段之一）：一条日志能不能被
+  // 归到某个 run，靠的就是它，而不是靠行号顺序猜。
+  cue::log::set_run_id(report.run_id);
+  cue::log::info("eval", "run_done",
+                 "run_id=" + report.run_id + " planned=" + std::to_string(report.planned) +
+                     " executed=" + std::to_string(report.executed) +
+                     " scored=" + std::to_string(report.scored) +
+                     " run_error=" + std::to_string(report.run_errors) +
+                     " truncated=" + (report.truncated ? "yes" : "no"));
 
   // 回归清单（§8.9 ④）：显式 --baseline 优先，否则自动找同 suite / mode / repeat 的上一次 run。
   // 找不到时 present 保持 false —— 报告写"本次没有 baseline，跳过"，而不是留空小节，
@@ -631,13 +546,13 @@ int main(int argc, char** argv) {
   {
     std::ofstream out(report_path);
     if (!out) {
-      std::fprintf(stderr, "无法写入 %s\n", report_path.c_str());
+      cue::log::error("eval", "write_failed", "无法写入 " + report_path);
       return 5;
     }
     out << md;
     out.flush();
     if (!out) {
-      std::fprintf(stderr, "写 %s 失败\n", report_path.c_str());
+      cue::log::error("eval", "write_failed", "写 " + report_path + " 失败");
       return 5;
     }
   }
@@ -646,13 +561,13 @@ int main(int argc, char** argv) {
   {
     std::ofstream out(json_path);
     if (!out) {
-      std::fprintf(stderr, "无法写入 %s\n", json_path.c_str());
+      cue::log::error("eval", "write_failed", "无法写入 " + json_path);
       return 5;
     }
     out << engine.render_json(report);
     out.flush();
     if (!out) {
-      std::fprintf(stderr, "写 %s 失败\n", json_path.c_str());
+      cue::log::error("eval", "write_failed", "写 " + json_path + " 失败");
       return 5;
     }
   }
@@ -660,7 +575,7 @@ int main(int argc, char** argv) {
   // 终端摘要（FR-EVAL.10）：走 stdout（报告正文也在 stdout），stderr 只留告警与错误。
   std::printf("%s", engine.render_terminal_summary(report).c_str());
   if (g_cancel.load()) {
-    std::fprintf(stderr, "[eval] 已按信号取消（已完成部分已落盘，可 --resume）\n");
+    cue::log::warn("eval", "cancelled", "已按信号取消（已完成部分已落盘，可 --resume）");
     return 130;
   }
   if (report.io_errors > 0) return 5;

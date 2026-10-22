@@ -1,0 +1,51 @@
+{
+  "_note": "cue 的单一配置文件模板（FR-OBS.5）。用法：cue-serve --config cue.example.json / cue-eval --config cue.example.json。优先级：命令行 > 配置文件 > 内置默认值。JSON 不支持注释，所以 `_` 开头的键被当作注释并忽略；不写某个键 = 该键保持内置默认值。",
+  "serve": {
+    "bind": "127.0.0.1",
+    "port": 8080,
+    "web_dir": "web",
+    "cued_bin": "./build/cued",
+    "runs_dir": "./runs",
+    "approval": "ask",
+    "ws_port": 9000,
+    "probe_port": 9001,
+    "approval_timeout_s": 30,
+    "no_pipeline": false,
+    "bitrate_kbps": 1500,
+    "gop": 60,
+    "preset": "veryfast",
+    "transcode": false,
+    "inject_drop": 0.0
+  },
+  "eval": {
+    "_suite_path": "suite 文件必须存在；不写则沿用 suites/m4-diagnosis.json",
+    "suite_path": "suites/m4-diagnosis.json",
+    "agent_mode": "scripted",
+    "repeat": 1,
+    "max_yuan": 5.0,
+    "out_dir": "runs",
+    "warmup_s": 6,
+    "cued_bin": "./build/cued",
+    "probe_bin": "./build/cue-probe",
+    "endpoint": "",
+    "model": "deepseek-chat",
+    "yuan_per_mtok": 2.0,
+    "llm_mode": "replay",
+    "cassette_dir": "cassettes",
+    "record": false,
+    "_mutex": "record_tools_dir 与 replay_tools_dir 互斥，不能同时出现（同时给会在配置行上报错）",
+    "record_tools_dir": "",
+    "replay_tools_dir": "",
+    "sla_settle_ms": 3000
+  },
+  "log": {
+    "_file": "写文件时才需要它的目录已经存在；留空 = 只写 stderr。单文件超过 rotate_mb 后轮转，保留 rotate_files 个",
+    "file": "",
+    "level": "info",
+    "json": true,
+    "stderr": true,
+    "rotate_mb": 64,
+    "rotate_files": 3,
+    "queue_size": 8192
+  }
+}

@@ -59,6 +59,10 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 
 `cue-serve` 提供 `GET /events`（SSE，`id` 单调递增，环形缓冲 512 条，支持 `Last-Event-ID` 补齐；更旧的事件靠 `/api/state` 全量快照恢复）、`GET /api/state` 快照、`POST /api/action` 控制动作、`POST /api/approve` 审批决策，并托管 `web/dist`。控制台五页是设备、管线、会话、审批、评测；审批页展示待审批队列与倒计时，动作必须走 `Registry::call_guarded`，不直接碰管线。
 
+运维面另有两个端点：`GET /healthz` 是纯文本 `ok`（给探活脚本/反代，和前端的 JSON `/api/health` 并存），`GET /metrics` 是 JSON（`curl -s http://127.0.0.1:8080/metrics | python3 -m json.tool`）。`/metrics` 覆盖技术设计 §12.3 的 10 项（`cue_agent_turns_total` / `cue_tool_calls_total` / `cue_llm_tokens_total` / `cue_llm_cost_yuan_total` / `cue_pipeline_p99_us` / `cue_pipeline_drop_frames_total` / `cue_probe_nack_sent_total` / `cue_probe_fec_recovered_total` / `cue_eval_cases_total` / `cue_process_rss_bytes`）外加 FR-OBS.3 的进程级读数（CPU、日志队列深度与 debug 丢弃数、连接数、SSE 客户端数）。拿不到的量写 0 并带 `note`/顶层 `_note` 说明"这是没有 run，不是测出来 0"；RSS/CPU 来自 `/proc`，CPU 是两次采样差的单核百分比（首拍为 0）。
+
+结构化日志（FR-OBS.1）走 spdlog 异步 sink：队列 8192，满时丢 `debug` 并计数（计数在 `/metrics` 的 `cue_log_dropped_debug_total` 里），JSON 由 nlohmann 序列化后整串写入，字段固定为 `ts_us/level/proc/run_id/case_id/session_id/component/event/msg`（可选 `err`）。默认 JSON 写 stderr；`--log-file` 额外写轮转文件（`--log-level` / `--log-text` / `--log-json`）。迁移范围只到 `cue-serve` 与 `cue-eval`：`cued` / `cue-probe` 的 stdout 是 harness 的解析输入（`[cue-event]`、`METRICS`、`probe.metric` 行），改格式会直接打断控制面，所以保持原样。
+
 边界：控制台是单机开发工具，没有鉴权、没有多租户；跨机部署需要自己在前面加一层（例如 nginx + SSO）。
 
 ## 技术栈
@@ -71,6 +75,7 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 | 编解码 | FFmpeg 6.1（libavcodec / libavutil / libswscale）+ libx264 |
 | 传输 | 自研 UDP 协议（分片 / NACK / XOR-FEC / 令牌桶） |
 | 前端 | React 18 + Vite 6（控制台）；推流页原生 HTML + Canvas + WebCodecs |
+| 日志 | spdlog 1.12（系统包，异步 sink 8192 + 文件轮转）+ fmt 9.1；JSON 由 nlohmann 序列化 |
 | LLM 接入 | libcurl（OpenAI 兼容接口） |
 | 沙箱 | landlock + rlimit |
 
@@ -81,7 +86,8 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 ```bash
 sudo apt install -y g++-14 cmake pkg-config \
   libavcodec-dev libavutil-dev libswscale-dev libx264-dev \
-  libcurl4-openssl-dev libboost-dev libboost-system-dev nlohmann-json3-dev
+  libcurl4-openssl-dev libboost-dev libboost-system-dev nlohmann-json3-dev \
+  libspdlog-dev libfmt-dev
 ```
 
 `libboost-system-dev` 不能省：`find_package(Boost COMPONENTS system)` 在只有头文件时会失败。
@@ -95,7 +101,7 @@ cmake --build build -j1
 
 `-j1` 是这台机器的硬约束：2 vCPU / 1.9 GiB 上 `-j2` 同时编两个 libavcodec 相关 TU 会 OOM。默认 `CUE_WERROR=ON`，本仓库全量构建 0 warning；只看警告不愿被中断时重新 configure 加 `-DCUE_WERROR=OFF`。全量首次构建在 2 vCPU 上约 7 分钟。
 
-单测（9 项，约 1 秒）：
+单测（20 项，约 1 秒）：
 
 ```bash
 ctest --test-dir build --output-on-failure
@@ -127,6 +133,16 @@ ctest --test-dir build --output-on-failure
 `run.sh` 不带参数（或 `demo-min`）会起「`cue-probe` + `cued` + 采集源 + 静态页」，在终端打印 `http://127.0.0.1:8080/?ws_port=9000`。采集源默认是 `cue-capture --backend lavfi`（`testsrc2` 画面 + `sine` 音频，零采购真实源；走与浏览器同一套上行协议）；没有该二进制时回退到 `scripts/test-client.mjs`（Node 模拟浏览器）。`CUE_PRODUCER=page` 则不自动产帧，改由页面点「开始推流」——`cued` 一次只接一个客户端，采集端跑着时页面连不上，这是预期行为。`cued` 默认只监听 `127.0.0.1`；跨机演示用 `BIND=0.0.0.0` 并自行限制 9000/TCP 与 9001/UDP。改过 `WS_PORT` 也能对上。
 
 控制台（可选）：`./scripts/serve.sh` 会先构建 `web/console`（首次需要 Node 与 npm，会联网装前端依赖），再起 `cue-serve`，默认 `http://127.0.0.1:8080/`、审批模式 `ask`。
+
+单一配置文件的用法（模板：仓库根的 `cue.example.json`）：
+
+```bash
+./build/cue-serve --config cue.example.json            # 命令行 > 配置文件 > 内置默认值
+./build/cue-eval  --config cue.example.json --repeat 1 # 命令行覆盖配置文件里的 repeat
+./build/cue-serve --config cue.example.json --port 9099 --log-level debug --log-file logs/cue.jsonl
+```
+
+配置文件是 JSON（省一个解析器：nlohmann 已在依赖里），启动时校验端口范围、路径存在性、枚举值与互斥项（`record_tools_dir` 与 `replay_tools_dir`），非法配置**拒绝启动并给出行号**，例如 `cue.example.json:5: 端口超出范围 …`。JSON 不支持注释，`_` 开头的键当注释被忽略；不写某个键就保持内置默认值，所以加配置文件不改变任何既有命令行默认语义。
 
 评测示例：
 
@@ -223,6 +239,7 @@ src/           与 include 分层对应的实现
 web/           推流页（Canvas + WebCodecs + WS）；web/console 是 React 控制台
 suites/        评测用例：m2-constraints.json · m4-diagnosis.json · real-faults.json · cassettes/
 scripts/       run.sh · serve.sh · bench.sh · test-client.mjs · e2e-* · test-*.sh
+cue.example.json  单一配置文件模板（FR-OBS.5）
 tests/         无框架单测（手写 check，靠 ctest 退出码）
 bench/         benchmark 脚本的产出目录（数据不入库）
 ```
