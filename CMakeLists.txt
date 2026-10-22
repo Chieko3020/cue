@@ -386,6 +386,77 @@ target_link_libraries(test_metrics PRIVATE cue_pipeline cue_log
 add_test(NAME metrics COMMAND test_metrics)
 set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ---- Python 驱动的两个测试（T-17a / T-18a）----
+# python3 是仓库脚本的既有依赖（test-real-faults.sh、test-control-channel.py 都要它），
+# 不新增依赖。找不到时只告警、不注册：ctest 少两个测试，比在没装 python3 的机器上
+# 直接把 configure 打挂更符合"CI 稳定性优先"，但会明确打印缺了什么。
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  # AC-13 的可执行证据：前端源码与产物里不得出现外部 URL（不依赖浏览器/网络，秒级）。
+  # 与 e2e-console 的关系：e2e 缺 web/dist 或 playwright 时会跳过，这条永远在跑。
+  add_test(NAME no_external_cdn
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-no-external-cdn.py)
+  set_tests_properties(no_external_cdn PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+  if(CUE_SANITIZE STREQUAL "none")
+    # 技术设计 §13.2 的三条端到端判据（真 cued/cue-probe/cue-capture/cue-serve）。
+    # 只在常规构建里跑：sanitizer 构建下 ctest 的 LD_PRELOAD（libasan/libtsan）会传给
+    # 所有子进程，2 vCPU 上再叠加 ASan 的 shadow 映射与 TSan 的内存开销，跑一条 27 s 的
+    # 多进程测试只会得到不稳定结果，而它测的不是内存安全（那是 unit test 的职责）。
+    # ASan/TSan job 仍跑全部单测，AC-12 的证据不受影响。
+    add_test(NAME integration
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_integration.py)
+    set_tests_properties(integration PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      TIMEOUT 120
+      ENVIRONMENT "BUILD_DIR=${CMAKE_BINARY_DIR}")
+  else()
+    message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}：不注册 integration（起真进程的端到端测试只在常规构建跑）")
+  endif()
+else()
+  message(WARNING "找不到 python3：不注册 integration / no_external_cdn 测试（scripts/*.py 也需要它）")
+endif()
+
+# ---- libFuzzer（可选，默认关；技术设计 §13.4 / T-18b）----
+# 为什么默认关、为什么必须 clang：
+#   * -fsanitize=fuzzer 是 Clang 的运行时（GCC 14 直接报 unrecognized argument），
+#     libFuzzer 随编译器分发，所以这里不需要引入任何第三方库；
+#   * 60 s × 3 个入口 ≈ 3 分钟，不适合放进每次 push 的 CI（另见 ci.yml 的手动 job）；
+#   * 解析器是纯头文件，fuzz 目标不链接项目库，只编一个 TU。
+#
+# 用法：
+#   cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++-18 -DCUE_FUZZ=ON
+#   cmake --build build-fuzz --target fuzz_decode_media -j1
+#   ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0 \
+#     ./build-fuzz/fuzz_decode_media tests/fuzz/corpus/decode_media -max_total_time=60 -max_len=18432
+#   （decode_media 的 FragmentTooLarge 分支要求输入 >16416 字节，libFuzzer 默认上限 4096 到不了；
+#     本机 /etc/ld.so.preload 预加载 libonion.so 会把 libasan 挤到第二位，
+#     verify_asan_link_order=0 是这台机器上唯一需要的让步，见 CMakeLists 开头的说明。）
+option(CUE_FUZZ "构建 proto 的 libFuzzer 目标（需要 clang++，默认关）" OFF)
+if(CUE_FUZZ)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR
+      "CUE_FUZZ=ON 需要 clang++：libFuzzer 随 Clang 提供，GCC 的 -fsanitize= 没有 fuzzer 运行时。\n"
+      "  cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DCUE_FUZZ=ON\n"
+      "  cmake --build build-fuzz --target fuzz_decode_media -j1")
+  endif()
+  # 一个 libFuzzer 进程只驱动一个 LLVMFuzzerTestOneInput，所以三个入口各一个 target。
+  # ASan 抓越界读、UBSan 抓未定义算术；-fno-sanitize-recover=undefined 让 UB 直接终止，
+  # 否则 libFuzzer 会把它当"正常返回"继续跑，覆盖数字好看但结论是假的。
+  function(cue_add_fuzz_target target macro)
+    add_executable(${target} tests/fuzz/proto_fuzz.cpp)
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(${target} PRIVATE ${macro}=1)
+    target_compile_options(${target} PRIVATE
+      -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
+      -fno-omit-frame-pointer -O1 -g)
+    target_link_options(${target} PRIVATE -fsanitize=fuzzer,address,undefined)
+  endfunction()
+  cue_add_fuzz_target(fuzz_decode_media CUE_FUZZ_TARGET_DECODE_MEDIA)
+  cue_add_fuzz_target(fuzz_decode_datagram CUE_FUZZ_TARGET_DECODE_DATAGRAM)
+  cue_add_fuzz_target(fuzz_decode_fec_header CUE_FUZZ_TARGET_FEC_HEADER)
+endif()
+
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
 # 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。

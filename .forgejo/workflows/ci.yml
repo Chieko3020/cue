@@ -6,11 +6,14 @@
 #   * 不上传任何产物（bench 数据与覆盖率日志留在 runner 本地）。
 #
 # runner 前置（self-hosted）：
-#   * g++-14 / cmake>=3.20 / node / ffmpeg+x264 / libboost-system / nlohmann-json / libcurl；
+#   * g++-14 / cmake>=3.20 / node / python3 / ffmpeg+x264 / libboost-system / nlohmann-json / libcurl；
 #   * tsan job 需要把 vm.mmap_rnd_bits 调到 28：内核默认 32 时 GCC 14 的 libtsan 会随机
 #     FATAL: unexpected memory mapping（见 tsan job 的「环境」步骤，sudo 不可用时只告警）；
 #   * ASan 的 LD_PRELOAD 由 CMake 的 ctest ENVIRONMENT 处理（本机 /etc/ld.so.preload 预加载
-#     libonion.so，会把 libasan 挤到第二位），不需要 job 里额外写。
+#     libonion.so，会把 libasan 挤到第二位），不需要 job 里额外写；
+#   * e2e-console 的 playwright 不是系统包（本机手工装在 /tmp/pwtest/node_modules）。缺它时
+#     该 job **显式跳过**（::warning:: + 落盘跳过原因），不再用"直接 exit 0"冒充 success；
+#   * fuzz job 需要 clang++（libFuzzer 随 Clang 提供），只在手动触发时跑。
 #
 # 本地手动验证（本机没有注册 Forgejo runner 时）：逐条跑各 job 的 run: 命令即可。
 name: ci
@@ -19,6 +22,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # T-18b：fuzz 一次 3×60 s，不进 push/PR 的常驻路径，只能手动触发。
+  # Forgejo 网页的「Run workflow」按钮或 forgejo-cli 都能触发它。
+  workflow_dispatch:
 
 # 并发护栏：本机 2 vCPU / 1967 MB，runner 的 capacity 已经是 1（同一时刻只有一个 job），
 # 这条是跨 workflow 的第二道闸（例如 ci 与别的 workflow 同时触发时）。
@@ -42,6 +48,7 @@ jobs:
           g++-14 --version | head -1
           cmake --version | head -1
           node --version
+          python3 --version
 
       - name: 配置与构建（-j1 防 OOM）
         run: |
@@ -54,8 +61,20 @@ jobs:
             exit 1
           fi
 
-      - name: ctest
+      - name: ctest（含 integration 与 AC-13 静态检查）
         run: ctest --test-dir build-ci --output-on-failure
+
+  # AC-13（前端无外部 CDN、断网可加载）的可执行证据（T-17a）。
+  # 为什么独立成一个 job：不需要浏览器、不需要网络、不需要 npm，所以永远能跑；
+  # e2e-console 因缺 playwright 跳过时，这一层证据仍然在。
+  ac13-static:
+    name: AC-13 前端无外部 URL（静态扫描）
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 扫描 web/ 与 web/dist（若存在）
+        run: python3 scripts/check-no-external-cdn.py
 
   asan:
     name: ASan+UBSan
@@ -70,6 +89,8 @@ jobs:
         run: cmake --build build-asan -j1
 
       - name: ctest（UBSan halt_on_error=1）
+        # integration 不在 sanitizer 构建里注册：它起真进程，ctest 的 LD_PRELOAD 会一路
+        # 传给子进程，2 vCPU 上只会得到不稳定结果，而它测的不是内存安全（详见 CMakeLists）。
         run: ctest --test-dir build-asan --output-on-failure
 
   tsan:
@@ -95,10 +116,12 @@ jobs:
       - name: ctest
         run: ctest --test-dir build-tsan --output-on-failure
 
-  # 浏览器 e2e（M5 控制台）：需要 web/dist 与 playwright。缺任何一个都跳过而不是判失败——
-  # 它们的构建要联网装依赖，而本仓库 CI 的口径是「不依赖外部 CDN / 不拉外部包」。
+  # 浏览器 e2e（M5 控制台）：需要 web/dist 与 playwright。
+  # T-17 的修正：以前缺件时直接 `exit 0`，job 显示 success 但零证据。现在缺件走
+  # 「显式跳过」：::warning:: + 一段 ===== 跳过原因 ===== + 落盘 ci-skipped.txt。跳过与
+  # 失败在日志里不可能被误读；真有证据时这个 job 会真的跑。AC-13 另有 ac13-static 兜底。
   e2e-console:
-    name: e2e-console（可选，缺依赖跳过）
+    name: e2e-console（缺 dist/playwright 时显式跳过）
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
@@ -109,13 +132,109 @@ jobs:
           cmake -S . -B build-e2e -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build-e2e -j1
 
-      - name: 浏览器 e2e（缺 web/dist 或 playwright 则跳过）
+      - name: 尝试构建 web/dist（失败不判红，但必须显式记录原因）
+        run: |
+          set -eu
+          NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
+          rm -f ci-web-dist.status
+          if [ -f web/dist/index.html ]; then
+            echo "web/dist 已存在，跳过前端构建"
+            echo "ok 已存在" > ci-web-dist.status
+            exit 0
+          fi
+          # npm ci 需要 package-lock.json（仓库里有）。--prefer-offline 优先用 npm 缓存：
+          # 无网但缓存完整时仍能装上；缓存也没有就失败——那种情况按「缺件」处理，不让整个
+          # job 变红（CI 稳定性优先），但必须诚实标注"没有证据"。
+          if (cd web/console && npm ci --prefer-offline --registry="$NPM_REGISTRY" \
+                && npm run build); then
+            echo "web/dist 构建成功"
+            echo "ok 构建成功" > ci-web-dist.status
+          else
+            echo "::warning::web/dist 构建失败（npm ci / npm run build；可能无网且无 npm 缓存），e2e 将显式跳过"
+            echo "skip npm 构建 web/dist 失败（registry=$NPM_REGISTRY）" > ci-web-dist.status
+          fi
+
+      - name: 浏览器 e2e（缺 web/dist 或 playwright 则显式跳过）
         run: |
           set -eu
           PW_NODE_MODULES="${PW_NODE_MODULES:-/tmp/pwtest/node_modules}"
-          if [ ! -d web/dist ] || [ ! -d "$PW_NODE_MODULES/playwright" ]; then
-            echo "缺少 web/dist 或 playwright（$PW_NODE_MODULES）→ 跳过 e2e-console"
+          SKIP=""
+          if [ ! -f web/dist/index.html ]; then
+            SKIP="web/dist 不存在（$(cat ci-web-dist.status 2>/dev/null || echo '构建步骤没有写状态')）"
+          elif [ ! -d "$PW_NODE_MODULES/playwright" ]; then
+            SKIP="playwright 不存在（$PW_NODE_MODULES；本机手工安装，runner 没有系统包来源）"
+          fi
+
+          if [ -n "$SKIP" ]; then
+            # 三件事同时发生：warning 注解 + 日志里的显式横幅 + 落盘一份跳过原因
+            echo "::warning::e2e-console 跳过：$SKIP"
+            {
+              echo "===== 跳过原因 ====="
+              echo "job: e2e-console"
+              echo "原因: $SKIP"
+              echo "影响: 浏览器端 e2e **没有执行**；job 的 success 不代表 AC-13 有浏览器证据。"
+              echo "兜底: AC-13 的静态检查由独立的 ac13-static job 覆盖（无外部 URL、断网可加载）。"
+              echo "复现: 装好 playwright（NODE_PATH 指向其 node_modules）并构建 web/dist 后重跑本 job。"
+              echo "===================="
+            } | tee ci-skipped.txt
             exit 0
           fi
+
           NODE_PATH="$PW_NODE_MODULES" BUILD_DIR=build-e2e \
             node scripts/e2e-console.cjs
+
+  # 手动触发的 libFuzzer（T-18b）：三个 proto 解析入口各 60 s。
+  # 不进 push/PR 路径：3 分钟 × 本机 2 vCPU 会拖长每次提交的反馈时间。
+  fuzz:
+    name: fuzz proto（手动，3×60 s）
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置与构建（CUE_FUZZ=ON；缺 clang 则显式跳过）
+        run: |
+          set -eu
+          if command -v clang++-18 >/dev/null 2>&1; then
+            FUZZ_CXX=clang++-18
+          elif command -v clang++ >/dev/null 2>&1; then
+            FUZZ_CXX=clang++
+          else
+            # 不判红：这台 runner 没装 clang 不代表代码有问题；但必须让"没跑"看得出来。
+            echo "::warning::找不到 clang++（libFuzzer 随 Clang 提供），fuzz job 跳过"
+            echo "===== 跳过原因 ====="
+            echo "fuzz 未执行：没有 clang++；GCC 的 -fsanitize= 不支持 fuzzer 运行时。"
+            echo "安装：sudo apt-get install -y clang-18 libclang-rt-18-dev"
+            echo "===================="
+            exit 0
+          fi
+          cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER="$FUZZ_CXX" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCUE_FUZZ=ON
+          cmake --build build-fuzz --target fuzz_decode_media fuzz_decode_datagram \
+            fuzz_decode_fec_header -j1
+
+      - name: 三个入口各跑 60 s
+        run: |
+          set -euo pipefail
+          if [ ! -x build-fuzz/fuzz_decode_media ]; then
+            echo "上一步跳过了构建（缺 clang），这里不再假装跑过 fuzz"
+            exit 0
+          fi
+          # 语料复制到临时目录：libFuzzer 会往语料目录里写新条目，不能污染工作区。
+          WORK="${RUNNER_TEMP:-/tmp}/cue-fuzz"
+          rm -rf "$WORK"
+          mkdir -p "$WORK/artifacts"
+          # 本机 /etc/ld.so.preload 预加载 libonion.so，会把 libasan 挤到第二位：
+          # verify_asan_link_order=0 是这台机器上唯一的让步（见 CMakeLists.txt 的说明）。
+          export ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0
+          for t in decode_media decode_datagram fec_header; do
+            mkdir -p "$WORK/$t"
+            cp tests/fuzz/corpus/$t/* "$WORK/$t/"
+            # decode_media 的 FragmentTooLarge（单分片 >16 KiB）需要 >16416 字节的输入，
+            # libFuzzer 默认上限 4096 到不了；另外两个入口的合法输入 ≤24/8 字节，不用放宽。
+            EXTRA=""
+            if [ "$t" = "decode_media" ]; then EXTRA="-max_len=18432"; fi
+            echo "===== fuzz_decode_$t 60s ====="
+            "./build-fuzz/fuzz_decode_$t" "$WORK/$t" \
+              -max_total_time=60 -print_final_stats=1 $EXTRA -artifact_prefix="$WORK/artifacts/"
+          done

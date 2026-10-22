@@ -101,11 +101,36 @@ cmake --build build -j1
 
 `-j1` 是这台机器的硬约束：2 vCPU / 1.9 GiB 上 `-j2` 同时编两个 libavcodec 相关 TU 会 OOM。默认 `CUE_WERROR=ON`，本仓库全量构建 0 warning；只看警告不愿被中断时重新 configure 加 `-DCUE_WERROR=OFF`。全量首次构建在 2 vCPU 上约 7 分钟。
 
-单测（20 项，约 1 秒）：
+测试（22 项：20 个进程内单测 + 集成测试 + AC-13 静态检查；全量约 30 秒）：
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
+
+集成测试（技术设计 §13.2；ctest 里的 `integration` 就是它，起真进程、约 27 秒）：
+
+```bash
+python3 tests/test_integration.py            # BUILD_DIR=build-ci 可指定别的构建目录
+```
+
+三条判据：本机回环 10 s 的帧率 / 解码错误 / 端到端 p50·p99；`--inject-drop 5` 下 NACK 与 FEC 的真实计数，以及接收端整帧缺失率（≤5%，不修复时约 23%）；`kill -9` 托管中的 `cued` 后 supervisor 的 `pipeline.restart` 事件、pid 变化与重新吃帧——这条是 AC-2 唯一的自动化验证。sanitizer 构建不注册它（它测的不是内存安全，见 `CMakeLists.txt` 的说明）。
+
+AC-13（前端无外部 CDN、断网可加载）的静态检查，不依赖浏览器与网络，`ctest` 里的 `no_external_cdn`：
+
+```bash
+./scripts/check-no-external-cdn.py --verbose
+```
+
+fuzz（libFuzzer，默认不编译；需要 clang，一次 3×60 s，只在 CI 手动触发，见 `.forgejo/workflows/ci.yml` 的 `fuzz` job）：
+
+```bash
+cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCUE_FUZZ=ON
+cmake --build build-fuzz --target fuzz_decode_media fuzz_decode_datagram fuzz_decode_fec_header -j1
+ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0 \
+  ./build-fuzz/fuzz_decode_media tests/fuzz/corpus/decode_media -max_total_time=60 -max_len=18432
+```
+
+`-max_len=18432` 只对 `decode_media` 必要：`FragmentTooLarge`（单分片 > 16 KiB）要求输入超过 16416 字节，而 libFuzzer 默认上限是 4096，不显式放宽就永远到不了那个分支。另外两个入口的合法输入分别 ≤24/8 字节，默认上限已经够。
 
 跑一次脚本化 agent 演示（不联网、不花钱、不启动管线）：
 
@@ -228,7 +253,7 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 - TSan 需要 `vm.mmap_rnd_bits=28`，否则 libtsan 会随机报 `unexpected memory mapping`（CI 的 tsan job 里有这一步）。
 - 推流页不发送 `codec_config`（`0x03`）：`cued` 侧有接收与缓存实现，浏览器侧没发，`fetch_observation(frames)` 的媒体元信息段因此为空。
 - 控制台前端产物（`web/dist`）不入库：干净 clone 首次 `serve.sh` 需要联网装前端依赖。
-- CI 的 4 个 job（build+ctest、ASan+UBSan、TSan、可选 e2e）的 `run:` 命令已在本机逐条跑通，但尚未在真实的 Forgejo workflow 里跑过（self-hosted runner 已就位）。
+- CI 的 6 个 job（build+ctest、AC-13 静态检查、ASan+UBSan、TSan、e2e-console、手动 fuzz）的 `run:` 命令已在本机逐条跑通，但尚未在真实的 Forgejo workflow 里跑过（self-hosted runner 已就位）。e2e-console 缺 `web/dist` 或 playwright 时**显式跳过**（`::warning::` + `===== 跳过原因 =====` + `ci-skipped.txt`），不会再以「success」冒充「跑过」；AC-13 由独立的静态 job 兜底。
 
 ## 目录
 
@@ -240,7 +265,7 @@ web/           推流页（Canvas + WebCodecs + WS）；web/console 是 React �
 suites/        评测用例：m2-constraints.json · m4-diagnosis.json · real-faults.json · cassettes/
 scripts/       run.sh · serve.sh · bench.sh · test-client.mjs · e2e-* · test-*.sh
 cue.example.json  单一配置文件模板（FR-OBS.5）
-tests/         无框架单测（手写 check，靠 ctest 退出码）
+tests/         单测（手写 check，靠 ctest 退出码）+ test_integration.py（真进程集成）+ fuzz/（libFuzzer）
 bench/         benchmark 脚本的产出目录（数据不入库）
 ```
 
