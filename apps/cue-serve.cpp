@@ -618,7 +618,10 @@ class Server {
       // 跨线程 close 更糟——fd 号会被内核回收，工作线程的写可能落到被复用的 fd 上
       // （M6 的 TSan 在这里报出 data race：file descriptor destroyed by another thread）。
       // dup 之后两个描述符指向同一个打开文件描述，stop() 只碰自己那份，永不 close 别人的。
-      const int wake_fd = ::dup(sock.native_handle());
+      // 注意必须从 sp 上取句柄：上一行的 std::move(sock) 之后 sock 已处于被移动状态，
+      // sock.native_handle() 返回 -1，dup 会稳定失败（EBADF）——那样每条连接都拿不到唤醒
+      // 描述符，stop() 只能靠 10 s 超时兜底，等于把"优雅停止"退化成"等超时"。
+      const int wake_fd = ::dup(sp->native_handle());
       if (wake_fd < 0) {
         std::fprintf(stderr, "[cue-serve] dup 连接描述符失败：%s（该连接退出时可能多等 10 s）\n",
                      std::strerror(errno));
