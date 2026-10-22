@@ -7,7 +7,9 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 - **评测** — 声明式 case、三重判分（根因 / 证据 / SLA）、pass^k、指纹、回归对比、人读报告
 - **可观测** — `cue-serve` + React 控制台五页、SSE 事件流、审批 UI；`cue-probe` 跨机接收端
 
-当前状态：M0–M7 已落地。`ctest` 9 项全部通过；控制台五页、SSE 与审批 UI 可用；ASan/UBSan/TSan 构建选项、cassette、benchmark、CI workflow 都在仓库里。
+当前状态：`ctest` **23 项**全部通过（含一个起真进程的集成测试）；控制台五页、SSE 与审批 UI 可用；cassette、benchmark、proto fuzz、CI workflow 都在仓库里。
+
+CI 分两层：**常驻**（每次 push）跑 build + ctest、AC-13 静态检查、e2e-console；**手动**（`workflow_dispatch`）跑 sanitizer（ASan/UBSan、TSan）与 fuzz。sanitizer 不常驻的原因写在 `.forgejo/workflows/sanitizer.yml` 头部：本机 2 vCPU / 1967 MB（DSH 常驻近 1 GB）+ runner 的 `MemoryHigh=700M`，插桩构建连 `-g1` 都压不进预算（`MemoryCurrent` 恒贴 734M，单 TU 编 5 分钟）。
 
 ## 为什么是这个拼法
 
@@ -253,7 +255,8 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 - **抖动缓冲的粒度受帧率约束**：档位是 1/2/4/8 帧，30 fps 下约 0/33/100/233 ms，做不了音频那种毫秒级目标延迟；也没有时间伸缩（视频本就不适用）。抖动缓冲与 NACK 之间只做了"重传在途时放宽空洞等待"这一处联动，不与 feedback 的拥塞信号联动。
 - **抖动估计的基准已改为首片到达**，但"帧在途耗时污染抖动"这条在本机复现不出来（loopback 没有真实带宽整形，`sendmmsg` 一次推完整帧分片）。机制由单测证明，真实链路上的幅度未量化。
 - **`src/eval/state.cpp` 用 `popen("git describe …")` 算指纹**：命令固定、无用户输入，暂未改成直接读仓库元数据。
-- **TSan 需要 `vm.mmap_rnd_bits=28`**，否则 libtsan 会随机报 `unexpected memory mapping`（CI 的 tsan job 里有这一步）。
+- **TSan 需要 `vm.mmap_rnd_bits=28`**，否则 libtsan 会随机报 `unexpected memory mapping`（手动的 `sanitizer.yml` 里有这一步，`sudo -n` 不可用时只告警）。
+- **sanitizer 不在常驻 CI 里**：见顶部说明。`ASan/UBSan/TSan 无报告` 这条由本地验证 + 手动 workflow 承担，不是每次 push 的证据。
 - **推流页不发送 `codec_config`（0x03）**：`cued` 侧有接收与缓存实现，浏览器侧没发，`fetch_observation(frames)` 的媒体元信息段因此为空。
 - **控制台前端产物（`web/dist`）不入库**：干净 clone 首次 `serve.sh` 需要联网装前端依赖；CI 里同样要现场 `npm ci`，无网时 e2e 走显式跳过（有 `===== 跳过原因 =====` 横幅与 `ci-skipped.txt`，AC-13 由独立的静态检查 job 兜底）。
 - **集成测试只在 `CUE_SANITIZE=none` 下注册**：它起真进程，而 sanitizer 构建的 `LD_PRELOAD` 会传给子进程，2 vCPU 上不稳定，且它测的不是内存安全；ASan/TSan 仍跑全部单测。
