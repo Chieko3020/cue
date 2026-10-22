@@ -99,7 +99,10 @@ jobs:
           set -euo pipefail
           cmake -S . -B build-e2e -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g0"
-          cmake --build build-e2e -j1
+          # 只编 e2e 真正要用的三个二进制。无 target 的全量构建在这台机器上要 20 min，
+          # 而且大部分 target（测试、cue、cue-eval、cue-capture）e2e 根本用不到。
+          # `cue --target` 的依赖链会自动带上它需要的库。
+          cmake --build build-e2e -j1 --target cue-serve cued cue-probe
 
       - name: 尝试构建 web/dist（失败不判红，但必须显式记录原因）
         run: |
