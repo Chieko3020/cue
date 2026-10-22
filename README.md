@@ -39,15 +39,15 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 
 外层是阶段状态机 `collect → diagnose → repair → verify → done/give_up`，内层是 ReAct 工具循环。工具用声明式 spec 描述参数与风险级，校验分三层（JSON 类型 → 枚举/范围 → 语义），审批分 `ReadOnly` / `Mutating` / `Dangerous` 三级，模式分 `Ask` / `Auto` / `Deny`。上下文有 token 预算：超长观测按字节截断并留 `…[truncated N bytes]` 标记，不静默丢字段。
 
-边界：harness 层的头文件不得 include `media/`、`pipeline/`（CMake 在配置期扫描，违者直接 configure 失败）；工具层只认识 `IServicePipeline` 接口，不知道背后是子进程还是 HTTP 服务。
+边界：harness 层（`agent/`、`tool/`、`eval/`）不得 include `media/`、`pipeline/`——CMake 用**分层 include 视图**在构建期物理隔离：`cue_agent`/`cue_eval` 只拿到 `{common,tool,agent,llm,eval,cli}` 这些目录，越界 include 直接 `fatal error: No such file`。这条由 ctest 的 `layer_isolation` 长期守着（一条正例 + 两条反例）。工具层只认识 `IServicePipeline` 接口，不知道背后是子进程、HTTP 服务还是录制回放。
 
 ### 被测域（`src/media`、`src/pipeline`）
 
-`cued` 负责 WS 接收、分片重组、解码、`ProcessorChain`（passthrough / scale / transcode）、编码、UDP 发送，六段埋点（recv / buffer / decode / op / encode / send）逐帧计时。令牌桶、XOR-FEC、NACK 与四种损伤注入（`drop` / `ingress_drop` / `rate` / `backlog`）都在发送路径上，结果可复现。
+`cued` 负责 WS 接收、分片重组、**抖动缓冲**、解码、`ProcessorChain`（passthrough / scale / transcode）、编码、UDP 发送，六段埋点（recv / buffer / decode / op / encode / send）逐帧计时、每段给 p50/p95/p99。令牌桶、XOR-FEC（每 N 包一组，可调）、NACK 与**六种损伤注入**（`drop` / `ingress_drop` / `rate` / `backlog` / `delay` / `jitter`）都在发送路径上，同一 seed 逐包可复现。控制面走 UDS（`SOCK_SEQPACKET` 优先，STREAM + JSON-line 兜底），所以改参数与注入**不重启进程、不断流**；只有结构性参数（端口、bind、FEC 开关、抖动缓冲结构）仍需重启。
 
 `pipeline/` 是适配层：`ProcessPipelineControl` 把 `cued` 当子进程拉起，从 stdout 解析指标与事件；`HttpServicePipeline` 连接实现 `GET /api/state` + `POST /api/action` 的外部服务（`cue-mock-svc` 是其中一个确定性假域）。
 
-边界：帧数据只在浏览器 ↔ `cued` ↔ `cue-probe` 之间流动，不跨进程进 harness；工具面目前只看得到 `cued` 侧指标，`cue-probe` 的端到端分位还没回传（见「已知限制」）。
+边界：帧数据只在浏览器/`cue-capture` ↔ `cued` ↔ `cue-probe` 之间流动，不跨进程进 harness。**端到端分位已回传**：harness 托管探针并解析它的输出，`IServicePipeline::probe_latest()` 把端到端 p50/p95/p99、卡顿、四段分解（recv/reassembly/buffer/decode）交给工具与判分；探针不可用时报 `run_error=probe_unavailable`，不退回 `cued` 侧指标。
 
 ### 评测（`src/eval`）
 
@@ -247,16 +247,17 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 
 ## 已知限制 / 未做
 
-- 音频链路未实现（Opus 只出现在协议头的 codec 枚举里）。
-- `cued` 是单连接同步服务：同一时刻只服务一个推流端。
-- 控制面是「子进程 + stdout 解析」而不是 UDS：SPEC 原计划的 `SOCK_SEQPACKET` 控制通道没有做。
-- `inject_fault` 与 `pipeline_set_param` 的生效方式是重启 `cued`，每次会造成数百 ms 断流。
-- `cue-probe` 的指标还没回传到工具面：端到端分位只在 probe 侧打印，所以 `network_delay` / `clock_drift` 这两类根因 agent 诊断不了。
-- `src/eval/state.cpp` 用 `popen("git describe …")` 算指纹：命令固定、无用户输入，暂未改成直接读仓库元数据。
-- TSan 需要 `vm.mmap_rnd_bits=28`，否则 libtsan 会随机报 `unexpected memory mapping`（CI 的 tsan job 里有这一步）。
-- 推流页不发送 `codec_config`（`0x03`）：`cued` 侧有接收与缓存实现，浏览器侧没发，`fetch_observation(frames)` 的媒体元信息段因此为空。
-- 控制台前端产物（`web/dist`）不入库：干净 clone 首次 `serve.sh` 需要联网装前端依赖。
-- CI 的 6 个 job（build+ctest、AC-13 静态检查、ASan+UBSan、TSan、e2e-console、手动 fuzz）的 `run:` 命令已在本机逐条跑通，但尚未在真实的 Forgejo workflow 里跑过（self-hosted runner 已就位）。e2e-console 缺 `web/dist` 或 playwright 时**显式跳过**（`::warning::` + `===== 跳过原因 =====` + `ci-skipped.txt`），不会再以「success」冒充「跑过」；AC-13 由独立的静态 job 兜底。
+- **音频只计数、不解码**：`cue-capture` 与浏览器都能编 Opus 上行，`cued` 也计数（`audio_frames_in`），但服务端没有 Opus 解码器，指标里显式写 `audio_decoded=false` + 原因。所以能证明"音频在流且包数对得上"，不能证明可播。
+- **AC-1 的真摄像头路径未在真机验证**：开发机无摄像头、无声卡（`/dev/snd` 不存在），全部用 Chromium fake device（`--use-fake-device-for-media-stream`）与 `lavfi` 合成源验证。链路上的每个环节都通了，但"真 USB 摄像头 + 真麦克风"这一条要拿到有摄像头的机器上才能签字。
+- **`cued` 是单连接同步服务**：同一时刻只服务一个推流端；多设备会话、能力协商下发、租约（心跳续租 + 超时回收）未做。
+- **抖动缓冲的粒度受帧率约束**：档位是 1/2/4/8 帧，30 fps 下约 0/33/100/233 ms，做不了音频那种毫秒级目标延迟；也没有时间伸缩（视频本就不适用）。抖动缓冲与 NACK 之间只做了"重传在途时放宽空洞等待"这一处联动，不与 feedback 的拥塞信号联动。
+- **抖动估计的基准已改为首片到达**，但"帧在途耗时污染抖动"这条在本机复现不出来（loopback 没有真实带宽整形，`sendmmsg` 一次推完整帧分片）。机制由单测证明，真实链路上的幅度未量化。
+- **`src/eval/state.cpp` 用 `popen("git describe …")` 算指纹**：命令固定、无用户输入，暂未改成直接读仓库元数据。
+- **TSan 需要 `vm.mmap_rnd_bits=28`**，否则 libtsan 会随机报 `unexpected memory mapping`（CI 的 tsan job 里有这一步）。
+- **推流页不发送 `codec_config`（0x03）**：`cued` 侧有接收与缓存实现，浏览器侧没发，`fetch_observation(frames)` 的媒体元信息段因此为空。
+- **控制台前端产物（`web/dist`）不入库**：干净 clone 首次 `serve.sh` 需要联网装前端依赖；CI 里同样要现场 `npm ci`，无网时 e2e 走显式跳过（有 `===== 跳过原因 =====` 横幅与 `ci-skipped.txt`，AC-13 由独立的静态检查 job 兜底）。
+- **集成测试只在 `CUE_SANITIZE=none` 下注册**：它起真进程，而 sanitizer 构建的 `LD_PRELOAD` 会传给子进程，2 vCPU 上不稳定，且它测的不是内存安全；ASan/TSan 仍跑全部单测。
+- **fuzz 只覆盖 `proto` 的三个解析入口**（上行头/分片校验、下行头、FEC 载荷头）：FEC 分组与 XOR 恢复、NACK 条目、feedback 编解码不在其中（已有单测，但没有 fuzz）。
 
 ## 目录
 
