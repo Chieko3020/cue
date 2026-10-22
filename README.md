@@ -265,6 +265,10 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 - **推流页不发送 `codec_config`（0x03）**：`cued` 侧有接收与缓存实现，浏览器侧没发，`fetch_observation(frames)` 的媒体元信息段因此为空。
 - **控制台前端产物（`web/dist`）不入库**：干净 clone 首次 `serve.sh` 需要联网装前端依赖；CI 里同样要现场 `npm ci`，无网时 e2e 走显式跳过（有 `===== 跳过原因 =====` 横幅与 `ci-skipped.txt`，AC-13 由独立的静态检查 job 兜底）。
 - **集成测试只在 `CUE_SANITIZE=none` 下注册**：它起真进程，而 sanitizer 构建的 `LD_PRELOAD` 会传给子进程，2 vCPU 上不稳定，且它测的不是内存安全；ASan/TSan 仍跑全部单测。
+- **能力协商的端到端未测**：夹取逻辑（配置超过设备上限时夹分辨率/码率）有单测覆盖，但"真客户端发 `0x05` 上报能力 → 服务端按能力下发档位"这条链路没跑过——`cue-capture` 不发 `0x05`，只有浏览器发，而服务器无浏览器。实测两路设备时 `caps_declared` 都是 `false`，走的是"无上报按配置下发"的分支。
+- **`cue-serve` 不转发 `--max-sessions` / `--lease-ms`**：这两个参数只能直接给 `cued`（控制台走 `ProcessPipelineControl` 的 spawn 参数，目前没暴露）。想让控制台配并发与租约，需要给 `ServeOptions` + `PipelineEndpoint` + spawn args 各加一处。
+- **会话页的轨迹是 4 秒轮询，不是推送**：它读 `runs/*/sessions/*.jsonl`（完整审计事实），代价是刷新延迟而非实时；实时看事件流视图（SSE）。事件流有环形缓冲上限、慢消费者丢最旧、断线只补最后一段，所以两者不互相替代。
+- **评测页的"对比"是逐 case 并列条形，不是时间序列曲线**：`report.json`/`state.jsonl` 只有逐 case 汇总，没有时间序列，所以界面写死"该 run 没有时间序列"、p99 全 `n/a` 时给空态而不是画 0 ms。另一个已知漂移点：汇总行来自 `report.md` 文本解析、分类来自 `state.jsonl`，两个源，报告被手改时会不一致（未做交叉校验）。
 - **fuzz 只覆盖 `proto` 的三个解析入口**（上行头/分片校验、下行头、FEC 载荷头）：FEC 分组与 XOR 恢复、NACK 条目、feedback 编解码不在其中（已有单测，但没有 fuzz）。
 
 ## 目录
