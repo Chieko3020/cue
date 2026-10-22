@@ -40,7 +40,7 @@ int usage() {
       "\n"
       "  cue-eval --suite <path> [--mode scripted|real] [--repeat k] [--max-yuan N]\n"
       "           [--out dir] [--warmup s] [--model name] [--cued path] [--probe path]\n"
-      "           [--endpoint URL]\n"
+      "           [--sla-settle-ms N] [--endpoint URL]\n"
       "           [--replay|--live] [--record] [--cassette-dir dir]\n"
       "  cue-eval --resume <run_id> [--out dir]             # 从 state.jsonl 续跑\n"
       "  cue-eval --diff <run_a> <run_b> [--out dir]        # case 级回归对比\n"
@@ -183,6 +183,9 @@ int main(int argc, char** argv) {
       cfg.out_dir = next();
     } else if (a == "--warmup") {
       cfg.warmup_s = std::max(0, std::atoi(next().c_str()));
+    } else if (a == "--sla-settle-ms") {
+      // SLA 重测前的收敛期。0 = 立即采样（复现"恢复期尖峰"这种问题时会用到）。
+      cfg.sla_settle_ms = std::max(0, std::atoi(next().c_str()));
     } else if (a == "--model") {
       cfg.model = next();
     } else if (a == "--cued") {

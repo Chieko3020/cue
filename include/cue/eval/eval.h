@@ -255,6 +255,13 @@ struct RunConfig {
   // 只用 ReplayPipeline（不 spawn cued、不连 endpoint）。两者互斥。
   std::string record_tools_dir;
   std::string replay_tools_dir;
+  // SLA 重测前的收敛期（毫秒）。修复动作不是瞬间把系统拉回稳态的：
+  //  · 抖动缓冲降档需要若干个观测窗口；
+  //  · 编码器换档后上游积压要排空（实时流会丢帧，但排空仍需时间）。
+  // 直接在 agent 结束后立刻采样，p99 会被恢复期的一两个离群帧顶穿——3 s 窗口约 90 帧，
+  // p99 只要 1 帧尖峰就会被拉到几百 ms（实测 AC-15 的 queue-backlog 与 enc-placebo 就是这么掉的）。
+  // 等待期不看 agent 行为，所以"什么都不做"骗不过去：故障没修的话指标不会自己变好。
+  int sla_settle_ms = 2000;
   // SIGINT/SIGTERM：非空时每个 case 边界与等待循环检查，置位后尽快停管线退出
   const std::atomic<bool>* cancel = nullptr;
 };

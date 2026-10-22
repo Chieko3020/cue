@@ -328,6 +328,9 @@ struct Counters {
   uint64_t encode_delays = 0;  // 编码器内部延迟：正常路径，无可发数据
   uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
   uint64_t queue_dropped = 0;  // 排队策略切换时被丢弃的积压帧（见 process_frame 里的注释）
+  // 迟到帧丢弃（实时流不追赶积压）。旧实现在编码器慢下来时会把 WS 上行积压一路读完，
+  // 恢复后以 100+ fps 追帧，端到端延迟要好几秒才回来——实时流宁可丢帧也不排队。
+  uint64_t ingress_late = 0;
   // 音频只计数：上行 type=0x02 的包被接收、被计数、出现在指标行里，但不进解码、
   // 不写下行。audio_decoded 恒 false 是这条链路的真实状态（原因见 METRICS 行的
   // audio_decode_reason 与处理分支处注释），不是没填的占位值。
@@ -529,6 +532,9 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
          {"encode_delays", c.encode_delays},
          {"decode_drops", c.decode_drops},
          {"queue_dropped", c.queue_dropped},
+         // 迟到帧：相对最小延迟基线晚到超过预算而被丢弃的帧。它与 queue_dropped 的区别是
+         // 「时间维度的背压」vs「策略切换的清空」——都丢帧，但触发条件与排查方向不同。
+         {"ingress_late", c.ingress_late},
          // 音频（FR-DEV.6）：收包侧只计数。audio_decoded=false 与原因一起进指标行，
          // 因为「音频包在流」和「音频被解出来能播」是两件事，混成一句就是谎报。
          // 注意 MB 仍然只算视频载荷（bytes_in），音频字节单列，两类带宽不混在一个数里。
@@ -683,6 +689,9 @@ int main(int argc, char** argv) {
   long long jitter_max_frames = 8;     // 队列容量硬上限（帧）
   long long jitter_budget_ms = 40;     // 缺帧等待预算
   long long jitter_target_frames = 1;  // 固定目标深度（帧）；1 = 不驻留，只靠空洞预算纠乱序
+  // 迟到帧预算（毫秒）：帧相对"最小延迟基线"晚到超过这个值就丢弃，见 process_frame 开头。
+  // 0 = 关闭。300 ms 的取法：够编码器换档时的短暂抖动，又远小于"追赶积压"造成的秒级延迟。
+  long long max_ingress_lag_ms = 300;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
@@ -769,6 +778,8 @@ int main(int argc, char** argv) {
       jitter_budget_ms = want_int(0, 2000);
     } else if (a == "--jitter-target-frames") {
       jitter_target_frames = want_int(1, 16);
+    } else if (a == "--max-ingress-lag-ms") {
+      max_ingress_lag_ms = want_int(0, 10000);
     } else if (a == "--fec") {
       const auto val = next();
       if (val != "on" && val != "off") bad(val);
@@ -781,7 +792,7 @@ int main(int argc, char** argv) {
           "     [--inject-drop 0..100] [--inject-ingress-drop 0..100] [--queue-fps N]\n"
           "     [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
           "     [--jitter on|off] [--jitter-target-frames 2] [--jitter-max-frames 8]\n"
-          "     [--jitter-budget-ms 40]\n"
+          "     [--jitter-budget-ms 40] [--max-ingress-lag-ms 300]\n"
           "  --bind 默认 127.0.0.1（只回环）；跨机演示才用 --bind 0.0.0.0，\n"
           "  并且必须自己限制网络可达性（cued 本身没有鉴权）。\n");
       return 0;
@@ -1177,6 +1188,12 @@ int main(int argc, char** argv) {
       }
     };
 
+    // 迟到帧丢弃用到的两个量（见 process_frame 开头）：
+    //  · ingress_min_offset 是「这一帧到达时刻 − 它的上行 PTS」的历史最小值，
+    //    充当跨机时钟差的基线；上行 PTS 来自设备时钟，绝对值不可比，但相对值可比。
+    //  · 基线不重置：客户端时钟漂移典型 <100 ppm（每秒 0.1 ms），相对 300 ms 的阈值可忽略。
+    int64_t ingress_min_offset = std::numeric_limits<int64_t>::max();
+
     // 一帧「重组完成之后」的全部处理：解码 → 处理器链 → 编码 → 令牌桶 → FEC → 发送。
     // 抽成 lambda 是因为抖动缓冲在**三个不同时刻**放行帧（push 当场 / 周期 tick / 断连接 flush），
     // 三条入口必须走同一条路径，否则「jb 放行的帧」和「直接处理的帧」会长出两套行为。
@@ -1184,6 +1201,32 @@ int main(int argc, char** argv) {
       const uint64_t pts_us = jf.pts_us;
       const uint32_t frame_id = jf.frame_id;
       bool keyframe = jf.keyframe;
+
+      // ---- 实时流不追赶积压 ----
+      // 编码器变慢时（placebo/1600x900 实测 >33 ms/帧），WS 上行会在 socket 缓冲里堆积。
+      // 恢复后若仍按"读到就处理"消费，cued 会以远高于标称帧率的速率追帧（实测 40~109 fps），
+      // 每个追赶帧的端到端延迟都是几百毫秒到几秒。旧实现靠"改参数就重启"把积压一起丢掉，
+      // 所以问题被掩盖；改参数不再重启（T-05）之后它立刻暴露成 AC-15 回归。
+      // 这里连关键帧一起丢：积压到这个程度时，"回到实时"比"花屏到下一个 IDR"更重要——
+      // 实时链路的正确降级是丢帧，不是排队。
+      if (max_ingress_lag_ms > 0) {
+        const int64_t now = cue::now_us();
+        const int64_t raw = now - static_cast<int64_t>(pts_us);
+        if (raw < ingress_min_offset) ingress_min_offset = raw;
+        const int64_t age = raw - ingress_min_offset;
+        if (age > max_ingress_lag_ms * 1000) {
+          ++c.ingress_late;
+          if (c.ingress_late == 1 || (c.ingress_late % 30) == 0) {
+            emit_event("pipeline.ingress_late",
+                       json{{"frame_id", frame_id},
+                            {"age_us", age},
+                            {"keyframe", keyframe},
+                            {"dropped_total", c.ingress_late},
+                            {"budget_us", max_ingress_lag_ms * 1000}});
+          }
+          return;
+        }
+      }
       // 每帧取一次参数快照（几十字节的拷贝）：整帧内编码器、注入、排队看到的是**同一个
       // 版本**，不会出现「bitrate 换了但 gop 还是旧的」这种半截配置。
       const auto snap = params.snapshot();

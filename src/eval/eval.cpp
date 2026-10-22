@@ -1477,6 +1477,15 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     post.push_back(SamplePoint{now_us(), to_metrics(cued), pipe->probe_latest()});
     return cued;
   };
+  // 收敛期：见 RunConfig::sla_settle_ms 的注释。回放模式跳过——录制时已经等过，
+  // 回放要确定性，不能引入墙钟依赖（否则 AC-6 的回放一致性会被破坏）。
+  if (!replay_tools && cfg_.sla_settle_ms > 0) {
+    const int64_t settle_deadline = now_us() + int64_t(cfg_.sla_settle_ms) * 1000;
+    while (now_us() < settle_deadline) {
+      if (cfg_.cancel != nullptr && cfg_.cancel->load()) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
   bool have_sample = false;
   if (replay_tools || record_tools) {
     for (int i = 0; i < kWaitAttempts; ++i) {
