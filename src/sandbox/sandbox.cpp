@@ -369,6 +369,27 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
   for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
   argv.push_back(nullptr);
 
+  // 环境变量同样在 fork 前构造：沙箱子进程拿到的是**一份白名单环境**，不继承 harness 的。
+  // 两个理由，缺一都不成立：
+  //  ① 安全：harness 的环境里有 CUE_API_KEY 之类的凭据，而命令白名单里就有 `env`。
+  //     继承等于把密钥直接交给模型（sandbox 要防的"误泄露"正是这一条）。
+  //  ② 正确性：本机 /etc/ld.so.preload 预加载了 libonion，sanitizer 构建的进程一旦把
+  //     LD_PRELOAD=libasan 继承给子进程，子进程会在 main 之前因 "ASan runtime does not
+  //     come first" 直接 abort，或者撞上 RLIMIT_AS=256MB 分不出 shadow 而崩。
+  // 用 execve 而不是 fork 后 unsetenv：unsetenv 在 glibc 里可能 malloc，而 fork 之后
+  // 子进程只允许做系统调用（父进程是多线程的，malloc 有死锁风险）。
+  // PATH 给沙箱自己用（部分是绝对路径调用，但 `which` 之类要查 PATH）；locale 固定，
+  // 免得子进程的排序/大小写行为随宿主环境漂移。
+  std::vector<std::string> env_storage = {
+      "PATH=/usr/local/bin:/usr/bin:/bin",
+      "LANG=C.UTF-8",
+      "LC_ALL=C.UTF-8",
+  };
+  std::vector<char*> envp;
+  envp.reserve(env_storage.size() + 1);
+  for (auto& s : env_storage) envp.push_back(const_cast<char*>(s.c_str()));
+  envp.push_back(nullptr);
+
   int out_pipe[2] = {-1, -1};
   int err_pipe[2] = {-1, -1};
   int st_pipe[2] = {-1, -1};
@@ -426,8 +447,8 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
       child_report(st_pipe[1], 'D', lerr, 0);
     }
 
-    ::execv(exe.c_str(), argv.data());
-    child_report(st_pipe[1], 'X', "execv", errno);
+    ::execve(exe.c_str(), argv.data(), envp.data());
+    child_report(st_pipe[1], 'X', "execve", errno);
     ::_exit(127);
   }
 
@@ -581,7 +602,7 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
   // 走到这里说明连 write 都没发生）。其余无状态行的情况也要给原因，不能留空的 error。
   if (!r.ran && r.error.empty()) {
     if (r.exit_code == 127) {
-      r.error = "execv 失败（子进程退出 127：可执行文件可能在 fork 后被移走）";
+      r.error = "execve 失败（子进程退出 127：可执行文件可能在 fork 后被移走）";
     } else if (r.exit_code == 126) {
       r.error = "子进程沙箱初始化失败（退出 126）";
     } else if (r.timed_out || r.cancelled) {
