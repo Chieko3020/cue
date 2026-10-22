@@ -296,6 +296,14 @@ struct Counters {
   uint64_t encode_errors = 0;  // 编码失败（尺寸/格式/编码器错误），不再混进"轻丢帧"
   uint64_t encode_delays = 0;  // 编码器内部延迟：正常路径，无可发数据
   uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
+  // 音频只计数：上行 type=0x02 的包被接收、被计数、出现在指标行里，但不进解码、
+  // 不写下行。audio_decoded 恒 false 是这条链路的真实状态（原因见 METRICS 行的
+  // audio_decode_reason 与处理分支处注释），不是没填的占位值。
+  uint64_t audio_frames_in = 0;
+  uint64_t audio_bytes_in = 0;
+  // 多分片音频不做重组，单独计数：少计会让「音频到底有没有在流」看不出来
+  uint64_t audio_multi_frag = 0;
+  int64_t audio_last_pts_us = 0;
 };
 
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counters& c) {
@@ -324,7 +332,7 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
   const uint64_t df = c.frames_out - frames_prev;
   const double fps = double(df) / dt;
   std::printf("[cued] fps=%.1f in=%llu out=%llu drop=%llu inj=%llu bkt=%llu serr=%llu enc_err=%llu "
-              "dec=%llu dec_err=%llu dec_drop=%llu rej=%llu MB=%.2f",
+              "dec=%llu dec_err=%llu dec_drop=%llu rej=%llu aud=%llu MB=%.2f",
               fps, static_cast<unsigned long long>(c.frames_in),
               static_cast<unsigned long long>(c.frames_out), static_cast<unsigned long long>(c.frames_dropped),
               static_cast<unsigned long long>(c.injected_drops),
@@ -335,6 +343,7 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
               static_cast<unsigned long long>(c.decode_errors),
               static_cast<unsigned long long>(c.decode_drops),
               static_cast<unsigned long long>(c.rejected),
+              static_cast<unsigned long long>(c.audio_frames_in),
               double(c.bytes_in) / (1024.0 * 1024.0));
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
@@ -361,7 +370,18 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
          {"send_errors", c.send_errors},
          {"encode_errors", c.encode_errors},
          {"encode_delays", c.encode_delays},
-         {"decode_drops", c.decode_drops}};
+         {"decode_drops", c.decode_drops},
+         // 音频（FR-DEV.6）：收包侧只计数。audio_decoded=false 与原因一起进指标行，
+         // 因为「音频包在流」和「音频被解出来能播」是两件事，混成一句就是谎报。
+         // 注意 MB 仍然只算视频载荷（bytes_in），音频字节单列，两类带宽不混在一个数里。
+         {"audio_frames_in", c.audio_frames_in},
+         {"audio_bytes_in", c.audio_bytes_in},
+         {"audio_multi_frag", c.audio_multi_frag},
+         {"audio_last_pts_us", c.audio_last_pts_us},
+         {"audio_decoded", false},
+         // 真解码 = libavcodec opus 解码器 + 下行音频数据报类型 + 播放侧，是独立的一条链路；
+         // 本批只做「收、计、可见」，原因显式写进指标，不做静默降级。
+         {"audio_decode_reason", "opus_decode_not_implemented"}};
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
       m[kStageNames[i]] = nullptr;
@@ -383,6 +403,8 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last, u
               {"injected", c.injected_drops},
               {"rejected", c.rejected},
               {"serr", c.send_errors},
+              {"audio_frames_in", c.audio_frames_in},
+              {"audio_decoded", false},
               {"decode_p50", stage_ms(rings[2], 0.50)},
               {"decode_p99", stage_ms(rings[2], 0.99)},
               {"op_p50", stage_ms(rings[3], 0.50)},
@@ -847,12 +869,14 @@ int main(int argc, char** argv) {
         continue;
       }
 
-      // 控制类上行包（0x03 codec_config / 0x04 keyframe_req）不带分片语义：
-      // 发送端常把 frag_count 留 0，用放宽了分片校验的入口解（其余边界仍然严格）。
+      // 控制类上行包（0x03 codec_config / 0x04 keyframe_req / 0x05 stats 能力上报）
+      // 不带分片语义：发送端常把 frag_count 留 0，用放宽了分片校验的入口解
+      // （其余边界仍然严格）。
       std::optional<cue::proto::MediaHeader> h;
       if (n >= 2 && p[0] == cue::proto::kMagicUp &&
           (p[1] == static_cast<uint8_t>(cue::proto::MediaType::CodecConfig) ||
-           p[1] == static_cast<uint8_t>(cue::proto::MediaType::KeyframeReq))) {
+           p[1] == static_cast<uint8_t>(cue::proto::MediaType::KeyframeReq) ||
+           p[1] == static_cast<uint8_t>(cue::proto::MediaType::Stats))) {
         cue::proto::MediaHeader hc;
         if (cue::proto::validate_control({p, n}, hc) == cue::proto::MediaReject::None) h = hc;
       } else {
@@ -884,6 +908,46 @@ int main(int argc, char** argv) {
         emit_event("keyframe.request", json{{"stream_id", h->stream_id},
                                             {"frame_id", h->frame_id},
                                             {"pts_us", h->pts_us}});
+        continue;
+      }
+      if (h->type == static_cast<uint8_t>(cue::proto::MediaType::Stats)) {
+        // 设备能力上报（FR-DEV.4）：浏览器把 VideoEncoder/AudioEncoder 的 isConfigSupported
+        // 结果、enumerateDevices() 设备数与 UA 装进一条 0x05 控制包的 JSON 载荷。
+        // 选 0x05 而不是新开一个 type：wire.h 里这个枚举早就留了 Stats 位、上行一直没人用，
+        // 复用它不必改协议版本；载荷是自描述 JSON，收端不认识新键也不会坏。
+        const std::string_view body(reinterpret_cast<const char*>(p) + cue::proto::kMediaHeaderSize,
+                                    h->payload_len);
+        auto caps = json::parse(body, nullptr, false);
+        if (caps.is_object()) {
+          caps["stream_id"] = h->stream_id;  // 谁报的（视频流 id）由收端补，发送端不必自报
+          // 事件名不能由发送端随便定（上行来自浏览器，任何页面/扩展都能发字节）：
+          // 只放行白名单，未知 kind 统一落 device.event，原值仍留在载荷里可查。
+          const std::string kind = caps.value("kind", std::string("unknown"));
+          const char* ev = "device.event";
+          if (kind == "caps") ev = "device.caps";
+          else if (kind == "codec.degraded") ev = "device.codec_degraded";
+          else if (kind == "audio.disabled") ev = "device.audio_disabled";
+          else if (kind == "audio.started") ev = "device.audio_started";
+          emit_event(ev, caps);
+        } else {
+          ++c.rejected;  // 载荷不是 JSON 对象：这次上报作废，但不影响媒体流继续
+        }
+        continue;
+      }
+      if (h->type == static_cast<uint8_t>(cue::proto::MediaType::Audio)) {
+        // 音频上行（FR-DEV.6）：**只喂计数，不解码、不下发**。
+        // 之所以不假装处理：opus 真解码要 libavcodec opus 解码器 + 下行音频数据报类型
+        // + 播放侧，是独立一条链路；本批验收只要「音频包能被收端看到」。
+        // 20 ms 的 Opus 帧只有几百字节，远低于 16 KiB 分片上限，浏览器恒单分片，
+        // 所以这里不做重组；见到多分片时单独计数（audio_multi_frag），
+        // 让「音频在流但口径不完整」可见，而不是静默少计成 0。
+        if (h->frag_count == 1) {
+          ++c.audio_frames_in;
+          c.audio_bytes_in += h->payload_len;
+          c.audio_last_pts_us = static_cast<int64_t>(h->pts_us);
+        } else {
+          ++c.audio_multi_frag;
+        }
         continue;
       }
       if (h->type != static_cast<uint8_t>(cue::proto::MediaType::Video)) continue;

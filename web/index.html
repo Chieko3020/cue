@@ -8,11 +8,16 @@
     body { margin: 0; background: #0d1117; color: #c9d1d9; font: 14px/1.5 ui-monospace, monospace; }
     .wrap { max-width: 920px; margin: 24px auto; padding: 0 16px; }
     h1 { font-size: 18px; font-weight: 600; }
-    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
     button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; cursor: pointer; }
     button:hover { background: #30363d; }
     button:disabled { opacity: .5; cursor: default; }
-    canvas { display: block; width: 100%; max-width: 854px; border: 1px solid #30363d; border-radius: 6px; margin-top: 12px; background: #000; }
+    select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 3px 6px; }
+    canvas, video { display: block; width: 100%; max-width: 854px; border: 1px solid #30363d; border-radius: 6px; margin-top: 12px; background: #000; }
+    /* 采集源默认隐藏，选到摄像头/屏幕时才显示（见 app.js 的 change 处理） */
+    #preview { display: none; }
+    #status { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; padding: 8px 10px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; }
+    #status b { color: #8b949e; font-weight: 400; }
     #log { white-space: pre-wrap; margin-top: 12px; padding: 10px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; min-height: 96px; max-height: 220px; overflow: auto; font-size: 12px; }
     .k { color: #58a6ff; }
     .warn { color: #d29922; }
@@ -23,8 +28,15 @@
 <div class="wrap">
   <h1>Cue · 推流控制台</h1>
   <div class="row">
+    <span>输入源 <select id="src">
+      <option value="synthetic" selected>合成源（Canvas，默认）</option>
+      <option value="camera">摄像头 + 麦克风</option>
+      <option value="screen">屏幕共享</option>
+    </select></span>
     <button id="start">开始推流</button>
     <button id="stop" disabled>停止</button>
+  </div>
+  <div class="row">
     <span>分辨率 <select id="res">
       <option value="854x480">854×480 (L3.0，默认)</option>
       <option value="1280x720">1280×720 (L4.0)</option>
@@ -34,8 +46,29 @@
     <span>帧率 <select id="fps">
       <option>30</option><option>60</option><option>24</option><option>15</option>
     </select></span>
+    <span>码率 <select id="bitrate">
+      <option value="auto" selected>自动（按像素率）</option>
+      <option value="1">1 Mbps</option>
+      <option value="2">2 Mbps</option>
+      <option value="4">4 Mbps</option>
+    </select></span>
+    <span>GOP <select id="gop">
+      <option value="2" selected>2 s</option>
+      <option value="1">1 s</option>
+      <option value="5">5 s</option>
+    </select></span>
   </div>
+  <!-- 采集源（摄像头/屏幕）走这个元素预览与兜底取帧；合成源用下面的 canvas -->
+  <video id="preview" muted autoplay playsinline></video>
   <canvas id="cv" width="854" height="480"></canvas>
+  <div id="status">
+    <span><b>输入源</b> <span id="stat-src">-</span></span>
+    <span><b>采集路径</b> <span id="stat-path">-</span></span>
+    <span><b>实际分辨率/帧率</b> <span id="stat-res">-</span></span>
+    <span><b>codec</b> <span id="stat-codec">-</span></span>
+    <span><b>编码错误</b> <span id="stat-err">0</span></span>
+    <span><b>音频</b> <span id="stat-audio">-</span></span>
+  </div>
   <div id="log"></div>
 </div>
 <script src="./app.js"></script>
