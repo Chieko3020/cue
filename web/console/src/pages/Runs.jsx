@@ -1,7 +1,9 @@
-// 评测页：读 /api/runs（服务端解析 runs/<id>/report.md，不额外产出 JSON）。
-// 展示分层成功率（根因/证据/SLA/pass^k/Run Error/MTTR）、成本、逐用例与失败用例。
+// 评测页：读 /api/runs（服务端解析 runs/<id>/report.md），展示分层成功率
+// （根因/证据/SLA/pass^k/Run Error/MTTR）、成本、失败模式、逐用例与失败用例；
+// 上半部分是两 run 对比（Compare：分类来自 /api/diff，与 cue-eval --diff 同源）。
 import { useCallback, useEffect, useState } from 'react';
 import { Card } from '../components/ui.jsx';
+import Compare from '../components/Compare.jsx';
 import { getJson, num } from '../api.js';
 
 function RateChip({ label, value }) {
@@ -56,6 +58,17 @@ function RunCard({ r }) {
         </div>
       ) : null}
 
+      {(r.failure_modes || []).length > 0 ? (
+        <div className="row" style={{ marginBottom: 8 }}>
+          <span className="small muted">失败模式：</span>
+          {r.failure_modes.map((m) => (
+            <span className="badge warn" key={m.text} data-testid="failure-mode">
+              {m.text} ({m.count ?? '—'})
+            </span>
+          ))}
+        </div>
+      ) : null}
+
       {r.case_rows && r.case_rows.length ? (
         <table>
           <thead>
@@ -82,6 +95,7 @@ function RunCard({ r }) {
       )}
       <p className="small muted" style={{ marginBottom: 0 }}>
         目录 {r.dir} · 报告由 cue-eval 生成（scripted 模式 = 引擎自检；real 模式每次约 ¥0.13）
+        {r.stability ? ` · 稳定性：${r.stability}` : ''}
       </p>
     </Card>
   );
@@ -123,6 +137,7 @@ export default function Runs() {
           </div>
         ) : null}
       </Card>
+      <Compare runs={runs} />
       {runs.map((r, i) => (
         <RunCard r={r} key={`${r.run_id}-${i}`} />
       ))}

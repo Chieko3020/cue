@@ -273,7 +273,9 @@ target_link_libraries(cue_eval PUBLIC cue_agent cue_pipeline PkgConfig::CURL)
 target_include_directories(cue_eval PUBLIC ${CUE_UPPER_INCLUDE})
 
 # ---- CLI 选项（FR-OBS.5 的优先级规则在这里落地）----
-# 拆两个库是为了不让 cue-serve 被拖上 cue_eval：评测的选项结构体里有 RunConfig。
+# 拆两个库是为了不让 cue-serve 被拖上 cue_cli_eval（评测的 CLI 选项结构体里有 RunConfig，
+# 那是 cue-eval 的入参，控制台不需要）。cue_eval 本身现在被 cue-serve 直接链接：
+# GET /api/diff 要复用 eval::diff_runs，见下面 cue-serve 那段的说明。
 add_library(cue_cli_serve STATIC src/cli/serve_options.cpp)
 target_link_libraries(cue_cli_serve PUBLIC cue_config)
 target_include_directories(cue_cli_serve PUBLIC ${CUE_UPPER_INCLUDE})
@@ -297,7 +299,11 @@ target_link_libraries(cue-eval PRIVATE cue_eval cue_cli_eval cue_headers_all)
 # 独立 target（而非 cue 的子命令）：serve 是长期驻留进程，信号/退出码语义与一次性 CLI 不同；
 # 它复用 cue_pipeline（事件源）与 cue_agent（Registry/工具/审批），不另起一套管线控制。
 add_executable(cue-serve apps/cue-serve.cpp)
-target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline cue_cli_serve cue_headers_all
+# 为什么 serve 也链接 cue_eval：GET /api/diff 要复用 eval::diff_runs。对比分类
+# （run_error 算不算新增失败、指纹不同要先声明不可比）只能有一份实现——前端自己算
+# 一份、cue-eval --diff 再算一份，两边迟早会漂。cue_cli_eval 仍然不链（它带 RunConfig
+# 选项结构体，那是 CLI 的东西，serve 不需要）。
+target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline cue_eval cue_cli_serve cue_headers_all
   Boost::system Threads::Threads)
 
 # ---- M7 假域服务（AC-16）----

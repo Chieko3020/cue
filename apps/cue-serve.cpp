@@ -13,6 +13,9 @@
 //   GET  /events         SSE；支持 Last-Event-ID 补齐（SPEC §6 M5）
 //   GET  /api/state      全量快照：管线配置 + 指标 + 设备会话表 + 最近事件 + 待审批 + 工具表
 //   GET  /api/runs       评测产物（runs/<id>/report.md）索引
+//   GET  /api/sessions   agent 会话索引（runs/*/sessions/*.jsonl）
+//   GET  /api/session    单个会话的逐类分组记录（?id=<sid> 或 ?id=<run>/<sid>）
+//   GET  /api/diff       两个 run 的 case 级回归对比（?a=<run>&b=<run>，语义同 cue-eval --diff）
 //   POST /api/action     控制动作：必须走 Registry::call_guarded（risk + 审批），不直接碰管线
 //   POST /api/approve    {id, allow} 决定一条待审批
 //   GET  /api/health
@@ -54,7 +57,10 @@
 #include "console/approval_queue.h"
 #include "console/metrics_report.h"
 #include "console/report_index.h"
+#include "console/session_index.h"
 #include "console/sse_hub.h"
+#include "cue/eval/compare.h"
+#include "cue/eval/state.h"
 #include "cue/cli/serve_options.h"
 #include "cue/common/clock.h"
 #include "cue/common/log.h"
@@ -70,6 +76,7 @@ using json = nlohmann::json;
 namespace tool = cue::tool;
 namespace pipeline = cue::pipeline;
 namespace cow = cue::console;
+namespace eval = cue::eval;
 
 namespace {
 
@@ -333,7 +340,141 @@ class ConsoleApp {
 
   json runs() const { return cow::scan_runs(opt_.runs_dir, 20); }
 
+  // GET /api/sessions：会话索引。数据源是 agent 的 append-only jsonl（T-19），
+  // 不是 SSE 环形缓冲——缓冲会被 800 条上限挤掉，会话文件才是事实。
+  json sessions() const { return cow::scan_sessions(opt_.runs_dir, 50); }
+
+  // GET /api/session?id=…：逐类分组 + seq（行号），前端据此拼回时间线并按阶段切段。
+  // 状态码：400 = id 非法/缺失，404 = 没有这个会话或读不到。
+  json session_view(const std::string& id, int& status_code) const {
+    status_code = 200;
+    auto path = cow::find_session_path(opt_.runs_dir, id);
+    if (!path) {
+      // id 非法与"不存在"对调用者是不同的错误，但都返回 ok:false（前端只认这个字段）
+      status_code = cow::valid_session_id(id) ? 404 : 400;
+      return json{{"ok", false}, {"error", path.error()}};
+    }
+    json out = cow::read_session_view(*path);
+    out["id"] = id;
+    return out;
+  }
+
+  // GET /api/diff?a=&b=：case 级回归对比。判定复用 eval::diff_runs —— 与
+  // `cue-eval --diff` 是**同一份实现**，前端不再自己算分类，避免两套语义漂移
+  // （例如 run_error 到底算不算"新增失败"这种口径，只能有一处）。
+  json diff(const std::string& a, const std::string& b, int& status_code) const {
+    status_code = 200;
+    eval::RunInfo ia;
+    eval::RunInfo ib;
+    eval::StateMap sa;
+    eval::StateMap sb;
+    std::string err;
+    if (!load_run_for_diff(a, ia, sa, err) || !load_run_for_diff(b, ib, sb, err)) {
+      status_code = (cow::valid_session_id(a) && cow::valid_session_id(b)) ? 404 : 400;
+      if (err.find("非法") != std::string::npos) status_code = 400;
+      return json{{"ok", false}, {"error", err}};
+    }
+    const eval::DiffReport d = eval::diff_runs(ia, sa, ib, sb);
+    json cases = json::array();
+    for (const auto& c : d.cases) {
+      json row{{"id", c.id},
+               {"cls", diff_class_key(c.cls)},
+               {"name", eval::diff_class_name(c.cls)},
+               {"a", case_agg_json(c.a)},
+               {"b", case_agg_json(c.b)}};
+      cases.push_back(std::move(row));
+    }
+    json out{{"ok", true},
+             {"a", run_info_json(ia)},
+             {"b", run_info_json(ib)},
+             {"comparable", d.comparable},
+             {"warnings", d.warnings},
+             {"counts",
+              json{{"new_failures", d.new_failures},
+                   {"fixed", d.fixed},
+                   {"still_failing", d.still_failing},
+                   {"still_passing", d.still_passing},
+                   {"inconclusive", d.inconclusive},
+                   {"only_a", d.only_a},
+                   {"only_b", d.only_b}}},
+             {"cases", std::move(cases)}};
+    return out;
+  }
+
  private:
+  static const char* diff_class_key(eval::DiffClass c) {
+    switch (c) {
+      case eval::DiffClass::NewFailure: return "new_failure";
+      case eval::DiffClass::Fixed: return "fixed";
+      case eval::DiffClass::StillFailing: return "still_failing";
+      case eval::DiffClass::StillPassing: return "still_passing";
+      case eval::DiffClass::Inconclusive: return "inconclusive";
+      case eval::DiffClass::OnlyInA: return "only_a";
+      case eval::DiffClass::OnlyInB: return "only_b";
+    }
+    return "unknown";
+  }
+
+  static json case_agg_json(const eval::CaseAgg& g) {
+    // 文本口径与 cue-eval 的 diff 报告一致（A "2/2 过"），只是这里的消费者是网页：
+    // 结构化字段 + 同一条人读文本都给，前端不必再写一套格式化。
+    std::string text;
+    if (g.attempts == 0) {
+      text = "—";
+    } else {
+      text = std::to_string(g.passes) + "/" + std::to_string(g.attempts) + " 过";
+      if (g.run_errors > 0) text += "，run_error=" + std::to_string(g.run_errors);
+      if (!g.root_cause.empty()) text += "，root=" + g.root_cause;
+    }
+    return json{{"attempts", g.attempts},
+                {"passes", g.passes},
+                {"run_errors", g.run_errors},
+                {"pass", g.pass()},
+                {"root_cause", g.root_cause},
+                {"text", text}};
+  }
+
+  static json run_info_json(const eval::RunInfo& i) {
+    return json{{"run_id", i.run_id},
+                {"suite", i.suite},
+                {"mode", i.mode},
+                {"repeat", i.repeat},
+                {"fingerprint", i.fingerprint}};
+  }
+
+  // run_id 会拼进路径，先过白名单；再从 state.jsonl 的 header 恢复 suite/mode/repeat/
+  // fingerprint（与 cue-eval --diff 完全同源），否则"配置不同"这一条就判不出来。
+  bool load_run_for_diff(const std::string& id, eval::RunInfo& info, eval::StateMap& state,
+                         std::string& err) const {
+    if (!cow::safe_session_component(id)) {
+      err = "run_id 非法（只允许字母数字与 . _ -，且不能包含 ..）：" + id;
+      return false;
+    }
+    const std::string sp = opt_.runs_dir + "/" + id + "/state.jsonl";
+    auto hdr = eval::read_state_header(sp);
+    if (!hdr) {
+      err = "读取 " + id + " 的 state header 失败：" + hdr.error();
+      return false;
+    }
+    auto st = eval::load_state(sp);
+    if (!st) {
+      err = "读取 " + id + " 的 state 失败：" + st.error();
+      return false;
+    }
+    const auto hstr = [&hdr](const char* k) {
+      return hdr->contains(k) && (*hdr)[k].is_string() ? (*hdr)[k].get<std::string>() : std::string();
+    };
+    info.run_id = id;
+    info.fingerprint = hstr("fingerprint");
+    info.suite = hstr("suite");
+    info.mode = hstr("mode");
+    info.repeat = hdr->contains("repeat") && (*hdr)["repeat"].is_number_integer()
+                      ? (*hdr)["repeat"].get<int>()
+                      : 1;
+    state = std::move(*st);
+    return true;
+  }
+
   // body 里的 {action, key, value, kind} → 工具名 + args
   bool map_action(const json& body, std::string& name, json& args) {
     const std::string a = body["action"].get<std::string>();
@@ -580,6 +721,25 @@ bool parse_u64(const std::string& s, uint64_t& out) {
   return true;
 }
 
+// GET 查询参数：控制台只传 id/run_id 这类白名单字符串，**不做百分号解码**是刻意的——
+// 解码会让 "%2e%2e" 变成 ".."，校验与拼接之间就多出一步需要防守的转换；
+// 不解码则任何编码字符都过不了白名单（非法字符直接 400）。
+std::string query_param(const std::string& target, const std::string& key) {
+  const auto q = target.find('?');
+  if (q == std::string::npos) return "";
+  const std::string qs = target.substr(q + 1);
+  std::size_t pos = 0;
+  while (pos <= qs.size()) {
+    const auto amp = qs.find('&', pos);
+    const std::string pair = qs.substr(pos, (amp == std::string::npos ? qs.size() : amp) - pos);
+    const auto eq = pair.find('=');
+    if (eq != std::string::npos && pair.compare(0, eq, key) == 0) return pair.substr(eq + 1);
+    if (amp == std::string::npos) break;
+    pos = amp + 1;
+  }
+  return "";
+}
+
 class Server {
  public:
   Server(ConsoleApp& app, const std::string& bind_addr, int port)
@@ -764,6 +924,39 @@ class Server {
       if (!is_get) return json_res({{"ok", false}, {"error", "method not allowed"}}, req,
                                    http::status::method_not_allowed);
       return json_res(app_.runs(), req);
+    }
+    // 这三条带查询串，所以先取路径部分再比较（其余路由沿用原来的整串比较，不动）。
+    // 方法校验放在取参数之前：POST 到已知路径应该是 405，而不是落进静态文件 404。
+    {
+      const std::string path = target.substr(0, target.find('?'));
+      const bool known = path == "/api/sessions" || path == "/api/session" || path == "/api/diff";
+      if (known && !is_get) {
+        return json_res({{"ok", false}, {"error", "method not allowed"}}, req,
+                        http::status::method_not_allowed);
+      }
+      if (path == "/api/sessions") return json_res(app_.sessions(), req);
+      if (path == "/api/session") {
+        const std::string id = query_param(target, "id");
+        if (id.empty()) {
+          return json_res({{"ok", false},
+                           {"error", "缺少 id（?id=<session_id> 或 ?id=<run_id>/<session_id>）"}},
+                          req, http::status::bad_request);
+        }
+        int code = 200;
+        json out = app_.session_view(id, code);
+        return json_res(out, req, static_cast<http::status>(code));
+      }
+      if (path == "/api/diff") {
+        const std::string a = query_param(target, "a");
+        const std::string b = query_param(target, "b");
+        if (a.empty() || b.empty()) {
+          return json_res({{"ok", false}, {"error", "缺少 a/b（?a=<run_id>&b=<run_id>）"}}, req,
+                          http::status::bad_request);
+        }
+        int code = 200;
+        json out = app_.diff(a, b, code);
+        return json_res(out, req, static_cast<http::status>(code));
+      }
     }
     if (target == "/api/action") {
       if (!is_post) return json_res({{"ok", false}, {"error", "method not allowed"}}, req,
@@ -970,7 +1163,8 @@ int main(int argc, char** argv) {
                      app.web_dir() + "，审批模式：" + opt.approval + "，审批超时 " +
                      std::to_string(opt.approval_timeout_s) + " s）");
   cue::log::info("serve", "routes",
-                 "SSE: /events  API: /api/state /api/action /api/approve /api/runs  "
+                 "SSE: /events  API: /api/state /api/action /api/approve /api/runs "
+                 "/api/sessions /api/session /api/diff  "
                  "运维: /healthz /metrics");
   // 一行 debug：`--log-level debug` 时能确认级别真的生效（否则"没看到 debug 行"会
   // 被误读成日志系统没起来）。

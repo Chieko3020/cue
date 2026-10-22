@@ -48,6 +48,13 @@ function ok(msg) {
   console.log(`[e2e] ok: ${msg}`);
 }
 
+// 会话页默认停在「轨迹」视图（FR-UI.3：按阶段组织的 agent 轨迹）；本脚本断言的是
+// 事件流（SSE 实时），所以每次进会话页后显式切到「事件流」。
+async function showEventStream(page) {
+  const btn = page.locator('[data-testid="view-events"]');
+  if ((await btn.count()) > 0) await btn.click();
+}
+
 function haveBin(p) {
   try {
     fs.accessSync(p, fs.constants.X_OK);
@@ -288,6 +295,7 @@ async function shutdown() {
 
   // ---------------------------------------------------------------- 5. 会话页 SSE 实时出现
   await page.click('[data-testid="tab-session"]');
+  await showEventStream(page);
   await page.waitForSelector('[data-testid="event-row"]', { timeout: 15000 });
   const rows = () => page.locator('[data-testid="event-row"]').count();
   const n1 = await waitFor(async () => {
@@ -374,6 +382,7 @@ async function shutdown() {
   // 执行结果也进了 SSE：会话页应有 status=executed 的 tool.result
   // （注意列表里可能已有更早的 tool.result，比如畸形请求被拒的那条，所以按文本筛）
   await page.click('[data-testid="tab-session"]');
+  await showEventStream(page);
   const trText = await waitFor(async () => {
     const texts = await page.locator('[data-testid="event-row"][data-ev="tool.result"]').allTextContents();
     return texts.find((t) => t.includes('executed')) || null;
@@ -415,6 +424,7 @@ async function shutdown() {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.waitForSelector('[data-testid="page-device"]', { timeout: 15000 });
   await page.click('[data-testid="tab-session"]');
+  await showEventStream(page);
   const afterReload = await waitFor(async () => {
     const c = await rows();
     return c >= 3 ? c : 0;

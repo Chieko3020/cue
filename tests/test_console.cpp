@@ -1,6 +1,7 @@
 // M5 控制台纯逻辑单测：SSE 环形缓冲/补齐、审批队列（批准/拒绝/超时/关闭）、
 // report.md 解析与 runs 索引。HTTP/SSE 端到端走 scripts/e2e-console.cjs（浏览器），
 // 这里只覆盖「不依赖 socket」的部分，保证 ctest 能在无端口环境下跑。
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -13,6 +14,7 @@
 
 #include "console/approval_queue.h"
 #include "console/report_index.h"
+#include "console/session_index.h"
 #include "console/sse_hub.h"
 
 namespace fs = std::filesystem;
@@ -223,6 +225,61 @@ void test_report() {
   check(empty["ok"] == true, "report: 空报告不误报失败");
 }
 
+
+// 失败模式 / 稳定性（FR-UI.5）：报告里是列表项而不是表格，且「运行状态备注」要分开
+void test_report_failure_modes() {
+  const char* md = R"(# Cue 评测报告
+
+- run_id: `run-fm`
+- 稳定性: repeat=1，**无稳定性信息**（只有 1 轮样本）
+
+## 失败模式
+
+- evidence 无法在观测中找到 (2)
+- root_cause 不匹配：期望 network_loss (1)
+
+**运行状态备注（不是失败模式，不计入上面任何一类）**：
+
+- 探针不可用：probe_unavailable (1)
+)";
+  const auto r = cow::parse_report(md);
+  check(r["stability"] == "repeat=1，**无稳定性信息**（只有 1 轮样本）", "report: 稳定性原样保留");
+  check(r["failure_modes"].size() == 2, "report: 失败模式两条");
+  check(r["failure_modes"][0]["text"] == "evidence 无法在观测中找到", "report: 失败模式描述（去掉计数）");
+  check(r["failure_modes"][0]["count"] == 2, "report: 失败模式计数");
+  check(r["failure_modes"][1]["text"] == "root_cause 不匹配：期望 network_loss", "report: 带冒号的描述不被当成 key: value");
+  check(r["failure_modes"][1]["count"] == 1, "report: 第二条计数");
+  check(r["run_notes"].size() == 1, "report: 运行状态备注单独收集");
+  check(r["run_notes"][0]["text"] == "探针不可用：probe_unavailable", "report: 备注文本");
+
+  // 当前报告版式：## 失败模式 TOP3 下的表格
+  const char* md_table = R"(# Cue 评测报告
+
+- run_id: `run-fm2`
+
+## 失败模式 TOP3
+
+> 口径：……
+
+| # | 根因 | miss | 例子 |
+|---|---|---|---|
+| 1 | network_loss | 2 | `netloss-5pct（evidence）` |
+| 2 | __run__（运行错误，未判分） | 1 | `bogus-case` |
+
+共 5 类失败模式，此处只列前 2 类（完整分布见 report.json 的 `failure_modes`）。
+
+## 回归清单
+
+本次没有 baseline，跳过。
+)";
+  const auto rt = cow::parse_report(md_table);
+  check(rt["failure_modes"].size() == 2, "report: TOP3 表格解析出两条失败模式");
+  check(rt["failure_modes"][0]["text"] == "network_loss", "report: 失败模式表格-根因列");
+  check(rt["failure_modes"][0]["count"] == 2, "report: 失败模式表格-miss 列转数字");
+  check(rt["failure_modes"][0]["example"] == "netloss-5pct（evidence）", "report: 失败模式表格-例子列（去反引号）");
+  check(rt["failure_modes"][1]["count"] == 1, "report: run_error 组也保留（报告注明了它未判分）");
+}
+
 void test_scan_runs() {
   const fs::path root = fs::temp_directory_path() / ("cue-console-test-" + std::to_string(::getpid()));
   std::error_code ec;
@@ -250,13 +307,93 @@ void test_scan_runs() {
   check(missing.contains("error"), "scan: 目录不存在时给 error 而不是空数组装没事");
 }
 
+
+// ---------------------------------------------------------------- 会话视图（FR-UI.3）
+
+void test_session_index() {
+  namespace fs = std::filesystem;
+  const fs::path root =
+      fs::temp_directory_path() / ("cue-session-idx-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / "run-x" / "sessions", ec);
+  const fs::path f = root / "run-x" / "sessions" / "s1.jsonl";
+
+  {
+    std::ofstream out(f, std::ios::binary);
+    out << R"({"t":"meta","format":"cue-agent-session/1","session_id":"s1","run_id":"run-x","started_us":123,"agent_version":"cue-agent/1","model":"scripted","mode":"demo","system_prompt":"sp","goal":"g"})" << "\n";
+    out << R"({"t":"message","role":"system","content":"sp"})" << "\n";
+    out << R"({"t":"message","role":"assistant","content":"先看指标"})" << "\n";
+    out << R"({"t":"tool","turn":1,"name":"query_metrics","args":{"window_ms":5000},"ok":true,"approval_denied":false,"risk":"read-only","duration_us":13,"summary":"metrics=ok"})" << "\n";
+    out << R"({"t":"observation","turn":1,"tool":"query_metrics","args":{},"text":"metrics=ok","data":{"fps":30.3},"truncated":false,"original_bytes":10})" << "\n";
+    out << R"({"t":"stage","from":"collect","to":"diagnose","allowed":true,"reason":"","turns":1,"cost_yuan":0.0001,"wall_us":100,"used_observe":true,"used_mutating":false,"consecutive_rejects":0,"diagnosis":null})" << "\n";
+    out << R"({"t":"stage","from":"diagnose","to":"repair","allowed":true,"reason":"","turns":2,"cost_yuan":0.0002,"wall_us":200,"used_observe":true,"used_mutating":false,"consecutive_rejects":0,"diagnosis":{"root_cause":"network_loss","confidence":0.8,"evidence":["fps=24.1"]}})" << "\n";
+    out << R"({"t":"budget","turns":2,"cost_yuan":0.0002,"wall_us":210,"used_observe":true,"used_mutating":false,"consecutive_rejects":0})" << "\n";
+    out << R"({"t":"weird","payload":1})" << "\n";
+    out << R"({"t":"end","final_stage":"done","kind":"done","reason":"","turns":3,"cost_yuan":0.0003,"wall_us":300,"resumable":false})" << "\n";
+    // 崩溃截断的末行：只跳过、必须有 warning（只读视图不因此失败）
+    out << R"({"t":"mess)";
+  }
+  // 锁文件不是会话：不能被当成一条记录列出来
+  std::ofstream(f.string() + ".lock") << "";
+
+  const auto list = cow::scan_sessions(root.string(), 10);
+  check(list["sessions"].size() == 1, "sessions: 只收 *.jsonl（.lock 不算）");
+  const auto& s = list["sessions"][0];
+  check(s["session_id"] == "s1" && s["run_id"] == "run-x", "sessions: id/run 来自 meta");
+  check(s["final_stage"] == "done", "sessions: final_stage 来自 end 记录");
+  check(s["turns"] == 3, "sessions: turns 来自 end 记录");
+  check(s["ended"] == true, "sessions: kind=done 视为已结束");
+  check(s["bytes"].get<std::size_t>() > 0 && s["mtime_us"].get<std::int64_t>() > 0,
+        "sessions: 带文件大小与 mtime");
+  check(s["bad_lines"] == 1, "sessions: 残行计入 bad_lines");
+
+  auto path = cow::find_session_path(root.string(), "s1");
+  check(path.has_value(), "find: 按 session_id 找到");
+  auto path2 = cow::find_session_path(root.string(), "run-x/s1");
+  check(path2.has_value() && *path2 == *path, "find: run_id/session_id 精确写法等价");
+  check(!cow::find_session_path(root.string(), "../../etc/passwd").has_value(),
+        "find: 含 .. 的 id 一律拒");
+  check(!cow::find_session_path(root.string(), "/etc/passwd").has_value(),
+        "find: 绝对路径 id 一律拒");
+  check(!cow::find_session_path(root.string(), "nope").has_value(), "find: 不存在的 id 报错");
+  check(!cow::find_session_path(root.string(), "").has_value(), "find: 空 id 报错");
+
+  const auto v = cow::read_session_view(*path);
+  check(v["ok"] == true, "view: ok");
+  check(v["meta"]["model"] == "scripted", "view: meta 原样保留");
+  check(v["messages"].size() == 2, "view: message 分组");
+  check(v["tools"].size() == 1 && v["tools"][0]["name"] == "query_metrics", "view: tool 分组带工具名");
+  check(v["tools"][0]["risk"] == "read-only", "view: tool 保留风险级");
+  check(v["observations"].size() == 1 && v["observations"][0]["data"]["fps"] == 30.3,
+        "view: observation 分组带 data");
+  check(v["stages"].size() == 2, "view: stage 分组");
+  check(v["stages"][1]["diagnosis"]["evidence"][0] == "fps=24.1", "view: 诊断证据原样保留");
+  check(v["budgets"].size() == 1 && v["ends"].size() == 1, "view: budget/end 分组");
+  check(v["other"].size() == 1, "view: 未知记录类型进 other（不丢）");
+  check(!v["warnings"].empty(), "view: 残行/未知类型给 warning");
+  check(v["counts"]["message"] == 2, "view: counts 按类型计数");
+  // 分组是为了渲染方便，顺序是事实：每类记录都带 seq（文件行号）
+  check(v["messages"][0]["seq"] == 1, "view: 记录带 seq（第 2 行 → seq=1）");
+  std::vector<int> seqs;
+  for (const char* k : {"messages", "tools", "observations", "stages", "budgets", "ends"}) {
+    for (const auto& r : v[k]) seqs.push_back(r["seq"].get<int>());
+  }
+  std::sort(seqs.begin(), seqs.end());
+  check(std::adjacent_find(seqs.begin(), seqs.end()) == seqs.end(), "view: 各组 seq 互不重复");
+
+  fs::remove_all(root, ec);
+}
+
 }  // namespace
 
 int main() {
   test_hub();
   test_approval();
   test_report();
+  test_report_failure_modes();
   test_scan_runs();
+  test_session_index();
   if (failures == 0) {
     std::printf("test_console: all checks passed\n");
     return 0;

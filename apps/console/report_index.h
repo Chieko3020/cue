@@ -146,11 +146,22 @@ inline nlohmann::json parse_report(const std::string& md) {
   out["rate_map"] = nlohmann::json::object();
   out["case_rows"] = nlohmann::json::array();
   out["failed"] = nlohmann::json::array();
+  // FR-UI.5 的「失败模式」：报告里是「## 失败模式」下的一行一条「- 描述 (N)」。
+  // 这是"这类故障失败了几次"的分布，不是把失败用例再列一遍——所以单独成一个字段。
+  out["failure_modes"] = nlohmann::json::array();
+  // 「运行状态备注」不是失败模式（环境/预算问题），报告里也明确区分；照抄成另一组，
+  // 免得控制台把"探针不可用"读成"agent 又错了"。
+  out["run_notes"] = nlohmann::json::array();
+  out["stability"] = nullptr;
   out["ok"] = true;
 
   std::string section;
   std::vector<std::string> case_header;
   bool case_header_seen = false;
+  // 失败模式在当前版式里是「## 失败模式 TOP3」下的表格（| # | 根因 | miss | 例子 |）；
+  // 更早的报告用的是「- 描述 (N)」列表项。两种都认，字段形状统一成 {text,count,example}。
+  std::vector<std::string> fm_header;
+  bool run_notes_mode = false;
 
   for (const auto& raw : split_lines(md)) {
     const std::string line = trim(raw);
@@ -159,7 +170,33 @@ inline nlohmann::json parse_report(const std::string& md) {
       section = line.substr(3);
       continue;
     }
+    // 报告里「**运行状态备注…**」之后的小节不是失败模式：从这里切换收集目标。
+    if (line.rfind("**", 0) == 0 && line.find("运行状态") != std::string::npos) {
+      run_notes_mode = true;
+      continue;
+    }
     if (line.rfind("- ", 0) == 0) {
+      if (section.find("失败模式") != std::string::npos) {
+        // 「- evidence 无法在观测中找到 (2)」：描述可能含空格，计数固定是行尾的括号整数
+        std::string text = trim(line.substr(2));
+        nlohmann::json item{{"text", text}, {"count", nullptr}};
+        if (!text.empty() && text.back() == ')') {
+          const auto lp = text.rfind('(');
+          if (lp != std::string::npos) {
+            const std::string num = text.substr(lp + 1, text.size() - lp - 2);
+            bool digits = !num.empty();
+            for (const char ch : num) {
+              if (!std::isdigit(static_cast<unsigned char>(ch))) digits = false;
+            }
+            if (digits) {
+              item["count"] = std::atoi(num.c_str());
+              item["text"] = trim(text.substr(0, lp));
+            }
+          }
+        }
+        (run_notes_mode ? out["run_notes"] : out["failure_modes"]).push_back(std::move(item));
+        continue;
+      }
       const auto colon = line.find(':');
       if (colon == std::string::npos) continue;
       const std::string key = trim(line.substr(2, colon - 2));
@@ -183,6 +220,8 @@ inline nlohmann::json parse_report(const std::string& md) {
         out["cases"]["executed"] = int_after(val, "执行");
         out["cases"]["scored"] = int_after(val, "计分");
         out["cases"]["error"] = int_after(val, "运行失败");
+      } else if (key == "稳定性") {
+        out["stability"] = val;
       } else if (key == "成本") {
         double v = 0;
         if (parse_number(val, v)) out["cost_yuan"] = v;
@@ -200,6 +239,25 @@ inline nlohmann::json parse_report(const std::string& md) {
         out["rates"].push_back(nlohmann::json{{"name", cells[0]}, {"value", cells[1]}});
         if (!k.empty()) out["rate_map"][k] = cells[1];
       }
+    } else if (section.find("失败模式") != std::string::npos) {
+      if (fm_header.empty()) {
+        fm_header = cells;
+        continue;
+      }
+      auto col = [&fm_header, &cells](const char* name) -> std::string {
+        for (std::size_t i = 0; i < fm_header.size() && i < cells.size(); ++i) {
+          if (fm_header[i] == name) return cells[i];
+        }
+        return "";
+      };
+      // 「根因」为空/`__run__` 的组是 run_error，不是答错——报告自己会加注，照抄不改写
+      // 例子单元格是 `case-id`（报告用反引号包 case id），UI 要的是 case id 本身
+      nlohmann::json item{{"text", col("根因")},
+                          {"count", nullptr},
+                          {"example", detail::unquote(col("例子"))}};
+      double n = 0;
+      if (parse_number(col("miss"), n)) item["count"] = static_cast<int>(n);
+      out["failure_modes"].push_back(std::move(item));
     } else if (section.find("逐用例") != std::string::npos) {
       if (!case_header_seen) {
         case_header = cells;

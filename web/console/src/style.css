@@ -204,3 +204,86 @@ ol.events li .raw { grid-column: 1 / -1; color: #6e7681; font-size: 11px; paddin
 .action-result.ok { border-color: #2a5a34; }
 .action-result.bad { border-color: #6e2a2a; }
 .action-log { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow: auto; }
+
+/* 会话轨迹（FR-UI.3）：阶段分段 + 段内时间线。证据块是这一页的重点，所以用暖色边框
+   与普通条目区分，而不是只加一行小字。 */
+.trace-stage {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--panel-2);
+}
+.trace-stage.diagnose { border-color: #5a4a1a; }
+.trace-stage > h3 {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.trace-stage > h3 .small { font-weight: 400; }
+ol.trace-items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.trace-item {
+  border-left: 2px solid #2d333b;
+  padding: 4px 0 4px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.trace-item b { font-size: 12px; }
+.trace-pre {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  color: #a5d6ff;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 320px;
+  overflow: auto;
+}
+.evidence {
+  border: 1px solid #5a4a1a;
+  background: #221d10;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+ul.evidence-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+ul.evidence-list li { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+ul.evidence-list code { font-size: 12px; color: #a5d6ff; word-break: break-all; }
+.warnbox {
+  border: 1px solid #5a4a1a;
+  background: #1d1a12;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--warn);
+}
+
+/* 评测页两 run 对比：逐 case p99 的并列条形（没有时间序列，所以不画曲线） */
+.bar-row { display: flex; align-items: center; gap: 8px; font-size: 11px; margin-bottom: 3px; }
+.bar-label { width: 64px; color: var(--muted); flex: none; }
+.bar-track {
+  flex: 1;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  height: 10px;
+  position: relative;
+  overflow: hidden;
+}
+.bar-fill { height: 100%; background: #1f6feb; }
+.bar-fill.b { background: #2ea043; }
+.bar-val { width: 78px; text-align: right; font-variant-numeric: tabular-nums; flex: none; }
