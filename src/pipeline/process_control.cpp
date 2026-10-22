@@ -497,6 +497,11 @@ bool ProcessPipelineControl::spawn_probe_locked(std::string& err) {
       "--bind", cfg.probe_host,
       // 标称帧率只用来推卡顿阈值（stall_factor × 1/fps），不是测量值
       "--fps", std::to_string(cfg.fps),
+      // 接收端缓冲深度必须与 cued 侧的 --jitter-target-frames 对齐：
+      // probe 的历史默认是 2 帧（30 fps 下 66 ms），而 case 的 SLA 门限是
+      // 端到端 p50 <= 60 ms —— 默认值单独就能顶穿它，且失败原因看起来像"管线慢"。
+      // 这里显式传 1，与 cued 的零驻留口径一致。
+      "--jitter-target-frames", "1",
   };
   if (!cfg.probe_report_addrs.empty()) {
     // 跨机模式：harness 与 probe 不在同一台机器上时，指标走 TCP JSON-line 上报；

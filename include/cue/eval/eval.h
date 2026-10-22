@@ -271,7 +271,14 @@ struct RunConfig {
   // 直接在 agent 结束后立刻采样，p99 会被恢复期的一两个离群帧顶穿——3 s 窗口约 90 帧，
   // p99 只要 1 帧尖峰就会被拉到几百 ms（实测 AC-15 的 queue-backlog 与 enc-placebo 就是这么掉的）。
   // 等待期不看 agent 行为，所以"什么都不做"骗不过去：故障没修的话指标不会自己变好。
-  int sla_settle_ms = 3000;
+  //
+  // 3000 → 6000 的实测依据（queue-backlog-12fps-tc，逐秒采样）：
+  //   清除 backlog 的瞬间 sendq 被清空，帧会**突发**补发，抖动缓冲据此升到 level 2
+  //   （hold = 3 × 33 ms ≈ 99 ms）；第 1~4 秒一直是 level 2，**第 5 秒**才降回 level 0。
+  //   3 s 的 settle 正好把重测的三个样本全压在 level 2 窗口里，于是
+  //   buffer p50 = 99 ms、端到端 p50 = 107 ms，而 cued 侧早就 30 fps、dropped=0。
+  // 6 s 覆盖"突发 → 升档 → 回落"的完整过程；代价是每个 case 多 3 s（54 个约 +162 s）。
+  int sla_settle_ms = 6000;
   // SIGINT/SIGTERM：非空时每个 case 边界与等待循环检查，置位后尽快停管线退出
   const std::atomic<bool>* cancel = nullptr;
 };

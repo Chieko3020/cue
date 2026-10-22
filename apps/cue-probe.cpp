@@ -219,32 +219,43 @@ void settle_fec(FrameAcc& fa, FecSettle& out) {
 
 class LatencyRing {
  public:
-  void push(int64_t us) {
-    if (buf_.size() < kCap) {
-      buf_.push_back(us);
-    } else {
-      buf_[head_] = us;
-      head_ = (head_ + 1) % kCap;
-    }
+  // 按**时间**淘汰的滑动窗口。
+  //
+  // 为什么不是按帧数：故障期 12 fps 只产生 120 帧/10 s，而修复后 30 fps 会飞快补
+  // 300 帧 —— 按帧数淘汰时环里仍是"故障期帧占多数"，p50 永远被故障期主导。
+  // 实测 queue-backlog-12fps-tc：cued 侧已回 30 fps、dropped=0，probe 的
+  // buffer p50 却仍是 99 ms（= 故障期 12 fps 的稳态），SLA（p50<=60）因此判失败。
+  //
+  // 5 s 的取法：settle（3 s）+ 重测先丢弃首条过渡窗口（1 s），环里剩下的
+  // 基本全是修复后的帧。再短就会让 p99 在少数样本上抖动。
+  static constexpr int64_t kWindowUs = 5'000'000;
+
+  void push(int64_t us, int64_t now_us) {
+    buf_.push_back({us, now_us});
     ++n_;
+    while (!buf_.empty() && now_us - buf_.front().at > kWindowUs) buf_.pop_front();
+    // 兜底：某些调用点没有稳定的 now（或回放时时间倒退），防止无界增长
+    while (buf_.size() > kHardCap) buf_.pop_front();
   }
   int64_t percentile(double p) const {
     if (buf_.empty()) return 0;
-    std::vector<int64_t> v = buf_;
+    std::vector<int64_t> v;
+    v.reserve(buf_.size());
+    for (const auto& e : buf_) v.push_back(e.us);
     std::sort(v.begin(), v.end());
     std::size_t idx = static_cast<std::size_t>(p * double(v.size() - 1));
     return v[idx];
   }
   std::size_t size() const { return buf_.size(); }
-  void clear() {
-    buf_.clear();
-    head_ = 0;
-  }
+  void clear() { buf_.clear(); }
 
  private:
-  static constexpr std::size_t kCap = 4096;
-  std::vector<int64_t> buf_;
-  std::size_t head_ = 0;
+  struct Entry {
+    int64_t us;
+    int64_t at;
+  };
+  static constexpr std::size_t kHardCap = 8192;
+  std::deque<Entry> buf_;
   uint64_t n_ = 0;
 };
 
@@ -606,6 +617,10 @@ int main(int argc, char** argv) {
   bool jitter_enabled = true;
   long long jitter_budget_ms = 40;
   long long jitter_max_level = 2;
+  // 接收端抖动缓冲的目标深度（帧）。默认 2 与 JitterBufferConfig 的历史默认一致，
+  // 但 cued 侧已经用 --jitter-target-frames 1（零驻留）时，两端假设必须对齐：
+  // 30 fps 下 2 帧 = 66 ms，会直接顶穿 case.expect.sla 里 60 ms 的端到端门限。
+  long long jitter_target_frames = 2;
   std::string bind_host = "0.0.0.0";
   std::vector<TcpReporters::Addr> report_addrs;
 
@@ -643,6 +658,9 @@ int main(int argc, char** argv) {
     } else if (a == "--jitter-budget-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 2000, jitter_budget_ms)) bad(a, val);
+    } else if (a == "--jitter-target-frames") {
+      const auto val = next();
+      if (!parse_int(val, 0, 8, jitter_target_frames)) bad(a, val);
     } else if (a == "--jitter-max-level") {
       const auto val = next();
       if (!parse_int(val, 0, 3, jitter_max_level)) bad(a, val);
@@ -698,6 +716,8 @@ int main(int argc, char** argv) {
   jb_cfg.adaptive = jitter_enabled;
   jb_cfg.min_level = 0;
   jb_cfg.max_level = static_cast<std::size_t>(jitter_max_level);
+  // 显式设定而不是靠默认值：默认值改了不会有人知道，而 SLA 门限是按它算的。
+  jb_cfg.target_frames = static_cast<std::size_t>(jitter_target_frames);
   jb_cfg.max_frames = cue::media::kDepthLadder[jb_cfg.max_level] + 2;
   jb_cfg.nominal_interval_us = frame_interval_us;
   jb_cfg.budget_us = jitter_budget_ms * 1000;
@@ -958,7 +978,7 @@ int main(int argc, char** argv) {
     std::string derr;
     AVFrame* out = dec.dec.decode(feed, derr);
     const int64_t dec_us = cue::now_us() - t0;
-    fs.decode_us.push(std::max<int64_t>(0, dec_us));
+    fs.decode_us.push(std::max<int64_t>(0, dec_us), cue::now_us());
     if (out != nullptr) {
       ++fs.decoded;
       dec.params_ready = true;
@@ -987,7 +1007,7 @@ int main(int argc, char** argv) {
     const int64_t now_rel = cue::now_us();
     const int64_t lat_us = now_rel + clk.offset_us - static_cast<int64_t>(jf.pts_us);
     if (clk.have && lat_plausible(lat_us)) {
-      lat.push(lat_us);
+      lat.push(lat_us, cue::now_us());
       // 抖动：相邻帧传输时延之差的 EWMA。帧间隔在相减中抵消，剩下的才是网络/调度抖动。
       // 用单调时钟 + offset，与端到端延迟同一口径；时钟未对齐时保持 -1（不编数）。
       if (last_transit_us >= 0) {
@@ -1006,7 +1026,7 @@ int main(int argc, char** argv) {
       }
     }
     // 抖动缓冲段：进队 → 放行。这是 buffer_us 的唯一来源，不再是恒 null。
-    fs.buffer_us.push(std::max<int64_t>(0, jf.wait_us));
+    fs.buffer_us.push(std::max<int64_t>(0, jf.wait_us), cue::now_us());
     decode_one(jf.codec, jf.frag_count, {jf.payload.data(), jf.payload.size()});
     // 卡顿按「帧与帧」的间隔算：与这一帧能否解出来无关（解不出来的帧同样占时间轴），
     // 所以放在解码之后统一观察，而不是塞进解码分支（跳过/失败会漏掉间隔）。
@@ -1056,7 +1076,7 @@ int main(int argc, char** argv) {
     const int64_t now_done = cue::now_us();
     ++frames;
     // 重组段：首片到达 → 整帧完成。这是 probe 自己能测的"重组开销"。
-    fs.reassembly_us.push(std::max<int64_t>(0, now_done - fa.first_seen_us));
+    fs.reassembly_us.push(std::max<int64_t>(0, now_done - fa.first_seen_us), cue::now_us());
     if (!have_completed || fid > max_completed) max_completed = fid;
     have_completed = true;
     settle(win, fa);
@@ -1352,7 +1372,7 @@ int main(int argc, char** argv) {
     if (n < static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) continue;
     ++packets;
     if (recv_us_sample >= 0) {
-      fs.recv_us.push(recv_us_sample);
+      fs.recv_us.push(recv_us_sample, cue::now_us());
     } else {
       ++fs.recv_ts_missing;
     }
