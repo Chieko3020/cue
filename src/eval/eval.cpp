@@ -1371,11 +1371,15 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   ctx.allowed_dangerous = {"inject_fault"};
   auto call = [&reg, &ctx](const char* name, const json& args, std::string& fail) -> bool {
     const auto gr = reg.call_guarded(name, args, ctx);
-    // Executed 只表示 handler 跑完了；handler 内部失败（set_param 返回 false）也在
-    // result.ok=false 里。两者都要当失败，否则回放参数不符会被「继续往下跑」掩盖。
-    if (gr.status == tool::GuardedCall::Status::Executed && gr.result.ok) return true;
-    fail = std::string(name) + ": " +
-           (gr.error.empty() ? gr.result.content : gr.error);
+    // Executed 表示 handler 跑完了；但 handler 内部失败（set_param 返回 false）会体现在
+    // outcome 的 error 侧。两者都要当失败，否则回放参数不符会被「继续往下跑」掩盖。
+    if (gr.status == tool::GuardedCall::Status::Executed) return true;
+    // 失败时带上分类：录制回放的报错里能看出是参数不符（argument）还是后端拒绝（sandbox）。
+    fail = std::string(name) + "(" +
+           tool::tool_error_kind_name(gr.outcome ? tool::ToolError::Kind::Execution
+                                                 : gr.outcome.error().kind) +
+           "): " +
+           (gr.outcome ? std::string("<no detail>") : gr.outcome.error().message);
     return false;
   };
 
@@ -1431,7 +1435,8 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   // 观测：真调 query_metrics（content 是 "metrics={...}" 原文）
   const auto q = reg.call("query_metrics", json::object());
   if (!q) {
-    o.error_kind = "observe_failed: " + q.error();
+    o.error_kind = std::string("observe_failed: ") + tool::tool_error_kind_name(q.error().kind) +
+                   " / " + q.error().message;
     return o;
   }
   // 假 agent 的证据 = 从这次真实观测里逐字摘抄 case 声明的候选指标（不编造、不改写）

@@ -297,7 +297,7 @@ struct ToolState {
               ++metrics_calls;
               json m{{"p50_ms", 31.2}, {"p95_ms", 58.9}, {"p99_ms", 181.4}, {"drop_rate", 0.0},
                      {"queue_depth", 3}, {"nack_retransmit", 42}};
-              return tool::ToolResult{true, "metrics=" + m.dump(), m};
+              return tool::ToolResult{"metrics=" + m.dump(), m};
             });
 
     reg.add(tool::ToolSpec{.name = "pipeline_set_param",
@@ -321,7 +321,7 @@ struct ToolState {
                                        .max = 0}}},
             [this](const json& a) {
               ++set_param_calls;
-              return tool::ToolResult{true, "ok", a};
+              return tool::ToolResult{"ok", a};
             });
 
     reg.add(tool::ToolSpec{.name = "inject_fault",
@@ -345,7 +345,7 @@ struct ToolState {
                                        .max = 100}}},
             [this](const json& a) {
               ++inject_calls;
-              return tool::ToolResult{true, "injected", a};
+              return tool::ToolResult{"injected", a};
             });
 
     reg.add(tool::ToolSpec{.name = "fetch_observation",
@@ -368,7 +368,7 @@ struct ToolState {
                                        .min = 1,
                                        .max = 200}}},
             [](const json& a) {
-              return tool::ToolResult{true, "observation", json{{"source", a["source"]}}};
+              return tool::ToolResult{"observation", json{{"source", a["source"]}}};
             });
   }
 };

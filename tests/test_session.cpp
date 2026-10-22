@@ -87,7 +87,7 @@ struct MockTools {
                                        .has_range = false}}},
             [](const json&) {
               json m{{"p99_ms", 181.4}, {"nack_retransmit", 42}};
-              return tool::ToolResult{true, "metrics=" + m.dump(), m};
+              return tool::ToolResult{"metrics=" + m.dump(), m};
             });
     reg.add(tool::ToolSpec{.name = "pipeline_set_param",
                            .desc = "改参数",
@@ -108,7 +108,7 @@ struct MockTools {
                                        .has_range = false,
                                        .min = 0,
                                        .max = 0}}},
-            [](const json& a) { return tool::ToolResult{true, "ok", a}; });
+            [](const json& a) { return tool::ToolResult{"ok", a}; });
   }
 };
 

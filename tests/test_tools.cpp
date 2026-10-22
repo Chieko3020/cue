@@ -125,7 +125,7 @@ int main() {
     pipeline::add_lifecycle_tools(r, p);
 
     const auto res = r.call("pipeline_start", json{{"profile", "std-1500k"}});
-    check(res.has_value() && res->ok, "pipeline_start(profile=std-1500k) 成功");
+    check(res.has_value(), "pipeline_start(profile=std-1500k) 成功");
     check(p.starts == 1, "pipeline_start 真的启动了管线");
     check(has_value(p.set_calls, "transcode=on") && has_value(p.set_calls, "bitrate_kbps=1500") &&
               has_value(p.set_calls, "fps=30") && has_value(p.set_calls, "gop=60") &&
@@ -149,9 +149,14 @@ int main() {
     // profile 失败必须如实报失败（不能因为 start 成功就整体报成功）
     p.reject_key = "bitrate_kbps";
     const auto res4 = r.call("pipeline_restart", json{{"profile", "high-4000k"}});
-    check(res4.has_value() && !res4->ok, "profile 某一步被拒 → 工具返回失败");
-    check(res4.has_value() && res4->content.find("未生效") != std::string::npos,
+    check(!res4.has_value(), "profile 某一步被拒 → 工具返回失败");
+    check(!res4.has_value() &&
+              res4.error().message.find("未生效") != std::string::npos,
           "失败文本指明档位未生效");
+    // 档位应用失败属于"执行失败"（不是参数错，也不是沙箱拒绝）
+    check(!res4.has_value() &&
+              res4.error().kind == tool::ToolError::Kind::Execution,
+          "档位未生效分类为 Execution");
 
     // pipeline_stop 没有 profile 参数（否则就是个"看起来能改、实际不动"的旋钮）
     const auto* stop = r.find_spec("pipeline_stop");
@@ -189,6 +194,31 @@ int main() {
     check(has_value(p.faults, "jitter=25.000000"), "jitter 注入透传到后端");
     check(!r.call("inject_fault", json{{"kind", "latency"}, {"value", 1}}).has_value(),
           "未知 kind 在 schema 层就被拒");
+  }
+
+  // ---------- 7b) run_shell 的失败分类（FR-TOOL.8 的核心价值） ----------
+  // 三类失败在模型看来该做的事完全不同，分类错了就会陷进重试死循环。
+  {
+    FakePipeline p;
+    tool::Registry r;
+    pipeline::build_real_tools(r, p, nullptr);
+
+    // 白名单外的命令 → Sandbox：换命令，重试同一命令没用
+    const auto denied = r.call("run_shell", json{{"cmd", "rm"}, {"args", json::array()}});
+    check(!denied.has_value(), "白名单外的命令被拒");
+    check(!denied.has_value() && denied.error().kind == tool::ToolError::Kind::Sandbox,
+          "白名单拒绝分类为 Sandbox（不是 Execution）");
+
+    // Timeout 分类无法在这套沙箱里端到端复现，如实说明而不硬造：
+    // ① timeout_ms 的 schema 范围是 [200, 30000]，1 ms 在参数层就被拒（Argument）；
+    // ② 白名单的 25 个命令全是只读诊断（cat/ls/ps/df/ss…），都在 200 ms 内跑完——
+    //    这正是当初选它们做白名单的原因，不该为了测试往生产实现里塞慢命令。
+    // 所以 Timeout 只有代码路径（tools.cpp 的 sr.timed_out 分支），没有实测断言。
+    const auto too_small =
+        r.call("run_shell", json{{"cmd", "ps"}, {"args", json::array()}, {"timeout_ms", 1}});
+    check(!too_small.has_value() &&
+              too_small.error().kind == tool::ToolError::Kind::Argument,
+          "超时参数越界分类为 Argument（schema 层拦下，不是 Timeout）");
   }
 
   // ---------- 6) 写白名单只影响 Auto；空列表 = 全部放行（旧行为不变） ----------

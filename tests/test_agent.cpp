@@ -59,7 +59,7 @@ struct MockTools {
           ++metrics_calls;
           json m{{"p50_ms", 31.2}, {"p95_ms", 58.9}, {"p99_ms", 181.4}, {"drop_rate", 0.0},
                  {"queue_depth", 3}};
-          return tool::ToolResult{true, "metrics=" + m.dump(), m};
+          return tool::ToolResult{"metrics=" + m.dump(), m};
         });
 
     reg.add(
@@ -82,7 +82,7 @@ struct MockTools {
         [this](const json& a) {
           ++set_param_calls;
           last_set = a;
-          return tool::ToolResult{true, "ok", a};
+          return tool::ToolResult{"ok", a};
         });
 
     reg.add(
@@ -104,7 +104,7 @@ struct MockTools {
                                    .max = 0}}},
         [this](const json& a) {
           ++inject_calls;
-          return tool::ToolResult{true, "injected", a};
+          return tool::ToolResult{"injected", a};
         });
 
     reg.add(tool::ToolSpec{.name = "fetch_observation",
@@ -116,7 +116,7 @@ struct MockTools {
                                        .required = true,
                                        .enum_values = {"logs", "procs", "frames"}}}},
             [](const json& a) {
-              return tool::ToolResult{true, "observation", json{{"source", a["source"]}}};
+              return tool::ToolResult{"observation", json{{"source", a["source"]}}};
             });
   }
 };
@@ -492,8 +492,28 @@ int main() {
     mocks.build(reg);
 
     const auto r1 = reg.call("pipeline_set_param", json{{"key", "gop"}, {"value", "30"}, {"bogus", 1}});
-    check(!r1.has_value() && r1.error().find("unknown param") != std::string::npos,
+    check(!r1.has_value() && r1.error().message.find("unknown param") != std::string::npos,
           "case14 unknown param rejected");
+    // FR-TOOL.8：错误分类要可区分——参数错必须标成 Argument（模型据此改参数，而不是换工具）
+    check(!r1.has_value() && r1.error().kind == cue::tool::ToolError::Kind::Argument,
+          "case14 参数错误分类为 Argument");
+
+    // 未知工具是引擎侧问题（注册表与 schema 不一致），不是模型能修的 → Internal
+    const auto r_unknown = reg.call("no_such_tool", json::object());
+    check(!r_unknown.has_value() &&
+              r_unknown.error().kind == cue::tool::ToolError::Kind::Internal,
+          "未知工具分类为 Internal");
+    // 审批拒绝单独一类：模型该去申请审批，不该改参数重试
+    {
+      cue::tool::CallContext dctx;
+      dctx.mode = cue::tool::ApprovalMode::Deny;
+      const auto denied = reg.call_guarded("pipeline_set_param",
+                                           json{{"key", "gop"}, {"value", "30"}}, dctx);
+      check(denied.status == cue::tool::GuardedCall::Status::ApprovalDenied &&
+                !denied.outcome &&
+                denied.outcome.error().kind == cue::tool::ToolError::Kind::ApprovalDenied,
+            "审批拒绝分类为 ApprovalDenied 且带申请审批提示");
+    }
     check(reg.call("query_metrics", json{{"window_ms", 5000.0}}).has_value(),
           "case14 integer accepts 5000.0");
     check(!reg.call("query_metrics", json{{"window_ms", 1.5}}).has_value(),

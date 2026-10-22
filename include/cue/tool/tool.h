@@ -64,21 +64,46 @@ struct ToolSpec {
 };
 
 struct ToolResult {
-  bool ok = true;
   std::string content;  // 回灌给模型的文本（预聚合、可读）
   json data = json::object();
 };
 
-using ToolHandler = std::function<ToolResult(const json& args)>;
+// 工具失败的原因（FR-TOOL.8：错误分类可区分）。
+//
+// 为什么不用裸字符串：模型看到笼统的 "failed" 只能猜下一步——
+// 改参数？换个方法？还是这条路根本不通？分类要能**直接指导动作**，
+// 所以按「接下来该做什么」分，而不是按异常类型分：
+//   Argument        → 改参数重试（少给一个字段、值域超了）
+//   Execution       → 换方法或换参数（命令失败、取不到数据）
+//   Timeout         → 缩小范围或放弃（不是参数错）
+//   Sandbox         → 换命令（被白名单/landlock 拒了，重试同一命令没用）
+//   ApprovalDenied  → 去申请审批，**不要重试**（这是最容易做错的一类：
+//                     把它当普通错误重试，模型会陷进死循环）
+//   Internal        → 引擎自身问题，模型做什么都没用
+struct ToolError {
+  enum class Kind { Argument, Execution, Timeout, Sandbox, ApprovalDenied, Internal };
+  Kind kind = Kind::Execution;
+  std::string message;
+  // 执行事实（退出码 / 耗时 / 是否超时）。失败时这些同样重要：
+  // run_shell 超时与"命令不存在"都算失败，但模型该做的事完全不同。
+  json data = json::object();
+};
 
-// 受策略保护的一次调用结果：必须能区分「审批拒绝」「参数/执行失败」「成功」，
-// 否则调用方只能把拒绝当错误回灌，模型看不到"去申请审批"这个信息。
+// 稳定名字（进事件流与报告，别在别处再写一遍 switch）
+const char* tool_error_kind_name(ToolError::Kind k);
+
+using ToolOutcome = std::expected<ToolResult, ToolError>;
+using ToolHandler = std::function<ToolOutcome(const json& args)>;
+
+// 受策略保护的一次调用结果。
+// status 与 outcome 并存而不是二选一：审批拒绝时 outcome 也是 error，
+// 但调用方通常更关心「这次到底执行了没有」——审计与阶段守卫都按 executed 判断，
+// 不该让它们各自去 outcome.error().kind 里翻找。
 struct GuardedCall {
   enum class Status { Executed, ApprovalDenied, Failed };
   Status status = Status::Failed;
   Risk risk = Risk::Dangerous;
-  ToolResult result;
-  std::string error;
+  ToolOutcome outcome;   // 成功 = ToolResult；失败 = ToolError（kind 区分原因）
 };
 
 class Registry {
@@ -91,7 +116,7 @@ class Registry {
   // 三层校验：JSON 类型 → 枚举/范围 → 语义（由 handler 自行检查）。
   // 注意：本方法不做风险/审批判断，仅供已知安全的调用点（内部/单测）使用；
   // 面向模型或外部入口一律用 call_guarded。
-  std::expected<ToolResult, std::string> call(const std::string& name, const json& args) const;
+  ToolOutcome call(const std::string& name, const json& args) const;
 
   // 风险策略的唯一实现处（SPEC §7.4：dangerous 必须显式授权）：
   //   Deny → 拒一切非只读；Auto → 只放行 allowed_dangerous 内的 dangerous；

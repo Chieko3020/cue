@@ -517,48 +517,61 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       });
       const int64_t tool_us = now_us() - t_tool;
 
+      // GuardedCall 的构造保证：Executed ⇔ outcome 有值，其余 ⇔ outcome 是 error。
+      // 所以这里按 status 取对应那一侧，不做二次判断。
+      const std::string err_text = g.outcome ? std::string() : g.outcome.error().message;
+      const auto err_kind =
+          g.outcome ? tool::ToolError::Kind::Execution : g.outcome.error().kind;
+      const tool::ToolResult* ok_res = g.outcome ? &*g.outcome : nullptr;
+
       if (g.status == tool::GuardedCall::Status::ApprovalDenied) {
         write([&](SessionLog& s) {
-          return s.write_tool(tc.name, args, false, g.error, tool_us, /*approval_denied=*/true,
+          return s.write_tool(tc.name, args, false, err_text, tool_us, /*approval_denied=*/true,
                               tool::risk_name(g.risk), r.turns);
         });
         emit("approval.denied", {{"tool", tc.name}, {"risk", tool::risk_name(g.risk)}});
-        push(tool_msg(g.error, tc.id, tc.name));
+        push(tool_msg(err_text, tc.id, tc.name));
         continue;
       }
       if (g.status == tool::GuardedCall::Status::Failed) {
         write([&](SessionLog& s) {
-          return s.write_tool(tc.name, args, false, g.error, tool_us, /*approval_denied=*/false,
+          return s.write_tool(tc.name, args, false, err_text, tool_us, /*approval_denied=*/false,
                               tool::risk_name(g.risk), r.turns);
         });
-        emit("tool.error", {{"tool", tc.name}, {"error", g.error}});
-        push(tool_msg("错误：" + g.error, tc.id, tc.name));
+        // 分类要进事件与回灌文本：模型看到 "execution" 会改参数，
+        // 看到 "sandbox" 才知道该换命令，看到 "timeout" 会缩小范围。
+        emit("tool.error", {{"tool", tc.name},
+                            {"error", err_text},
+                            {"kind", tool::tool_error_kind_name(err_kind)}});
+        push(tool_msg(std::string("错误（") + tool::tool_error_kind_name(err_kind) + "）：" +
+                          err_text,
+                      tc.id, tc.name));
         continue;
       }
 
       write([&](SessionLog& s) {
-        return s.write_tool(tc.name, args, g.result.ok, g.result.content, tool_us,
+        return s.write_tool(tc.name, args, true, ok_res->content, tool_us,
                             /*approval_denied=*/false, tool::risk_name(g.risk), r.turns);
       });
-      emit("tool.result", {{"tool", tc.name}, {"ok", g.result.ok}, {"data", g.result.data}});
+      emit("tool.result", {{"tool", tc.name}, {"ok", true}, {"data", ok_res->data}});
       // 失败的观测不算观测（cued 未收到流时 query_metrics 返回 ok=false）
-      if (tools_.is_observation_tool(tc.name) && g.result.ok) {
+      if (tools_.is_observation_tool(tc.name)) {
         used_observe = true;
         // 观测快照单独落盘：判分要校验"证据在真实观测里存在"，而对话里的 tool 消息
         // 可能被上下文裁剪或截断，不能当审计真值。
         ObservationRecord ob;
         ob.tool = tc.name;
         ob.args = args;
-        ob.text = g.result.content;
-        ob.data = g.result.data;
+        ob.text = ok_res->content;
+        ob.data = ok_res->data;
         ob.turn = r.turns;
         write([&](SessionLog& s) { return s.write_observation(ob); });
       }
       // 「修复动作」= 任何非只读工具成功：dangerous（如 inject_fault）同样是改状态，
       // 只算 Mutating 会让「靠取消注入完成修复」的合理轨迹被守卫永远卡在 repair。
-      if (g.risk != tool::Risk::ReadOnly && g.result.ok) used_mutating = true;
+      if (g.risk != tool::Risk::ReadOnly) used_mutating = true;
 
-      push(tool_msg(g.result.content, tc.id, tc.name));
+      push(tool_msg(ok_res->content, tc.id, tc.name));
     }
 
     // 守卫标志可能在同一轮里变化（第一次成功观测 / 第一次写操作）：立刻落盘，

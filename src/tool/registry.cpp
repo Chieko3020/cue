@@ -114,15 +114,32 @@ json Registry::schema() const {
   return tools;
 }
 
-std::expected<ToolResult, std::string> Registry::call(const std::string& name, const json& args) const {
+const char* tool_error_kind_name(ToolError::Kind k) {
+  switch (k) {
+    case ToolError::Kind::Argument: return "argument";
+    case ToolError::Kind::Execution: return "execution";
+    case ToolError::Kind::Timeout: return "timeout";
+    case ToolError::Kind::Sandbox: return "sandbox";
+    case ToolError::Kind::ApprovalDenied: return "approval_denied";
+    case ToolError::Kind::Internal: return "internal";
+  }
+  return "internal";  // 不可达：加新 Kind 时这里会被 -Werror 的 switch 检查提醒
+}
+
+ToolOutcome Registry::call(const std::string& name, const json& args) const {
   auto it = tools_.find(name);
-  if (it == tools_.end()) return std::unexpected("unknown tool: " + name);
+  // 未知工具是**调用方的**编程错误，不是模型能修的：模型只会照着 schema 生成名字，
+  // 走到这里说明引擎侧的注册表与 schema 不一致 → Internal。
+  if (it == tools_.end()) return std::unexpected(ToolError{ToolError::Kind::Internal, "unknown tool: " + name});
   auto v = validate_args(it->second.spec, args);
-  if (!v) return std::unexpected(v.error());
+  // 参数校验失败是模型最可能犯、也最容易自修的一类：必须明确标成 Argument，
+  // 它据此才知道"改参数重试"而不是"换个工具"。
+  if (!v) return std::unexpected(ToolError{ToolError::Kind::Argument, v.error()});
   try {
     return it->second.handler(args);
   } catch (const std::exception& e) {
-    return std::unexpected(std::string("tool threw: ") + e.what());
+    // 工具实现自己抛异常 = 引擎缺陷或未预期的环境问题，不是模型能处理的。
+    return std::unexpected(ToolError{ToolError::Kind::Internal, std::string("tool threw: ") + e.what()});
   }
 }
 
@@ -168,19 +185,17 @@ GuardedCall Registry::call_guarded(const std::string& name, const json& args, co
 
   if (!approved) {
     out.status = GuardedCall::Status::ApprovalDenied;
-    out.error = std::string("被拒绝（") + risk_name(out.risk) + "）";
+    // 文案要能直接指导模型：它看到"被拒绝"时唯一正确的动作是去申请审批，
+    // 而不是改参数重试（那样会陷进死循环）。
+    out.outcome = std::unexpected(ToolError{ToolError::Kind::ApprovalDenied,
+                                           std::string("被拒绝（") + risk_name(out.risk) +
+                                               "）；如确需执行，请先申请审批，不要改参数重试"});
     return out;
   }
 
   if (on_approved) on_approved(out.risk);
-  auto res = call(name, args);
-  if (!res) {
-    out.status = GuardedCall::Status::Failed;
-    out.error = res.error();
-    return out;
-  }
-  out.status = GuardedCall::Status::Executed;
-  out.result = std::move(*res);
+  out.outcome = call(name, args);
+  out.status = out.outcome ? GuardedCall::Status::Executed : GuardedCall::Status::Failed;
   return out;
 }
 

@@ -106,21 +106,23 @@ void add_probe_metrics(json& j, const ProbeMetrics& p) {
 namespace {
 
 // 统一的留痕包装：工具 handler 返回前把结果记进 trace（失败也要记，证据校验只认真实观测）
-tool::ToolResult record(std::vector<ToolTrace>* trace, const char* name, tool::ToolResult r) {
-  if (trace) trace->push_back(ToolTrace{name, r.content, r.data});
+// 成功才记 trace：失败由 expected 的 error 承载，没有 content/data 可记
+// （data 在 error 里，见 ToolError::data）。
+tool::ToolOutcome record(std::vector<ToolTrace>* trace, const char* name, tool::ToolOutcome r) {
+  if (trace && r) trace->push_back(ToolTrace{name, r->content, r->data});
   return r;
 }
 
 // 动作类工具的返回：动作写进 text，data 只带动作之后重新测到的指标
-tool::ToolResult action_result(std::vector<ToolTrace>* trace, const char* name, const std::string& text,
+tool::ToolOutcome action_result(std::vector<ToolTrace>* trace, const char* name, const std::string& text,
                                IServicePipeline& pipe) {
   const auto m = pipe.latest();
   if (m.samples == 0) {
     return record(trace, name,
-                  tool::ToolResult{true, text + "（暂无媒体流采样）", json{{"samples", 0}}});
+                  tool::ToolResult{text + "（暂无媒体流采样）", json{{"samples", 0}}});
   }
   auto j = metrics_json(m, now_us());
-  return record(trace, name, tool::ToolResult{true, text + " 最新观测: " + j.dump(), j});
+  return record(trace, name, tool::ToolResult{text + " 最新观测: " + j.dump(), j});
 }
 
 // ---------------------------------------------------------------- run_shell 审计
@@ -221,7 +223,7 @@ sandbox::Backend resolve_backend(const std::string& name) {
 
 // run_shell 的完整语义：校验参数 → 白名单 → 沙箱执行（landlock/docker + 降权）→ 审计
 // （含拒绝）→ 回灌文本。
-tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
+tool::ToolOutcome run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
                                 const RealToolsOptions& opts) {
   const std::string cmd = a.at("cmd").get<std::string>();
   const json raw_args = a.contains("args") ? a["args"] : json::array();
@@ -372,7 +374,16 @@ tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
             {"timed_out", sr.timed_out},
             {"cancelled", sr.cancelled},
             {"degraded", sr.degraded}};
-  return record(trace, "run_shell", tool::ToolResult{ok, text, data});
+  if (ok) return record(trace, "run_shell", tool::ToolResult{text, data});
+  // 失败分三类，模型该做的事完全不同：
+  //   白名单/landlock 拒绝 → 换命令（重试同一命令没用）
+  //   超时               → 缩小范围或放弃
+  //   非零退出/被信号杀   → 看 stderr 改参数
+  const auto kind = sr.timed_out ? tool::ToolError::Kind::Timeout
+                    : !sr.ran    ? tool::ToolError::Kind::Sandbox
+                                 : tool::ToolError::Kind::Execution;
+  return record(trace, "run_shell",
+                std::unexpected(tool::ToolError{kind, text, data}));
 }
 
 // ---------------------------------------------------------------- lifecycle 档位
@@ -514,8 +525,9 @@ void add_lifecycle_tools(tool::Registry& reg, IServicePipeline& pipe,
               std::string err;
               if (!pipe.start(err)) {
                 return record(trace, "pipeline_start",
-                              tool::ToolResult{false, "启动失败: " + err,
-                                               json{{"running", false}}});
+                              std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution,
+                                                              "启动失败: " + err,
+                                                              json{{"running", false}}}));
               }
             }
             std::string note = was_running ? "管线已在运行" : "管线已启动";
@@ -526,14 +538,15 @@ void add_lifecycle_tools(tool::Registry& reg, IServicePipeline& pipe,
               if (!apply_profile(pipe, profile, applied, perr)) {
                 // 启动成功但档位失败：必须如实分开说，不能因为 start 成功就报整体成功
                 return record(trace, "pipeline_start",
-                              tool::ToolResult{false, note + "，但 profile 未生效: " + perr,
-                                               data});
+                              std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution,
+                                                              note + "，但 profile 未生效: " + perr,
+                                                              data}));
               }
               note += "；profile=" + profile + " → " + applied;
               data["profile"] = profile;
             }
             return record(trace, "pipeline_start",
-                          tool::ToolResult{true, note, std::move(data)});
+                          tool::ToolResult{note, std::move(data)});
           });
 
   reg.add(tool::ToolSpec{.name = "pipeline_stop",
@@ -545,7 +558,7 @@ void add_lifecycle_tools(tool::Registry& reg, IServicePipeline& pipe,
           [&pipe, trace](const json&) {
             pipe.stop();
             return record(trace, "pipeline_stop",
-                          tool::ToolResult{true, "管线已停止", json{{"running", false}}});
+                          tool::ToolResult{"管线已停止", json{{"running", false}}});
           });
 
   reg.add(tool::ToolSpec{.name = "pipeline_restart",
@@ -557,8 +570,9 @@ void add_lifecycle_tools(tool::Registry& reg, IServicePipeline& pipe,
             std::string err;
             if (!pipe.start(err)) {
               return record(trace, "pipeline_restart",
-                            tool::ToolResult{false, "重启失败: " + err,
-                                             json{{"running", false}}});
+                            std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution,
+                                                            "重启失败: " + err,
+                                                            json{{"running", false}}}));
             }
             std::string note = "管线已重启";
             json data{{"running", true}};
@@ -569,13 +583,14 @@ void add_lifecycle_tools(tool::Registry& reg, IServicePipeline& pipe,
               std::string perr;
               if (!apply_profile(pipe, profile, applied, perr)) {
                 return record(trace, "pipeline_restart",
-                              tool::ToolResult{false, note + "，但 profile 未生效: " + perr,
-                                               data});
+                              std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution,
+                                                              note + "，但 profile 未生效: " + perr,
+                                                              data}));
               }
               note += "；profile=" + profile + " → " + applied;
               data["profile"] = profile;
             }
-            return record(trace, "pipeline_restart", tool::ToolResult{true, note, std::move(data)});
+            return record(trace, "pipeline_restart", tool::ToolResult{note, std::move(data)});
           });
 }
 
@@ -604,11 +619,11 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
               std::string why = "尚无采样（cued 未收到媒体流）";
               if (!qerr.empty()) why += "；主动查询：" + qerr;
               return record(trace, "query_metrics",
-                            tool::ToolResult{false, why, json::object()});
+                            std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution, why, json::object()}));
             }
             json j = metrics_json(m, now_us());
             add_probe_metrics(j, pipe.probe_latest());
-            return record(trace, "query_metrics", tool::ToolResult{true, "metrics=" + j.dump(), j});
+            return record(trace, "query_metrics", tool::ToolResult{"metrics=" + j.dump(), j});
           });
 
   reg.add(tool::ToolSpec{.name = "pipeline_set_param",
@@ -635,7 +650,7 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
             const std::string v = a["value"].get<std::string>();
             if (!pipe.set_param(k, v, err)) {
               return record(trace, "pipeline_set_param",
-                            tool::ToolResult{false, "设置失败: " + err, json::object()});
+                            std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution, "设置失败: " + err, json::object()}));
             }
             return action_result(trace, "pipeline_set_param",
                                  "已设置 " + k + "=" + v + "（运行期生效，未重启 cued）", pipe);
@@ -675,7 +690,7 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
             const std::string k = a["kind"].get<std::string>();
             const double v = a["value"].get<double>();
             if (!pipe.inject_fault(k, v, err)) {
-              return record(trace, "inject_fault", tool::ToolResult{false, "注入失败: " + err, json::object()});
+              return record(trace, "inject_fault", std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution, "注入失败: " + err, json::object()}));
             }
             if (v <= 0.0) {
               return action_result(trace, "inject_fault", "已清除全部注入（kind=" + k + "）", pipe);
@@ -705,10 +720,10 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
             const std::string src = a["source"].get<std::string>();
             const int tail = a.contains("tail") ? a["tail"].get<int>() : 20;
             const std::string obs = pipe.observation(src, tail, err);
-            if (!err.empty()) return record(trace, "fetch_observation", tool::ToolResult{false, err, json::object()});
+            if (!err.empty()) return record(trace, "fetch_observation", std::unexpected(tool::ToolError{tool::ToolError::Kind::Execution, err, json::object()}));
             // data 只带真实读数；source 是请求参数，放 text 里就够
             return record(trace, "fetch_observation",
-                          tool::ToolResult{true, obs, json::object()});
+                          tool::ToolResult{obs, json::object()});
           });
 
   // 第 5 个工具：只读诊断命令。risk=Dangerous 是**审批**口径（要显式授权），

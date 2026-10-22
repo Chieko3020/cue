@@ -284,22 +284,25 @@ class ConsoleApp {
                  {"status", "executed"},
                  {"tool", tool_name},
                  {"risk", tool::risk_name(gr.risk)},
-                 {"content", gr.result.content},
-                 {"data", gr.result.data}};
+                 {"content", gr.outcome->content},
+                 {"data", gr.outcome->data}};
         break;
       case tool::GuardedCall::Status::ApprovalDenied:
         reply = {{"ok", false},
                  {"status", "denied"},
                  {"tool", tool_name},
                  {"risk", tool::risk_name(gr.risk)},
-                 {"error", gr.error}};
+                 {"error_kind", tool::tool_error_kind_name(gr.outcome.error().kind)},
+                 {"error", gr.outcome.error().message}};
         break;
       case tool::GuardedCall::Status::Failed:
         reply = {{"ok", false},
                  {"status", "failed"},
                  {"tool", tool_name},
                  {"risk", tool::risk_name(gr.risk)},
-                 {"error", gr.error}};
+                 {"error_kind", tool::tool_error_kind_name(gr.outcome.error().kind)},
+                 {"error", gr.outcome.error().message},
+                 {"data", gr.outcome.error().data}};
         break;
     }
     const std::string status = reply["status"].get<std::string>();
