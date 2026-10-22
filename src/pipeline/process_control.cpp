@@ -81,6 +81,14 @@ void apply_encoder_params_json(const nlohmann::json& p, PipelineEndpoint& cfg) {
   if (p.contains("preset") && p["preset"].is_string()) {
     cfg.preset = p["preset"].get<std::string>();
   }
+  // fec_group/aimd 不是编码参数，但同样是「运行期真值」：镜像进 cfg_ 之后，
+  // cued 崩溃被监督线程重启时会带着用户最后设定的值，而不是回到启动默认。
+  if (p.contains("fec_group") && p["fec_group"].is_number_integer()) {
+    cfg.fec_group = p["fec_group"].get<int>();
+  }
+  if (p.contains("aimd") && p["aimd"].is_string()) {
+    cfg.aimd = p["aimd"].get<std::string>() == "on";
+  }
 }
 
 std::string describe_status(int status) {
@@ -271,7 +279,9 @@ bool ProcessPipelineControl::connect_control_locked(std::string& err) {
                   {"gop", cfg.gop},
                   {"preset", cfg.preset},
                   {"transcode", cfg.transcode ? "on" : "off"},
-                  {"fps", cfg.fps}};
+                  {"fps", cfg.fps},
+                  {"fec_group", cfg.fec_group},
+                  {"aimd", cfg.aimd ? "on" : "off"}};
         // width/height 只在成对有效时下发：单给一维本身非法，不该让整批失败。
         if (cfg.width > 0 && cfg.height > 0) {
           args["width"] = cfg.width;
@@ -408,6 +418,8 @@ bool ProcessPipelineControl::spawn_cued_locked(std::string& err) {
       "--inject-drop", std::to_string(cfg.inject_drop),
       "--inject-seed", std::to_string(cfg.inject_seed),
       "--fec", cfg.fec ? "on" : "off",
+      "--fec-group", std::to_string(cfg.fec_group),
+      "--aimd", cfg.aimd ? "on" : "off",
   };
   // 上行注入与发送排队只在开启时下传：不带这两个参数时 cued 的行为与 M2 完全一致
   if (cfg.inject_ingress_drop > 0.0) {

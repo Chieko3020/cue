@@ -49,6 +49,7 @@ extern "C" {
 #include "cue/common/clock.h"
 #include "cue/media/h264_decoder.h"
 #include "cue/media/jitter_buffer.h"
+#include "cue/proto/nack.h"
 #include "cue/proto/wire.h"
 
 namespace net = boost::asio;
@@ -95,6 +96,13 @@ bool parse_double(std::string_view s, double lo, double hi, double& out) {
   return true;
 }
 
+struct FecGroupState {
+  uint16_t offset = 0;
+  uint16_t member_count = 0;
+  std::vector<uint8_t> parity;
+  bool available = false;
+};
+
 struct FrameAcc {
   uint16_t count = 0;
   uint64_t pts_us = 0;
@@ -102,8 +110,9 @@ struct FrameAcc {
   uint8_t codec = cue::proto::kDownCodecUnspecified;
   uint16_t recv_parts = 0;  // 真正收到的分片数（FEC 恢复的不计，用于丢包率）
   std::vector<std::vector<uint8_t>> parts;
-  std::vector<uint8_t> parity;
-  bool fec_available = false;
+  // FEC 组（FR-PIPE.9）：key = group_index。一帧可以有多个组（每 N 个数据包一组），
+  // 旧的一帧一组格式只会产生一条（group_index=0，覆盖整帧）。
+  std::map<uint16_t, FecGroupState> fec_groups;
   bool nack_queued = false;
 };
 
@@ -163,27 +172,49 @@ struct ClockAlign {
   }
 };
 
-// 用 FEC 冗余包恢复缺失的那一片（仅当恰好缺 1 片）
-bool try_fec_recover(FrameAcc& fa, uint64_t& recovered) {
-  if (!fa.fec_available || fa.parity.empty()) return false;
-  int missing = -1;
-  int n_missing = 0;
-  for (uint16_t i = 0; i < fa.count; ++i) {
-    if (fa.parts[i].empty()) {
-      missing = i;
-      ++n_missing;
+// 逐组尝试 FEC 恢复：每组**恰好缺 1 片**时用 parity 补齐。返回本次恢复的片数。
+// 一组丢 2 片是欠定方程（XOR 只能解一个未知数），不能恢复——这由 fec_recover_one 判定。
+std::size_t try_fec_recover(FrameAcc& fa) {
+  std::size_t recovered = 0;
+  std::vector<uint8_t> rec;
+  for (auto& [gi, g] : fa.fec_groups) {
+    if (!g.available || g.parity.empty()) continue;
+    const std::size_t begin = g.offset;
+    const std::size_t end = std::min<std::size_t>(fa.count, begin + g.member_count);
+    if (end <= begin) continue;
+    const std::span<const std::vector<uint8_t>> members(fa.parts.data() + begin, end - begin);
+    std::size_t missing = 0;
+    if (!cue::proto::fec_recover_one(members, g.parity, missing, rec)) continue;
+    fa.parts[begin + missing] = rec;
+    ++recovered;
+  }
+  return recovered;
+}
+
+// 帧结算时的 FEC 账：哪些组有 FEC 覆盖（收到过 parity）、哪些组到最后仍有 ≥2 片缺失
+// （确定不可恢复）。只在帧完成或超时清理时调用一次，所以不会被重复计数。
+// 注意：由 NACK 补回后完成的帧不会进不可恢复统计——那时候它确实恢复了。
+struct FecSettle {
+  uint64_t groups_rx = 0;
+  uint64_t unrecoverable = 0;       // 组数
+  uint64_t unrecoverable_pkts = 0;  // 这些组里到底缺了几片
+};
+
+void settle_fec(FrameAcc& fa, FecSettle& out) {
+  for (const auto& [gi, g] : fa.fec_groups) {
+    if (!g.available) continue;
+    ++out.groups_rx;
+    const std::size_t begin = g.offset;
+    const std::size_t end = std::min<std::size_t>(fa.count, begin + g.member_count);
+    std::size_t missing = 0;
+    for (std::size_t i = begin; i < end; ++i) {
+      if (fa.parts[i].empty()) ++missing;
+    }
+    if (missing >= 2) {
+      ++out.unrecoverable;
+      out.unrecoverable_pkts += missing;
     }
   }
-  if (n_missing != 1) return false;
-  std::vector<uint8_t> rec = fa.parity;
-  for (uint16_t i = 0; i < fa.count; ++i) {
-    if (i == static_cast<uint16_t>(missing)) continue;
-    const auto& p = fa.parts[i];
-    for (std::size_t k = 0; k < p.size() && k < rec.size(); ++k) rec[k] ^= p[k];
-  }
-  fa.parts[missing] = std::move(rec);
-  ++recovered;
-  return true;
 }
 
 class LatencyRing {
@@ -521,11 +552,12 @@ bool parse_report_addrs(std::string_view spec, std::vector<TcpReporters::Addr>& 
 }
 
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, uint64_t& lost,
-                   LossWindow& win) {
+                   LossWindow& win, FecSettle& fec) {
   for (auto it = pending.begin(); it != pending.end();) {
     if (now_us - it->second.first_seen_us > 2'000'000) {
       ++lost;  // 超时未被完成即计丢失（不再依赖 pending.size()>256 这条死条件）
       settle(win, it->second);
+      settle_fec(it->second, fec);
       it = pending.erase(it);
     } else {
       ++it;
@@ -549,7 +581,9 @@ int main(int argc, char** argv) {
   uint16_t port = 9001;
   bool nack_enabled = true;
   long long nack_delay_ms = 15;
-  long long nack_interval_ms = 125;  // SPEC §7.2：限速 8 包/秒（旧默认 15 ms ≈ 66 包/秒）
+  // SPEC §7.2：NACK 限速 8 包/秒。默认间隔 125 ms 正好对应 8 包/秒；间隔更大只会更慢。
+  // 间隔小于 125 ms 时由 NackRateLimiter 夹到 8 包/秒的上限（这是协议上限，不是可选项）。
+  long long nack_interval_ms = 125;
   // 标称帧率只用于「卡顿阈值」的推断（阈值 = stall_factor × 1/fps），不是测量值。
   // 30 是这个项目的默认推流帧率（cued 的 --fps 默认 30）。
   long long nominal_fps = 30;
@@ -624,7 +658,10 @@ int main(int argc, char** argv) {
           "          [--nack-interval-ms 125] [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..3]\n"
-          "          [--report-addrs host:port[,host:port]]\n");
+          "          [--report-addrs host:port[,host:port]]\n"
+          "  --nack-interval-ms 只决定「多长时间尝试一次」；实际发送上限是 8 包/秒\n"
+          "  （SPEC §7.2），间隔 <125 ms 会被夹到该上限。冷却/单包探测不需要额外开关。\n"
+          "  feedback（type=0x06）每 200 ms 自动发一条，无需参数。\n");
       return 0;
     } else {
       std::fprintf(stderr, "[probe] 未知参数: %.*s\n", static_cast<int>(a.size()), a.data());
@@ -701,6 +738,12 @@ int main(int argc, char** argv) {
             {"port", port},
             {"bind", bind_host},
             {"nack", nack_enabled ? "on" : "off"},
+            {"nack_interval_ms", nack_interval_ms},
+            // 限速上限写进事件流：报告里说"8 包/秒"时这里能对得上，不必看命令行。
+            {"nack_rate_pkt_s", std::min(8.0, 1000.0 / double(std::max<long long>(nack_interval_ms, 1)))},
+            {"nack_cooldown_ms", 1000},
+            {"feedback", "on"},
+            {"feedback_interval_ms", 200},
             {"nominal_fps", nominal_fps},
             {"stall_threshold_us", stall_threshold_us},
             {"report_addrs", report_addrs.size()},
@@ -716,8 +759,14 @@ int main(int argc, char** argv) {
   FrameStats fs;
   // 抖动缓冲：插在重组之后、解码之前。组件不带线程，队列与时间都由本循环驱动。
   cue::media::JitterBuffer jb(jb_cfg);
-  uint64_t frames = 0, lost_frames = 0, bytes = 0, packets = 0, fec_recovered = 0, nack_sent = 0;
-  uint64_t rejected = 0, lat_invalid = 0, nack_pauses = 0, stats_reqs = 0;
+  uint64_t frames = 0, lost_frames = 0, bytes = 0, packets = 0;
+  uint64_t rejected = 0, lat_invalid = 0, stats_reqs = 0, fb_sent = 0;
+  // FEC 账（FR-PIPE.9）：恢复的片数、有 FEC 覆盖的组数、结算时仍缺 ≥2 片的组与片数。
+  // groups_rx 与 recovered/unrecoverable 一起构成「恢复率」的可执行分母：
+  //   rate = recovered / (recovered + unrecoverable_pkts)
+  // 只拿 recovered 一个数讲不了"到底有多少丢了没救回来"。
+  uint64_t fec_recovered = 0;
+  FecSettle fec_totals;
   uint32_t max_completed = 0;
   // max_completed 的初值是 0，直接用 `fid <= max_completed` 会把**第一帧**（frame_id=0）
   // 当成"已完成帧的迟到分片"丢掉。丢了 IDR 的代价是解码器拿不到 SPS/PPS，接下来整整
@@ -728,9 +777,18 @@ int main(int argc, char** argv) {
   int64_t t_last_peer_us = 0;
   uint32_t session_seen = 0;
   bool warned_clock = false;
-  int64_t last_nack_us = 0;
   const int64_t nack_interval_us = nack_interval_ms * 1000;
   const int64_t nack_delay_us = nack_delay_ms * 1000;
+  // NACK 策略（限速 + 冷却 + 单包探测）：纯决策对象，时钟由本循环喂。
+  // 速率由 --nack-interval-ms 推出来，但 NackRateLimiter 内部再夹一次 8 包/秒。
+  cue::proto::NackController::Config nack_cfg;
+  nack_cfg.packets_per_sec = 1000.0 / double(std::max<long long>(nack_interval_ms, 1));
+  cue::proto::NackController nack_ctl(nack_cfg);
+  int64_t last_nack_attempt_us = 0;
+  // 单包探测的目标（fid, frag）：发出去后等这一片回来；回来 = 探测成功 → 恢复常规。
+  bool nack_probe_pending = false;
+  uint32_t nack_probe_fid = 0;
+  uint16_t nack_probe_frag = 0;
   uint64_t frames_prev = 0;
   uint64_t decoded_prev = 0;
   int64_t t_last_report = cue::now_us();
@@ -744,12 +802,27 @@ int main(int argc, char** argv) {
   constexpr int64_t kStatsBurstGapUs = 20'000;
   int stats_burst_left = kStatsBurst;
   int64_t next_stats_us = 0;  // 首包到达后立刻问一次时钟
-  int64_t nack_pause_until = 0;  // 丢包率持续过高时暂停 NACK 的截止时刻（冷却 1 s）
   LossWindow win;
   double win_loss = 0.0;
-  int bad_windows = 0;
   bool warned_bad_frame = false;
   uint64_t bad_frame_events = 0;
+
+  // ---- feedback（技术设计 §4.2）：每 200 ms 一条，载荷 4 个 f32 ----
+  // RTT 复用时钟对齐的回环请求：除了 30 s 一次的 8 样本批，另外每秒发 1 个单发回环，
+  // 让 feedback 里的 rtt_ms 新鲜度 ≤1 s（30 s 批之间的旧值不能冒充"现在的 RTT"）。
+  // 这个单发回环**不参与** offset 估计，避免打乱"批内取最小 RTT"的口径。
+  int64_t next_fb_us = 0;
+  int64_t fb_bytes_prev = 0;
+  int64_t fb_t_prev = 0;
+  int64_t next_rtt_ping_us = 0;
+  int64_t rtt_ping_echo = 0;
+  int64_t last_rtt_us = -1;      // -1 = 从未测到（feedback 里写 -1，不写 0）
+  int64_t last_rtt_at_us = 0;
+  // 帧间抖动：相邻帧「传输时延」差的 EWMA（RFC 3550 的 1/16 平滑）。
+  // 帧间隔在相减时抵消，剩下的就是网络/调度抖动——正是抖动缓冲要吸收的量。
+  // -1 = 还没对齐时钟，没有可靠值。
+  double jitter_us = -1.0;
+  int64_t last_transit_us = -1;
 
   // 记录「数据报到达 → 被读出」的耗时：内核时间戳是 CLOCK_REALTIME，而延迟测量
   // 全用 CLOCK_MONOTONIC，所以在 recv 前后各取一对 (realtime, monotonic) 样本，
@@ -877,6 +950,13 @@ int main(int argc, char** argv) {
     const int64_t lat_us = now_rel + clk.offset_us - static_cast<int64_t>(jf.pts_us);
     if (clk.have && lat_plausible(lat_us)) {
       lat.push(lat_us);
+      // 抖动：相邻帧传输时延之差的 EWMA。帧间隔在相减中抵消，剩下的才是网络/调度抖动。
+      // 用单调时钟 + offset，与端到端延迟同一口径；时钟未对齐时保持 -1（不编数）。
+      if (last_transit_us >= 0) {
+        const double d = std::fabs(double(lat_us - last_transit_us));
+        jitter_us = jitter_us < 0.0 ? d : jitter_us + (d - jitter_us) / 16.0;
+      }
+      last_transit_us = lat_us;
     } else {
       ++lat_invalid;
       if (clk.have && !warned_clock) {
@@ -901,11 +981,39 @@ int main(int argc, char** argv) {
     for (const auto& jf : jb.poll(now)) deliver(jf);
   };
 
+  // 单包探测的判据：被探测的那一片真的回来了（原本到达或 FEC 恢复都算）。
+  // 只有这一片被补回才算成功——不能拿"任意帧完成"冒充探测成功。
+  auto mark_probe_if_recovered = [&](uint32_t fid) {
+    if (!nack_probe_pending || fid != nack_probe_fid) return;
+    const auto it = pending.find(fid);
+    if (it == pending.end()) return;
+    if (nack_probe_frag < it->second.parts.size() &&
+        !it->second.parts[nack_probe_frag].empty()) {
+      nack_probe_pending = false;
+      nack_ctl.on_probe_success();
+      emit("probe.nack_resume",
+           json{{"frame_id", fid},
+                {"frag_index", nack_probe_frag},
+                {"reason", "recovered"},
+                {"nack_sent", nack_ctl.sent()}});
+    }
+  };
+
   // 帧完成结算：所有分片到齐就计入帧数/重组分位/丢包窗口，然后**进抖动缓冲**。
   // 「收到多少帧」在这里结算（与旧口径一致）；「什么时候能交付」由抖动缓冲决定。
   auto finish_if_complete = [&](uint32_t fid, FrameAcc& fa) {
     for (const auto& pp : fa.parts) {
       if (pp.empty()) return false;
+    }
+    // 探测目标帧完整了 = 探测成功（可能在 FEC 包里被补齐，不一定经由数据包到达）。
+    if (nack_probe_pending && fid == nack_probe_fid) {
+      nack_probe_pending = false;
+      nack_ctl.on_probe_success();
+      emit("probe.nack_resume",
+           json{{"frame_id", fid},
+                {"frag_index", nack_probe_frag},
+                {"reason", "recovered"},
+                {"nack_sent", nack_ctl.sent()}});
     }
     const int64_t now_done = cue::now_us();
     ++frames;
@@ -914,6 +1022,7 @@ int main(int argc, char** argv) {
     if (!have_completed || fid > max_completed) max_completed = fid;
     have_completed = true;
     settle(win, fa);
+    settle_fec(fa, fec_totals);  // 完成的帧：组都齐了，只会累加 groups_rx
     cue::media::JitterFrame jf;
     jf.pts_us = fa.pts_us;
     jf.frame_id = fid;
@@ -945,6 +1054,40 @@ int main(int argc, char** argv) {
     ++stats_reqs;
   };
 
+  // feedback（技术设计 §4.2）：每 200 ms 一条 type=0x06。
+  // recv_bitrate_mbps 是「自从上一条 feedback 以来」的接收速率（200 ms 窗口），不是进程
+  // 平均值——AIMD 要的是**当前**链路状况。窗口太短（<50 ms，例如刚刚对端切换）时写 -1。
+  auto send_feedback = [&](int64_t now) {
+    if (!have_peer) return;
+    const double dt = fb_t_prev > 0 ? double(now - fb_t_prev) / 1e6 : 0.0;
+    double mbps = -1.0;
+    if (dt >= 0.05) {
+      mbps = double(bytes - static_cast<uint64_t>(fb_bytes_prev)) * 8.0 / dt / 1e6;
+    }
+    fb_bytes_prev = static_cast<int64_t>(bytes);
+    fb_t_prev = now;
+    const double jitter_ms = jitter_us >= 0.0 ? jitter_us / 1000.0 : -1.0;
+    // RTT 只在 **1 s 内** 有样本时才报：30 s 批之间隔得太久，旧值不能冒充"现在的 RTT"。
+    const double rtt_ms = (last_rtt_us >= 0 && last_rtt_at_us > 0 &&
+                           now - last_rtt_at_us <= 1'000'000)
+                              ? double(last_rtt_us) / 1000.0
+                              : -1.0;
+    cue::proto::FeedbackPayload f;
+    f.loss_rate = static_cast<float>(win_loss);
+    f.recv_bitrate_mbps = static_cast<float>(mbps);
+    f.jitter_ms = static_cast<float>(jitter_ms);
+    f.rtt_ms = static_cast<float>(rtt_ms);
+    cue::proto::DatagramHeader h;
+    h.type = static_cast<uint8_t>(cue::proto::DownType::Feedback);
+    h.session_id = session_seen;
+    const auto hdr = cue::proto::encode(h);
+    std::vector<uint8_t> pkt(hdr.begin(), hdr.end());
+    const auto body = cue::proto::encode(f);
+    pkt.insert(pkt.end(), body.begin(), body.end());
+    send_udp(pkt);
+    ++fb_sent;
+  };
+
   std::array<uint8_t, 4096> buf{};
   for (;;) {
     // ---- 周期任务放在循环顶部：FEC 分支 / 完全没包时都不会被跳过 ----
@@ -960,6 +1103,19 @@ int main(int argc, char** argv) {
       next_stats_us = stats_burst_left > 0 ? now_tick + kStatsBurstGapUs
                                            : now_tick + 30'000'000;
     }
+    // 1 Hz 单发回环：只为让 feedback 里的 rtt_ms 保持新鲜（≤1 s 前）。
+    // echo 用 now+1 µs，与同一拍可能发出的对齐批请求区分开（两个请求不共用回显值，
+    // 否则这一拍的回包会被当成 RTT 探测而漏喂一次 offset 估计）。
+    if (now_tick >= next_rtt_ping_us && have_peer) {
+      const int64_t echo = now_tick + 1;
+      send_stats_request(echo);
+      rtt_ping_echo = echo;
+      next_rtt_ping_us = now_tick + 1'000'000;
+    }
+    if (now_tick >= next_fb_us && have_peer) {
+      send_feedback(now_tick);
+      next_fb_us = now_tick + 200'000;
+    }
     if (!reporters.empty()) {
       // 连接推进放在周期任务里：pump 可能为跨机握手等上 200 ms，
       // 解码循环里做这件事会把收包节奏带歪。
@@ -968,41 +1124,53 @@ int main(int argc, char** argv) {
       }
     }
     if (now_tick - t_last_cleanup >= 500'000) {
-      cleanup_stale(pending, now_tick, lost_frames, win);
+      cleanup_stale(pending, now_tick, lost_frames, win, fec_totals);
       t_last_cleanup = now_tick;
     }
     if (now_tick - t_last_window >= 1'000'000) {
       win_loss = win.expected ? double(win.expected - win.received) / double(win.expected) : 0.0;
-      if (win.expected > 0 && win_loss > 0.10) {
-        ++bad_windows;
-        if (bad_windows >= 3) {
-          nack_pause_until = now_tick + 1'000'000;
-          bad_windows = 0;
-          ++nack_pauses;
-          std::fprintf(stderr, "[probe] loss=%.1f%% 连续 3 窗口 >10%%：暂停 NACK 1 s\n",
-                       win_loss * 100.0);
-        }
-      } else if (win.expected > 0) {
-        bad_windows = 0;
-      }
+      // NACK 策略的窗口：3 个连续 >10% 的窗口 → 暂停 + 冷却 1 s。
+      // 冷却中 observe_loss_window 不会重复累计坏窗口（否则永远出不来）。
+      // --nack off 时完全不推进策略：否则指标里会出现 paused/throttled，而实际上
+      // 一条 NACK 都没打算发——那会把"关了 NACK"读成"被限速了"。
+      if (nack_enabled) nack_ctl.observe_loss_window(win.expected, win.received, now_tick);
       win = LossWindow{};
       t_last_window = now_tick;
     }
     if (now_tick - t_last_report >= 1'000'000) {
+      // 先快照本窗口的 NACK 状态，再清零窗口计数：
+      //  - 清零必须发生在指标行这一拍，nack_sent 的每行增量才必然 ≤8（令牌桶只管
+      //    长期平均，窗口边界上可能凑出 9）；
+      //  - 但 mode 要按**刚结束的这一窗**来报：先清零再读，suppressed>0 的窗口会被
+      //    报成 normal（"这一秒被限速了"看不出来）。
+      const auto nack_mode = nack_ctl.mode(now_tick);
+      const uint64_t nack_sent_now = nack_ctl.sent();
+      const uint64_t nack_sup_now = nack_ctl.suppressed();
+      const uint64_t nack_pm_now = nack_ctl.paused_ms();
+      const uint64_t nack_pauses_now = nack_ctl.pauses();
+      nack_ctl.begin_window(now_tick);
       const double dt = double(now_tick - t_last_report) / 1e6;
       const uint64_t df = frames - frames_prev;
       const uint64_t dd = fs.decoded - decoded_prev;
       const double fps_rx = double(df) / dt;
       const double fps_dec = double(dd) / dt;
       std::printf(
-          "[probe] fps=%.1f frames=%llu lost=%llu pend=%zu pkts=%llu nack=%llu pause=%llu "
-          "fec_rec=%llu rej=%llu loss=%.1f%% MB=%.2f  ",
+          "[probe] fps=%.1f frames=%llu lost=%llu pend=%zu pkts=%llu nack=%llu sup=%llu "
+          "pm=%llums mode=%s pause=%llu fec_rec=%llu fec_unrec=%llu rej=%llu loss=%.1f%% "
+          "MB=%.2f fb=%llu  ",
           fps_rx, static_cast<unsigned long long>(frames),
           static_cast<unsigned long long>(lost_frames), pending.size(),
-          static_cast<unsigned long long>(packets), static_cast<unsigned long long>(nack_sent),
-          static_cast<unsigned long long>(nack_pauses), static_cast<unsigned long long>(fec_recovered),
+          static_cast<unsigned long long>(packets),
+          static_cast<unsigned long long>(nack_sent_now),
+          static_cast<unsigned long long>(nack_sup_now),
+          static_cast<unsigned long long>(nack_pm_now),
+          cue::proto::NackController::mode_name(nack_mode),
+          static_cast<unsigned long long>(nack_pauses_now),
+          static_cast<unsigned long long>(fec_recovered),
+          static_cast<unsigned long long>(fec_totals.unrecoverable),
           static_cast<unsigned long long>(rejected),
-          win_loss * 100.0, double(bytes) / (1024.0 * 1024.0));
+          win_loss * 100.0, double(bytes) / (1024.0 * 1024.0),
+          static_cast<unsigned long long>(fb_sent));
       std::printf(
           "dec=%.1ffps dec=%llu dec_err=%llu skip=%llu stall=%llu max_stall=%.1fms ",
           fps_dec, static_cast<unsigned long long>(fs.decoded),
@@ -1049,8 +1217,29 @@ int main(int argc, char** argv) {
           {"max_stall_us", fs.max_stall_us},
           {"stall_threshold_us", stall_threshold_us},
           {"lost", lost_frames},
-          {"nack", nack_sent},
+          {"nack", nack_sent_now},
+          // NACK 限速/冷却的可观测面（FR-PROBE.2）：被拦下的包数、累计暂停时长、
+          // 当前模式。mode 是字符串而不是枚举数字：报告里直接可读，不必查表。
+          {"nack_sent", nack_sent_now},
+          {"nack_suppressed", nack_sup_now},
+          {"nack_paused_ms", nack_pm_now},
+          {"nack_pauses", nack_pauses_now},
+          {"nack_mode", cue::proto::NackController::mode_name(nack_mode)},
+          // FEC（FR-PIPE.9）：recovered = 靠 XOR 补回的片数；unrecoverable = 结算时仍缺
+          // ≥2 片的**组数**，unrecoverable_pkts = 这些组一共缺了几片。
+          // 恢复率 = fec_recovered / (fec_recovered + fec_unrecoverable_pkts)。
           {"fec_rec", fec_recovered},
+          {"fec_recovered", fec_recovered},
+          {"fec_groups_rx", fec_totals.groups_rx},
+          {"fec_unrecoverable", fec_totals.unrecoverable},
+          {"fec_unrecoverable_pkts", fec_totals.unrecoverable_pkts},
+          // feedback 发送计数；RTT/抖动本身是 cued 的消费面，probe 不重复一份。
+          {"fb_sent", fb_sent},
+          {"rtt_ms", (last_rtt_us >= 0 && last_rtt_at_us > 0 &&
+                      now_tick - last_rtt_at_us <= 1'000'000)
+                         ? json(double(last_rtt_us) / 1000.0)
+                         : json(nullptr)},
+          {"jitter_ms", jitter_us >= 0.0 ? json(jitter_us / 1000.0) : json(nullptr)},
           {"synced", clk.have},
           {"lat_p50", pct_or_null(double(lat.percentile(0.50)) / 1000.0)},
           {"lat_p95", pct_or_null(double(lat.percentile(0.95)) / 1000.0)},
@@ -1163,6 +1352,15 @@ int main(int argc, char** argv) {
         // 抖动缓冲同样要清：上一代的 PTS 基线还在的话，新流前几帧会被判成"迟到"丢掉，
         // 那些帧里往往正好包含新编码器的 IDR/SPS。
         jb.reset();
+        // feedback 的速率/抖动/RTT 都是「针对上一代对端」的读数，不能带进新会话：
+        // 否则新 cued 的第一个 200 ms 会收到一条基于旧链路的反馈。
+        fb_bytes_prev = static_cast<int64_t>(bytes);
+        fb_t_prev = 0;
+        last_rtt_us = -1;
+        last_rtt_at_us = 0;
+        rtt_ping_echo = 0;
+        jitter_us = -1.0;
+        last_transit_us = -1;
         emit("probe.stream_reset",
              json{{"reason", new_stream ? "new_stream" : "peer_switch"},
                   {"old_max_frame", old_max},
@@ -1182,7 +1380,20 @@ int main(int argc, char** argv) {
       const uint8_t* pl = buf.data() + cue::proto::kDatagramHeaderSize;
       const int64_t echo = static_cast<int64_t>(cue::proto::detail::get_u64(pl));
       const int64_t cued_now = static_cast<int64_t>(cue::proto::detail::get_u64(pl + 8));
-      if (clk.observe(echo, cued_now, cue::now_us())) {
+      const int64_t recv_now = cue::now_us();
+      const int64_t rtt = recv_now - echo;
+      if (rtt >= 0 && rtt <= 1'000'000) {
+        // feedback 的 rtt_ms 用**最近一次**单发回环（1 Hz），不用 30 s 批的最小值：
+        // 最小值是给 offset 估计去抖用的，它代表"最好情况"而不是"现在"。
+        last_rtt_us = rtt;
+        last_rtt_at_us = recv_now;
+      }
+      if (rtt_ping_echo != 0 && echo == rtt_ping_echo) {
+        // 1 Hz 单发回环：只喂 RTT，不参与 offset 估计（保持"批内取最小 RTT"的口径）。
+        rtt_ping_echo = 0;
+        continue;
+      }
+      if (clk.observe(echo, cued_now, recv_now)) {
         // SPEC §7.1：漂移 > 5 ms 重锚并记事件——这个"记事件"现在真的落到事件流里
         emit("probe.reanchor", json{{"drift_us", clk.last_drift_us},
                                     {"offset_us", clk.offset_us},
@@ -1205,26 +1416,43 @@ int main(int argc, char** argv) {
       if (have_completed && base_fid <= max_completed && pending.find(base_fid) == pending.end()) {
         continue;
       }
-      // member_count 与数据报头里的 frag_count 双写：以头为准，对不上就拒包（review #18）
-      if (fph->member_count == 0 || fph->member_count != h->frag_count) {
-        ++rejected;
+      // 组的位置在数据报头里：frag_index = 组起始片号，frag_count = 整帧片数。
+      // member_count 是**本组**成员数（不是整帧片数）。旧格式（frag_index=0、
+      // member_count=frag_count）自然落进"整帧一组"，所以不需要协议版本。
+      const uint16_t total = h->frag_count;
+      const uint16_t offset = h->frag_index;
+      const uint16_t members = fph->member_count;
+      if (total == 0 || members == 0 || offset >= total ||
+          static_cast<uint32_t>(offset) + members > total) {
+        ++rejected;  // 组的范围越界：伪造/损坏包，不能拿它去 resize 别人的槽位
         continue;
       }
       auto& ffa = pending[base_fid];
       if (ffa.count == 0) {
-        ffa.count = fph->member_count;
+        ffa.count = total;
         ffa.pts_us = h->pts_us;
         // 冗余包本身不带 codec（cued 显式置 0）：codec 由随后的视频分片补上，
         // 若整帧只靠 FEC 恢复、连一片视频分片都没到过，就按"未标注"跳过解码。
         ffa.first_seen_us = cue::now_us();
-        ffa.parts.resize(fph->member_count);
+        ffa.parts.resize(total);
+      } else if (ffa.count != total) {
+        ++rejected;  // 同一 frame_id 的 FEC 与数据报对整帧片数说法不一致
+        continue;
       }
       const std::size_t parity_off =
           cue::proto::kDatagramHeaderSize + cue::proto::kFecPayloadHeaderSize;
-      ffa.parity.assign(buf.data() + parity_off, buf.data() + n);
-      ffa.fec_available = true;
-      try_fec_recover(ffa, fec_recovered);
+      auto& grp = ffa.fec_groups[fph->group_index];
+      if (grp.available && (grp.offset != offset || grp.member_count != members)) {
+        ++rejected;  // 同一 group_index 的几何信息前后矛盾
+        continue;
+      }
+      grp.offset = offset;
+      grp.member_count = members;
+      grp.parity.assign(buf.data() + parity_off, buf.data() + n);
+      grp.available = true;
+      fec_recovered += try_fec_recover(ffa);
       // 恢复后必须重新判定完整性：否则被 FEC 修好的帧永远不会被计为完成（实测踩到的坑）
+      mark_probe_if_recovered(base_fid);
       finish_if_complete(base_fid, ffa);
       continue;
     }
@@ -1256,53 +1484,89 @@ int main(int argc, char** argv) {
     }
     if (h->frag_index < fa.count && fa.parts[h->frag_index].empty()) {
       fa.parts[h->frag_index].assign(buf.data() + cue::proto::kDatagramHeaderSize, buf.data() + n);
-      ++fa.recv_parts;
+      // 丢包率只统计**原始传输**：重传包（flags bit1）补回来的是链路已经丢过的那一片，
+      // 把它算成"收到"会让丢失率随 NACK 修复一起下降——那样 >10% 冷却阈值永远不会触发，
+      // 指标也会把一条 30% 丢包的链路报成 9%。FEC 恢复的片同样不计（它没走过链路）。
+      if ((h->flags & cue::proto::kDownFlagRetransmit) == 0) ++fa.recv_parts;
     }
 
     // FEC 与 NACK 必须协同：FEC 包先到（当时缺 2 片无法恢复），NACK 补回 1 片后
     // 仍缺 1 片，此刻本可恢复 —— 旧实现只在 FEC 包到达那一刻试一次，白丢一帧。
-    try_fec_recover(fa, fec_recovered);
+    fec_recovered += try_fec_recover(fa);
+    mark_probe_if_recovered(h->frame_id);
     finish_if_complete(h->frame_id, fa);
 
     const int64_t now2 = cue::now_us();
 
-    // NACK：限速 8 包/秒（间隔 ≥125 ms）、单包 ≤64 条；
-    // 丢包率 >10% 连续 3 个窗口 → 暂停 + 冷却 1 s（弱网下不能放大拥塞）
-    if (nack_enabled && have_peer && now2 >= nack_pause_until &&
-        now2 - last_nack_us >= nack_interval_us) {
-      std::vector<uint8_t> entries;
-      entries.reserve(cue::proto::kMaxNackEntries * cue::proto::kNackEntrySize);
-      for (auto& [fid, fa2] : pending) {
-        if (fa2.count == 0 || fa2.nack_queued) continue;
-        if (now2 - fa2.first_seen_us < nack_delay_us) continue;
-        bool all_queued = true;
-        for (uint16_t i = 0; i < fa2.count; ++i) {
-          if (!fa2.parts[i].empty()) continue;
-          if (entries.size() + cue::proto::kNackEntrySize >
-              cue::proto::kMaxNackEntries * cue::proto::kNackEntrySize) {
-            all_queued = false;  // 本帧剩余缺片进不来，下一轮再来
+    // ---- NACK（FR-PROBE.2）：令牌桶限速 8 包/秒、单包 ≤64 条、坏窗口冷却 ----
+    // 策略本身在 proto/nack.h（纯决策，可单测）。这里只负责「收集缺口 → 问策略 → 发送」。
+    if (nack_enabled && have_peer) {
+      const bool probing = nack_ctl.probing(now2);
+      // 探测模式下每个统计窗口只发 1 条：额度用完后不再收集缺口，也不重复计 suppressed。
+      const bool probe_capped = probing && nack_ctl.probe_window_used();
+      if (!probe_capped && now2 - last_nack_attempt_us >= nack_interval_us) {
+        last_nack_attempt_us = now2;
+        const std::size_t max_entries = probing ? 1 : cue::proto::kMaxNackEntries;
+        std::vector<uint8_t> entries;
+        entries.reserve(cue::proto::kMaxNackEntries * cue::proto::kNackEntrySize);
+        // 一次 NACK 里整帧缺片都装下了，才把该帧标记成「已请求」；否则剩下的缺口
+        // 下一拍继续（review #8：部分入包的帧不能标位，否则剩下的缺片永远不被请求）。
+        std::vector<uint32_t> fully_covered;
+        uint32_t probe_fid = 0;
+        uint16_t probe_frag = 0;
+        for (auto& [fid, fa2] : pending) {
+          if (fa2.count == 0 || fa2.nack_queued) continue;
+          if (now2 - fa2.first_seen_us < nack_delay_us) continue;
+          bool all_queued = true;
+          for (uint16_t i = 0; i < fa2.count; ++i) {
+            if (!fa2.parts[i].empty()) continue;
+            if (entries.size() / cue::proto::kNackEntrySize >= max_entries) {
+              all_queued = false;
+              break;
+            }
+            cue::proto::append_nack_entry(entries, cue::proto::NackEntry{fid, i});
+            if (probing) probe_frag = i;
+          }
+          if (all_queued) fully_covered.push_back(fid);
+          if (probing) {
+            // 单包探测只问最老的一帧的一个缺口：多问就失去"探测"的语义。
+            if (!entries.empty()) {
+              probe_fid = fid;
+              break;
+            }
+          } else if (entries.size() / cue::proto::kNackEntrySize >= max_entries) {
             break;
           }
-          cue::proto::append_nack_entry(entries, cue::proto::NackEntry{fid, i});
         }
-        // 只有整帧缺片都进过请求才置位；否则剩下的缺片永远不会被请求（review #8）
-        if (all_queued) fa2.nack_queued = true;
-        if (entries.size() + cue::proto::kNackEntrySize >
-            cue::proto::kMaxNackEntries * cue::proto::kNackEntrySize) {
-          break;
+        if (!entries.empty()) {
+          if (nack_ctl.try_acquire(now2, probing)) {
+            cue::proto::DatagramHeader nh;
+            nh.type = static_cast<uint8_t>(cue::proto::DownType::Nack);
+            nh.session_id = session_seen;  // 回带会话号：cued 侧据此过滤（review #20）
+            const auto hdr = cue::proto::encode(nh);
+            std::vector<uint8_t> pkt(hdr.begin(), hdr.end());
+            pkt.insert(pkt.end(), entries.begin(), entries.end());
+            send_udp(pkt);
+            if (probing) {
+              // 记住探测目标：这一片回来才算探测成功（见 mark_probe_if_recovered）。
+              nack_probe_pending = true;
+              nack_probe_fid = probe_fid;
+              nack_probe_frag = probe_frag;
+            } else {
+              for (const uint32_t fid : fully_covered) {
+                const auto it = pending.find(fid);
+                if (it != pending.end()) it->second.nack_queued = true;
+              }
+            }
+          }
+        } else if (probing) {
+          // 探测模式下已经没有缺口 = 需要恢复的东西自己恢复了：直接回常规。
+          nack_ctl.on_probe_success();
+          nack_probe_pending = false;
+          emit("probe.nack_resume",
+               json{{"reason", "no_gap"}, {"nack_sent", nack_ctl.sent()}});
         }
       }
-      if (!entries.empty()) {
-        cue::proto::DatagramHeader nh;
-        nh.type = static_cast<uint8_t>(cue::proto::DownType::Nack);
-        nh.session_id = session_seen;  // 回带会话号：cued 侧据此过滤（review #20）
-        const auto hdr = cue::proto::encode(nh);
-        std::vector<uint8_t> pkt(hdr.begin(), hdr.end());
-        pkt.insert(pkt.end(), entries.begin(), entries.end());
-        send_udp(pkt);
-        ++nack_sent;
-      }
-      last_nack_us = now2;
     }
   }
 }

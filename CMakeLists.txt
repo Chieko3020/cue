@@ -288,6 +288,12 @@ add_executable(test_delay_injector tests/test_delay_injector.cpp)
 target_link_libraries(test_delay_injector PRIVATE cue_proto)
 add_test(NAME delay_injector COMMAND test_delay_injector)
 
+# T-09：NACK 令牌桶限速边界（8 包/秒、窗口 8 包）、坏窗口冷却 1 s、单包探测与恢复。
+# 纯决策对象（不碰 socket/时钟），毫秒级跑完。
+add_executable(test_nack tests/test_nack.cpp)
+target_link_libraries(test_nack PRIVATE cue_proto)
+add_test(NAME nack COMMAND test_nack)
+
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
 # 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。
@@ -306,7 +312,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
   foreach(_t wire agent context eval state compare console cassette probe sandbox jitter_buffer
-            control_channel tools delay_injector)
+            control_channel tools delay_injector nack)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
 endif()

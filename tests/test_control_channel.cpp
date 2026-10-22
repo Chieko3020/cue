@@ -338,6 +338,25 @@ int main() {
               fen2.params.queue_fps == 0.0,
           "fault.set：value=0 清除全部注入（含 rate/backlog）");
 
+    // T-09：fec_group / aimd 是**普通运行期参数**——改了不重建编码器，下一帧发送侧生效。
+    const auto fg0 = store.snapshot();
+    cerr.clear();
+    check(cli.call("pipeline.set_param", json{{"key", "fec_group"}, {"value", "16"}}, res, cerr),
+          "set_param：fec_group=16 成功（运行期可改）");
+    const auto fg1 = store.snapshot();
+    check(fg1.params.fec_group == 16, "set_param：fec_group 写进参数存储");
+    check(fg1.encoder_generation == fg0.encoder_generation,
+          "set_param：fec_group 不推进编码器 generation（不重建编码器）");
+    cerr.clear();
+    check(!cli.call("pipeline.set_param", json{{"key", "fec_group"}, {"value", "65"}}, res, cerr),
+          "set_param：fec_group 越界被拒绝");
+    check(cerr.find("fec_group 超出范围") != std::string::npos,
+          "set_param：fec_group 越界给出明确原因");
+    cerr.clear();
+    check(cli.call("pipeline.set_param", json{{"key", "aimd"}, {"value", "off"}}, res, cerr),
+          "set_param：aimd=off 成功");
+    check(store.snapshot().params.aimd == false, "set_param：AIMD 可以被关掉（评测确定性）");
+
     // 订阅：之后服务端主动推 {"event":...}（无 id），客户端不该把它当成响应
     std::atomic<int> pushed{0};
     std::string pushed_ev;

@@ -44,6 +44,15 @@ struct RuntimeParams {
   // 发送侧（故障注入的一种）：令牌桶速率与发送排队节奏
   double send_mbps = 10.0;
   double queue_fps = 0.0;
+  // FEC 组大小（FR-PIPE.9）：每 N 个数据包一个 XOR 组，1..64。
+  // 它不是结构性参数：发送侧每帧按它现切组，改完下一帧就生效，不重建编码器/不断流。
+  int fec_group = 8;
+  // AIMD（技术设计 §4.2）：仅 transcode=on 时按 feedback 调节码率。
+  // **默认关闭**：开启后健康链路（loss<2%）每 3 个窗口升 5%，每升一次都要懒重建编码器；
+  // 实测在 enc-placebo 的修复窗口里，每秒一次的重建会把探针抖动缓冲推高一档，
+  // e2e p99 从 ~45 ms 抬到 108 ms（擦着 100 ms 的 SLA）。评测要确定性时默认值必须是它，
+  // 需要拥塞控制就显式开：`--aimd on` 或 set_param aimd=on。
+  bool aimd = false;
   // 注入档位（%）
   double inject_drop = 0.0;
   double inject_ingress_drop = 0.0;

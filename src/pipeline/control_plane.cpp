@@ -87,13 +87,17 @@ bool same_params(const RuntimeParams& a, const RuntimeParams& b) {
   return a.transcode == b.transcode && a.width == b.width && a.height == b.height &&
          a.bitrate_kbps == b.bitrate_kbps && a.fps == b.fps && a.gop == b.gop &&
          a.threads == b.threads && a.preset == b.preset && a.send_mbps == b.send_mbps &&
-         a.queue_fps == b.queue_fps && a.inject_drop == b.inject_drop &&
+         a.queue_fps == b.queue_fps && a.fec_group == b.fec_group && a.aimd == b.aimd &&
+         a.inject_drop == b.inject_drop &&
          a.inject_ingress_drop == b.inject_ingress_drop &&
          a.inject_delay_ms == b.inject_delay_ms && a.inject_jitter_ms == b.inject_jitter_ms &&
          a.inject_seed == b.inject_seed;
 }
 
 json encoder_params_json(const RuntimeParams& p) {
+  // 名字沿用 encoder_params_json（调用方/录制格式已依赖），但里面不只有"编码档位"：
+  // fec_group/aimd 是发送与拥塞控制参数，同样属于「agent 可观测、不可被注入值污染」的
+  // 运行配置。三者都**不**进 encoder_relevant_key：改它们不重建编码器。
   return json{{"transcode", p.transcode ? "on" : "off"},
               {"width", p.width},
               {"height", p.height},
@@ -103,7 +107,9 @@ json encoder_params_json(const RuntimeParams& p) {
               {"fps", p.fps},
               {"gop", p.gop},
               {"preset", p.preset},
-              {"threads", p.threads}};
+              {"threads", p.threads},
+              {"fec_group", p.fec_group},
+              {"aimd", p.aimd ? "on" : "off"}};
 }
 
 json runtime_params_json(const RuntimeParams& p) {
@@ -115,6 +121,8 @@ json runtime_params_json(const RuntimeParams& p) {
   j["inject_delay_ms"] = p.inject_delay_ms;
   j["inject_jitter_ms"] = p.inject_jitter_ms;
   j["inject_seed"] = p.inject_seed;
+  j["fec_group"] = p.fec_group;
+  j["aimd"] = p.aimd ? "on" : "off";
   return j;
 }
 
@@ -191,12 +199,28 @@ bool apply_param(const std::string& key, const std::string& value, RuntimeParams
       return false;
     }
     next.fps = v;
+  } else if (key == "fec_group") {
+    // FR-PIPE.9：每 N 个数据包一组。改它只影响下一帧的分组，不重建编码器。
+    int v = 0;
+    if (!parse_int(value, 1, 64, v)) {
+      err = "fec_group 超出范围 [1, 64] 或不是整数: \"" + value + "\"";
+      return false;
+    }
+    next.fec_group = v;
+  } else if (key == "aimd") {
+    bool on = false;
+    if (!parse_bool_flag(value, on)) {
+      err = "aimd 只接受 on/off（或 true/false/1/0）: \"" + value + "\"";
+      return false;
+    }
+    next.aimd = on;
   } else {
     // 结构性参数（ws_port / bind / probe_* / jitter_* / fec）仍然必须重启：
     // 这里明确拒绝，而不是接受之后"看起来生效了"。
     err = "unsupported key: \"" + key +
-          "\"（运行期可改：bitrate_kbps / gop / preset / transcode / width / height / fps；"
-          "ws_port / bind / probe_* / jitter_* / fec 属于结构性参数，需要重启 cued）";
+          "\"（运行期可改：bitrate_kbps / gop / preset / transcode / width / height / fps / "
+          "fec_group / aimd；ws_port / bind / probe_* / jitter_* / fec(开关) 属于结构性参数，"
+          "需要重启 cued）";
     return false;
   }
   draft = next;

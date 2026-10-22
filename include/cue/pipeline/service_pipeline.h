@@ -52,6 +52,13 @@ struct PipelineEndpoint {
   double inject_jitter_ms = 0.0;
   uint64_t inject_seed = 42;
   bool fec = true;
+  // FEC 组大小（FR-PIPE.9）：每 N 个数据包一组。运行期可通过 set_param fec_group 改；
+  // 这个字段只是「下一次 spawn 的命令行初值」。
+  int fec_group = 8;
+  // AIMD（技术设计 §4.2）：仅 transcode=on 时生效。默认关（评测确定性：开启会在
+  // 无丢包时持续升码率并重建编码器，实测抬高修复态 e2e 时延）。harness spawn 时
+  // 显式下传该值，保证 cued 重启后与运行期一致。
+  bool aimd = false;
   double send_mbps = 10.0;
   std::function<void(const PipelineEvent&)> on_event;
   // Http 端

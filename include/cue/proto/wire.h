@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -252,8 +253,12 @@ inline constexpr std::size_t kFecPayloadHeaderSize = 8;
 
 struct FecPayloadHeader {
   uint32_t base_frame_id = 0;
-  uint16_t group_index = 0;   // 一帧一组：显式写 0，不再靠"整段零填充"隐式约定
-  uint16_t member_count = 0;  // 必须与数据报头的 frag_count 一致（probe 侧交叉校验）
+  // FR-PIPE.9：每 N 个数据报一组，group_index 从 0 递增（同一帧内唯一）。
+  // 组的**起始 frag 下标**写在数据报头的 frag_index 里，member_count 是本组成员数；
+  // probe 用 (frag_index, member_count) 定位组员。旧的一帧一组格式
+  // （frag_index=0、member_count=frag_count）因此仍然可解释，不需要协议版本位。
+  uint16_t group_index = 0;
+  uint16_t member_count = 0;  // 本组成员数；必须与「frag_count − frag_index」相容
 };
 
 inline std::array<uint8_t, kFecPayloadHeaderSize> encode(const FecPayloadHeader& h) {
@@ -270,6 +275,102 @@ inline std::optional<FecPayloadHeader> decode_fec_payload_header(std::span<const
   h.base_frame_id = detail::get_u32(&b[0]);
   h.group_index = detail::get_u16(&b[4]);
   h.member_count = detail::get_u16(&b[6]);
+  return h;
+}
+
+// ---------------------------------------------------------------- FEC 分组（FR-PIPE.9）
+// 分组规则与 XOR 运算收在头文件里：cued 生成、probe 恢复、单测验证用的是同一份实现，
+// 否则「发送端按 8 分组、接收端按整帧恢复」这种不对称只能靠联调发现。
+inline constexpr std::size_t kMaxFecGroupSize = 64;
+inline constexpr std::size_t kDefaultFecGroupSize = 8;
+
+// 一组在帧内的位置：offset = 第一个成员的 frag_index，member_count = 成员数。
+struct FecGroupSpan {
+  uint16_t offset = 0;
+  uint16_t member_count = 0;
+};
+
+inline std::vector<FecGroupSpan> fec_group_spans(std::size_t frag_count, std::size_t group_size) {
+  std::vector<FecGroupSpan> out;
+  if (frag_count == 0) return out;
+  const std::size_t n = std::clamp<std::size_t>(group_size, 1, kMaxFecGroupSize);
+  for (std::size_t off = 0; off < frag_count; off += n) {
+    const std::size_t len = std::min(n, frag_count - off);
+    out.push_back(FecGroupSpan{static_cast<uint16_t>(off), static_cast<uint16_t>(len)});
+  }
+  return out;
+}
+
+// 一组载荷的 XOR 冗余：各成员按最长者补零后逐字节异或。
+inline std::vector<uint8_t> fec_xor_parity(std::span<const std::vector<uint8_t>> members) {
+  std::size_t maxlen = 0;
+  for (const auto& m : members) maxlen = std::max(maxlen, m.size());
+  std::vector<uint8_t> parity(maxlen, 0);
+  for (const auto& m : members) {
+    for (std::size_t i = 0; i < m.size(); ++i) parity[i] ^= m[i];
+  }
+  return parity;
+}
+
+// 用 parity + 其余成员恢复唯一缺失的那一片。恰好缺 1 片才成功（缺 0 片无从判断长度，
+// 缺 ≥2 片是欠定方程）。members 里的空向量视为「缺失」。
+//
+// 恢复出的长度 = parity 长度（该组最长载荷）：若丢的是较短的一片，尾部多出的 0 是
+// 补零异或的产物。Annex-B 允许 trailing_zero_8bits，所以不影响解码；协议本身不携带
+// 每片长度，这是 XOR-FEC 的固有限制（与实现无关）。
+inline bool fec_recover_one(std::span<const std::vector<uint8_t>> members,
+                            std::span<const uint8_t> parity, std::size_t& missing_index,
+                            std::vector<uint8_t>& recovered) {
+  std::size_t miss = members.size();
+  std::size_t n_missing = 0;
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    if (members[i].empty()) {
+      miss = i;
+      ++n_missing;
+    }
+  }
+  if (n_missing != 1 || parity.empty()) return false;
+  recovered.assign(parity.begin(), parity.end());
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    if (i == miss) continue;
+    const auto& m = members[i];
+    for (std::size_t k = 0; k < m.size() && k < recovered.size(); ++k) recovered[k] ^= m[k];
+  }
+  missing_index = miss;
+  return true;
+}
+
+// ---------------------------------------------------------------- feedback（技术设计 §4.2）
+// probe → cued，type=0x06，载荷 4 个 f32（小端）：
+//   loss_rate | recv_bitrate_mbps | jitter_ms | rtt_ms
+// 「没有可靠值」写 -1，不写 0：0 是合法读数（零丢包/零时延），拿它冒充缺失会让
+// cued 的 AIMD 以为链路完美而升码率。f32 而不是 f64：这是控制反馈，1% 精度足够，
+// 且 16 字节载荷可以塞进任何 MTU。
+inline constexpr std::size_t kFeedbackPayloadSize = 16;
+
+struct FeedbackPayload {
+  float loss_rate = 0.0f;
+  float recv_bitrate_mbps = -1.0f;
+  float jitter_ms = -1.0f;
+  float rtt_ms = -1.0f;
+};
+
+inline std::array<uint8_t, kFeedbackPayloadSize> encode(const FeedbackPayload& h) {
+  std::array<uint8_t, kFeedbackPayloadSize> b{};
+  detail::put_u32(&b[0], std::bit_cast<uint32_t>(h.loss_rate));
+  detail::put_u32(&b[4], std::bit_cast<uint32_t>(h.recv_bitrate_mbps));
+  detail::put_u32(&b[8], std::bit_cast<uint32_t>(h.jitter_ms));
+  detail::put_u32(&b[12], std::bit_cast<uint32_t>(h.rtt_ms));
+  return b;
+}
+
+inline std::optional<FeedbackPayload> decode_feedback(std::span<const uint8_t> b) {
+  if (b.size() < kFeedbackPayloadSize) return std::nullopt;
+  FeedbackPayload h;
+  h.loss_rate = std::bit_cast<float>(detail::get_u32(&b[0]));
+  h.recv_bitrate_mbps = std::bit_cast<float>(detail::get_u32(&b[4]));
+  h.jitter_ms = std::bit_cast<float>(detail::get_u32(&b[8]));
+  h.rtt_ms = std::bit_cast<float>(detail::get_u32(&b[12]));
   return h;
 }
 

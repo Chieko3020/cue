@@ -341,6 +341,9 @@ struct Counters {
   // injected / budget_drops 不涨，才能说明包最终都发出去了。
   uint64_t delayed_pkts = 0;
   uint64_t delayed_max_us = 0;
+  // FEC 冗余组（FR-PIPE.9）：本会话实际发出的组数（被注入丢包吃掉的组不计——
+  // "发送的组数"要能对上 probe 侧"收到的组数"，虚报没发出去的不算）。
+  uint64_t fec_groups = 0;
   // 迟到帧丢弃（实时流不追赶积压）。旧实现在编码器慢下来时会把 WS 上行积压一路读完，
   // 恢复后以 100+ fps 追帧，端到端延迟要好几秒才回来——实时流宁可丢帧也不排队。
   uint64_t ingress_late = 0;
@@ -443,6 +446,31 @@ class MetricsView {
   std::deque<int64_t> times_;
 };
 
+// feedback（技术设计 §4.2）：probe 每 200 ms 发来一条 type=0x06，cued 侧只做两件事：
+//   1) 记账（fb_rx / fb_loss_rate / fb_rtt_ms / fb_recv_mbps）——永远做，与 transcode 无关；
+//   2) 仅当 transcode=on 且 aimd=on 时按 loss 调码率（AIMD）。
+// 为什么与 cued 的其他计数分开：NACK 线程会跨 WS 会话存活，而 Counters 是每连接重置的；
+// 反馈读数属于「这一代对端/链路」，放原子变量里让 media 线程每秒读取即可。
+struct FeedbackStats {
+  std::atomic<uint64_t> rx{0};
+  std::atomic<uint64_t> aimd_steps{0};
+  std::atomic<double> loss_rate{-1.0};   // -1 = 还没收到过（指标里写 null）
+  std::atomic<double> recv_mbps{-1.0};
+  std::atomic<double> rtt_ms{-1.0};
+  std::atomic<int> bitrate_kbps{0};      // AIMD 当前码率（初值 = 启动码率）
+};
+
+// AIMD 的本地状态（只在 NACK 线程里读写，不需要锁）。
+// base_kbps 是**手动/启动**设定的码率，用来算上限 2×base；AIMD 自己写出来的值不算基准。
+// last_written_kbps 用来识别「有人手动改过码率」：当前值不等于自己上次写的值 → 重新以
+// 手动值为基准。手动优先，AIMD 从手动值继续调，不会把手动设置覆盖回旧值。
+struct AimdState {
+  int base_kbps = 0;
+  int last_written_kbps = 0;
+  int low_streak = 0;       // 连续 3 个 feedback 窗口 loss<2% 才升一次
+  int64_t last_change_us = 0;
+};
+
 // 进程自述（obs.fetch procs）：pid / RSS / 线程数 / 运行时长 + 编码档位。
 // 注入值（inject_drop / inject_ingress_drop / send_mbps / queue_fps）**故意不出现**：
 // agent 必须从指标推断根因，把"标准答案"写进观测等于给它抄（沿用旧 observation(procs) 的约定）。
@@ -493,7 +521,8 @@ nlohmann::ordered_json procs_json(const cue::pipeline::ParamStore& params) {
 }
 
 void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
-            uint64_t& frames_prev, const cue::media::JitterBufferStats& jb, MetricsView& view) {
+            uint64_t& frames_prev, const cue::media::JitterBufferStats& jb, MetricsView& view,
+            const FeedbackStats& fb) {
   const double dt = double(now_us - t_last) / 1e6;
   const uint64_t df = c.frames_out - frames_prev;
   const double fps = double(df) / dt;
@@ -524,6 +553,14 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
   // 与六段一样每秒一行，agent 才能把「buffer 段涨」和「队列在涨」关联起来。
   human << "  jb depth=" << jb.depth << " lvl=" << jb.level << " tgt=" << jb.target_frames
         << " sw=" << jb.switches << " skip=" << jb.skipped << " late=" << jb.late_dropped;
+  // feedback/AIMD 单列：fb_rx 是收到的 feedback 条数（0 = 探针没在发或还没连上），
+  // 后面的 loss/rtt 只在收到过时才有意义。
+  human << "  fb=" << fb.rx.load(std::memory_order_relaxed);
+  if (fb.rx.load(std::memory_order_relaxed) > 0) {
+    human << " loss=" << std::setprecision(1) << fb.loss_rate.load() * 100.0 << "% rtt="
+          << fb.rtt_ms.load() << "ms";
+  }
+  human << " aimd=" << fb.aimd_steps.load() << "/" << fb.bitrate_kbps.load() << "kbps";
   const std::string human_line = human.str();
   std::fwrite(human_line.data(), 1, human_line.size(), stdout);
   std::fputc('\n', stdout);
@@ -549,6 +586,23 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
          // 延迟注入：与 injected/budget_drops 互补的一对"没有丢包"的证据
          {"delayed_pkts", c.delayed_pkts},
          {"delayed_max_us", c.delayed_max_us},
+         // FEC（FR-PIPE.9）：这一次会话发出的冗余组数。它与 probe 的 fec_rec /
+         // fec_unrecoverable 对照，才能回答"发了多少组、救回多少片"。
+         {"fec_groups", c.fec_groups},
+         // feedback/AIMD（技术设计 §4.2）：fb_rx=收到的 feedback 条数；
+         // 三个测量值在没收到过时写 null（不能拿 0 冒充"零丢包/零 RTT"）。
+         {"fb_rx", fb.rx.load(std::memory_order_relaxed)},
+         {"fb_loss_rate", fb.rx.load(std::memory_order_relaxed) > 0
+                              ? json(fb.loss_rate.load(std::memory_order_relaxed))
+                              : json(nullptr)},
+         {"fb_recv_mbps", fb.rx.load(std::memory_order_relaxed) > 0
+                              ? json(fb.recv_mbps.load(std::memory_order_relaxed))
+                              : json(nullptr)},
+         {"fb_rtt_ms", fb.rx.load(std::memory_order_relaxed) > 0
+                           ? json(fb.rtt_ms.load(std::memory_order_relaxed))
+                           : json(nullptr)},
+         {"aimd_steps", fb.aimd_steps.load(std::memory_order_relaxed)},
+         {"aimd_bitrate_kbps", fb.bitrate_kbps.load(std::memory_order_relaxed)},
          // 迟到帧：相对最小延迟基线晚到超过预算而被丢弃的帧。它与 queue_dropped 的区别是
          // 「时间维度的背压」vs「策略切换的清空」——都丢帧，但触发条件与排查方向不同。
          {"ingress_late", c.ingress_late},
@@ -615,6 +669,9 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
               {"injected", c.injected_drops},
               {"rejected", c.rejected},
               {"serr", c.send_errors},
+              {"fec_groups", c.fec_groups},
+              {"fb_rx", fb.rx.load(std::memory_order_relaxed)},
+              {"aimd_steps", fb.aimd_steps.load(std::memory_order_relaxed)},
               {"audio_frames_in", c.audio_frames_in},
               {"audio_decoded", false},
               // recv 段：数据报到达 → 本帧重组完成。此前 rings[0] 一直在算却没进 METRICS，
@@ -706,6 +763,15 @@ int main(int argc, char** argv) {
   uint64_t inject_seed = 42;
   std::string inject_trace;
   bool fec_enabled = true;
+  // FEC 组大小（FR-PIPE.9）：每 N 个数据包一组、每组 1 个 XOR 冗余。默认 8。
+  // 1 = 每包一个副本（100% 冗余，仅用于对比实验）；大帧 >N 片时自动切成多组。
+  long long fec_group = static_cast<long long>(cue::proto::kDefaultFecGroupSize);
+  // AIMD（技术设计 §4.2）：仅 transcode=on 时按 feedback 的 loss_rate 调码率。
+  // 默认 **off**：开启后无丢包时每 3 个 feedback 窗口升 5%，每次升档都重建编码器；
+  // 这会让"没有网络故障"的基线也带上一秒一次的编码器抖动（实测把修复后的 e2e p99
+  // 抬高 ~60 ms）。评测/A-B 需要确定性，所以默认关，`--aimd on` 或运行期
+  // set_param aimd=on 显式开启。关掉之后码率只由手动参数决定。
+  bool aimd_enabled = false;
   // 抖动缓冲（FR-PIPE.2）。默认值刻意取小：目标深度 2 帧 = 1 个帧间隔（30 fps ≈ 33 ms）的
   // 驻留，等待预算 40 ms 只用来兜「缺帧时要不要再等一会儿」。把这两个数调大能把乱序纠正
   // 得更彻底，代价是端到端延迟线性上升——所以默认不下"几百 ms"那种手。
@@ -814,6 +880,12 @@ int main(int argc, char** argv) {
       const auto val = next();
       if (val != "on" && val != "off") bad(val);
       fec_enabled = (val == "on");
+    } else if (a == "--fec-group") {
+      fec_group = want_int(1, static_cast<long long>(cue::proto::kMaxFecGroupSize));
+    } else if (a == "--aimd") {
+      const auto val = next();
+      if (val != "on" && val != "off") bad(val);
+      aimd_enabled = (val == "on");
     } else if (a == "--help") {
       std::printf(
           "cued --ws-port 9000 [--bind 127.0.0.1] --probe-host 127.0.0.1 --probe-port 9001\n"
@@ -822,6 +894,7 @@ int main(int argc, char** argv) {
           "     [--inject-drop 0..100] [--inject-ingress-drop 0..100] [--queue-fps N]\n"
           "     [--inject-delay-ms 0..2000] [--inject-jitter-ms 0..2000]\n"
           "     [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
+          "     [--fec-group 1..64] [--aimd on|off]\n"
           "     [--jitter on|off] [--jitter-target-frames 2] [--jitter-max-frames 8]\n"
           "     [--jitter-budget-ms 40] [--max-ingress-lag-ms 300]\n"
           "  --bind 默认 127.0.0.1（只回环）；跨机演示才用 --bind 0.0.0.0，\n"
@@ -865,6 +938,8 @@ int main(int argc, char** argv) {
   initial_params.preset = preset;
   initial_params.send_mbps = send_mbps;
   initial_params.queue_fps = queue_fps;
+  initial_params.fec_group = static_cast<int>(fec_group);
+  initial_params.aimd = aimd_enabled;
   initial_params.inject_drop = inject_drop;
   initial_params.inject_ingress_drop = inject_ingress_drop;
   initial_params.inject_delay_ms = inject_delay_ms;
@@ -916,6 +991,12 @@ int main(int argc, char** argv) {
   // 「改参数不断流」是结构上成立的，而不是靠"小心一点"。
   cue::pipeline::ParamStore params(initial_params);
   MetricsView view;
+  // feedback/AIMD 的运行期状态：NACK 线程写、media 线程的 report() 读。
+  FeedbackStats fb_stats;
+  fb_stats.bitrate_kbps.store(out_kbps);
+  AimdState aimd;
+  aimd.base_kbps = out_kbps;
+  aimd.last_written_kbps = out_kbps;
 
   cue::pipeline::ControlPlane::Providers ctl_providers;
   ctl_providers.metrics = [&view](int window_ms) { return view.query(window_ms); };
@@ -1019,6 +1100,76 @@ int main(int argc, char** argv) {
   }
   RetransmitCache xmit_cache;
 
+  // ---- AIMD（技术设计 §4.2）：只改 ParamStore 的 bitrate_kbps ----
+  // 走的是**现有的懒重建路径**：ParamStore 推进 encoder_generation → 媒体线程下一帧
+  // close+configure，WS 会话/解码器/抖动缓冲原地保留。所以调码率不会重启 cued、不断流。
+  auto aimd_apply = [&](int new_kbps, int old_kbps, float loss, const char* reason,
+                        float rtt_ms, int64_t now) {
+    bool changed = false;
+    std::string err;
+    if (!params.set_param("bitrate_kbps", std::to_string(new_kbps), changed, err)) {
+      emit_event("pipeline.aimd_error", json{{"reason", err},
+                                             {"requested_kbps", new_kbps},
+                                             {"current_kbps", old_kbps}});
+      return;
+    }
+    if (!changed) return;
+    aimd.last_written_kbps = new_kbps;
+    aimd.last_change_us = now;
+    fb_stats.aimd_steps.fetch_add(1, std::memory_order_relaxed);
+    fb_stats.bitrate_kbps.store(new_kbps, std::memory_order_relaxed);
+    emit_event("pipeline.aimd",
+               json{{"old_kbps", old_kbps},
+                    {"new_kbps", new_kbps},
+                    {"loss_rate", loss},
+                    {"rtt_ms", rtt_ms},
+                    {"reason", reason},
+                    {"base_kbps", aimd.base_kbps},
+                    {"cap_kbps", std::min(20000, aimd.base_kbps * 2)},
+                    {"encoder_rebuild", true},
+                    {"scope", "feedback"}});
+  };
+
+  // 每一条 feedback 调用一次。loss>10% → 降 10%（下限 200 kbps）；
+  // 连续 3 个 feedback 窗口 loss<2% → 升 5%（上限 2×手动基准，且不超过 20000）。
+  // 两次调整至少间隔 1 s：feedback 是 200 ms 一条，逐条重建编码器会把 x264 打爆。
+  auto aimd_on_feedback = [&](const cue::pipeline::ParamStore::Snapshot& snap,
+                              const cue::proto::FeedbackPayload& f, int64_t now) {
+    const auto& rp = snap.params;
+    if (!rp.transcode || !rp.aimd) {
+      aimd.low_streak = 0;
+      return;
+    }
+    if (!std::isfinite(f.loss_rate)) return;
+    const int cur = rp.bitrate_kbps;
+    if (cur != aimd.last_written_kbps) {
+      // 当前码率不是 AIMD 上次写的值 → 有人手动改过（pipeline.set_param / startup）。
+      // 以手动值为新基准：手动优先，AIMD 从它继续调，不把手动值覆盖回旧码率。
+      aimd.base_kbps = std::max(cur, 1);
+      aimd.last_written_kbps = cur;
+      aimd.low_streak = 0;
+    }
+    if (aimd.base_kbps <= 0) aimd.base_kbps = std::max(cur, 1);
+    const double loss = double(f.loss_rate);
+    if (loss > 0.10) {
+      aimd.low_streak = 0;
+      if (now - aimd.last_change_us < 1'000'000) return;
+      const int next = std::max(200, cur - cur / 10);
+      if (next < cur) aimd_apply(next, cur, f.loss_rate, "loss", f.rtt_ms, now);
+      return;
+    }
+    if (loss < 0.02) {
+      if (++aimd.low_streak < 3) return;
+      aimd.low_streak = 0;
+      if (now - aimd.last_change_us < 1'000'000) return;
+      const int cap = std::min(20000, aimd.base_kbps * 2);
+      const int next = std::min(cap, cur + std::max(1, cur / 20));
+      if (next > cur) aimd_apply(next, cur, f.loss_rate, "recover", f.rtt_ms, now);
+      return;
+    }
+    aimd.low_streak = 0;
+  };
+
   // NACK 重传线程：阻塞在 poll(200ms) 上而不是裸 recvfrom——退出路径才能
   // stop_nack=true 后 join()；旧实现从不 join，主循环哪天能正常退出就会被
   // std::thread 析构里的 std::terminate 打死（review #21）。
@@ -1048,6 +1199,25 @@ int main(int argc, char** argv) {
       }
       auto nh = cue::proto::decode_datagram({nbuf.data(), static_cast<size_t>(n)});
       if (!nh) continue;
+      if (nh->type == static_cast<uint8_t>(cue::proto::DownType::Feedback)) {
+        // feedback（技术设计 §4.2）：4 个 f32，编解码收在 wire.h（两端各写一份必漂移）。
+        const auto f = cue::proto::decode_feedback(
+            {nbuf.data() + cue::proto::kDatagramHeaderSize,
+             static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize});
+        if (!f) continue;
+        // 先写测量值、最后推进 rx：指标行用 fb_rx>0 判断"有没有收到过"，
+        // 顺序反了就会出现「rx 已经 +1、loss 还是 -1」的一瞬（报告里变成 null vs 数字）。
+        fb_stats.loss_rate.store(double(f->loss_rate), std::memory_order_relaxed);
+        fb_stats.recv_mbps.store(double(f->recv_bitrate_mbps), std::memory_order_relaxed);
+        fb_stats.rtt_ms.store(double(f->rtt_ms), std::memory_order_relaxed);
+        fb_stats.rx.fetch_add(1, std::memory_order_relaxed);
+        // 每次反馈都同步一次当前码率：手动 set_param 之后、AIMD 还没动作时，
+        // 指标里的 aimd_bitrate_kbps 也不能停在旧值上。
+        const auto snap = params.snapshot();
+        fb_stats.bitrate_kbps.store(snap.params.bitrate_kbps, std::memory_order_relaxed);
+        aimd_on_feedback(snap, *f, cue::now_us());
+        continue;
+      }
       if (nh->type == static_cast<uint8_t>(cue::proto::DownType::StatsReq)) {
         // SPEC §7.1 时钟对齐：probe 发下行回环请求（载荷 = 它的发戳），这里原样回显发戳
         // 并附上自己的时钟；跨机部署的端到端延迟由此有确定口径（review #9）。
@@ -1122,6 +1292,8 @@ int main(int argc, char** argv) {
                   {"gop", out_gop},
                   {"transcode", transcode_enabled ? "on" : "off"},
                   {"fec", fec_enabled ? "on" : "off"},
+                  {"fec_group", fec_group},
+                  {"aimd", aimd_enabled ? "on" : "off"},
                   {"inject_drop", inject_drop},
                   {"inject_delay_ms", inject_delay_ms},
                   {"inject_jitter_ms", inject_jitter_ms},
@@ -1588,40 +1760,48 @@ int main(int argc, char** argv) {
           outgoing.push_back(d);
         }
 
-        // XOR-FEC：一帧的所有分片为一组，生成 1 个冗余包。
-        // 载荷的字节序/字段顺序收在 wire.h（两端不再各写一份 memcpy，review #18）。
+        // XOR-FEC（FR-PIPE.9）：每 N 个数据包一组，每组 1 个冗余包。
+        // N 从运行期参数现取（set_param fec_group 下一帧生效）；分组/异或都走 wire.h，
+        // 与 probe 的恢复逻辑同一份实现。帧内组分片 = 连续 frag 下标，组起始片号写进
+        // 数据报头的 frag_index，member_count 写本组人数——接收端据此定位组员。
         if (fec_enabled && datagrams.size() > 1) {
-          std::size_t maxlen = 0;
-          for (auto& d : datagrams) {
-            maxlen = std::max(maxlen, d.size() - cue::proto::kDatagramHeaderSize);
-          }
-          std::vector<uint8_t> parity(maxlen, 0);
-          for (auto& d : datagrams) {
-            const std::size_t plen = d.size() - cue::proto::kDatagramHeaderSize;
-            for (std::size_t i = 0; i < plen; ++i) {
-              parity[i] ^= d[cue::proto::kDatagramHeaderSize + i];
+          const std::size_t group_size = static_cast<std::size_t>(
+              std::clamp(rp.fec_group, 1, static_cast<int>(cue::proto::kMaxFecGroupSize)));
+          const auto groups = cue::proto::fec_group_spans(datagrams.size(), group_size);
+          outgoing.reserve(outgoing.size() + groups.size());
+          for (std::size_t g = 0; g < groups.size(); ++g) {
+            const auto& span = groups[g];
+            const std::size_t begin = span.offset;
+            const std::size_t end = begin + span.member_count;
+            // 载荷视图：跳过数据报头（冗余只覆盖 payload，不覆盖逐包变化的头）
+            std::vector<std::vector<uint8_t>> payloads;
+            payloads.reserve(span.member_count);
+            for (std::size_t i = begin; i < end; ++i) {
+              const auto& d = datagrams[i];
+              payloads.emplace_back(d.begin() + cue::proto::kDatagramHeaderSize, d.end());
             }
-          }
-          cue::proto::DatagramHeader fh;
-          fh.type = static_cast<uint8_t>(cue::proto::DownType::Fec);
-          fh.session_id = session_id;
-          fh.frame_id = frame_id;
-          fh.frag_index = 0;
-          fh.frag_count = static_cast<uint16_t>(datagrams.size());
-          fh.pts_us = pts_us;
-          // 冗余包本身不是可解码帧：显式不标注 codec，免得 probe 拿奇偶校验字节去解码
-          fh.codec = cue::proto::kDownCodecUnspecified;
-          const auto hdr = cue::proto::encode(fh);
-          std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
-          cue::proto::FecPayloadHeader ph;
-          ph.base_frame_id = frame_id;
-          ph.group_index = 0;  // 一帧一组：显式写 0，不再靠"零填充"隐式约定
-          ph.member_count = static_cast<uint16_t>(datagrams.size());
-          const auto phb = cue::proto::encode(ph);
-          fpkt.insert(fpkt.end(), phb.begin(), phb.end());
-          fpkt.insert(fpkt.end(), parity.begin(), parity.end());
-          if (!should_drop_pkt(rp.inject_seed, out_permille, pkt_seq++)) {
+            const std::vector<uint8_t> parity = cue::proto::fec_xor_parity(payloads);
+            cue::proto::DatagramHeader fh;
+            fh.type = static_cast<uint8_t>(cue::proto::DownType::Fec);
+            fh.session_id = session_id;
+            fh.frame_id = frame_id;
+            fh.frag_index = span.offset;  // 组起始片号（旧格式恒 0）
+            fh.frag_count = static_cast<uint16_t>(datagrams.size());
+            fh.pts_us = pts_us;
+            // 冗余包本身不是可解码帧：显式不标注 codec，免得 probe 拿奇偶校验字节去解码
+            fh.codec = cue::proto::kDownCodecUnspecified;
+            const auto hdr = cue::proto::encode(fh);
+            std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
+            cue::proto::FecPayloadHeader ph;
+            ph.base_frame_id = frame_id;
+            ph.group_index = static_cast<uint16_t>(g);
+            ph.member_count = span.member_count;
+            const auto phb = cue::proto::encode(ph);
+            fpkt.insert(fpkt.end(), phb.begin(), phb.end());
+            fpkt.insert(fpkt.end(), parity.begin(), parity.end());
+            if (should_drop_pkt(rp.inject_seed, out_permille, pkt_seq++)) continue;
             outgoing.push_back(std::move(fpkt));
+            ++c.fec_groups;
           }
         }
 
@@ -1682,7 +1862,7 @@ int main(int argc, char** argv) {
           // 的帧算成积压，buffer 段也会少采样几帧。
           for (auto& ready : jb.poll(now_tick)) process_frame(std::move(ready));
           c.decode_drops = decoder.stats().dropped;
-          report(rings, c, now_tick, t_last_report, frames_prev, jb.stats(), view);
+          report(rings, c, now_tick, t_last_report, frames_prev, jb.stats(), view, fb_stats);
         }
       }
 
