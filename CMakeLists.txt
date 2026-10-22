@@ -324,6 +324,12 @@ add_executable(test_session tests/test_session.cpp)
 target_link_libraries(test_session PRIVATE cue_agent)
 add_test(NAME session COMMAND test_session)
 
+add_executable(test_session_registry tests/test_session_registry.cpp)
+# session_registry.cpp 在 cue_control 里，而它的 include 是 PRIVATE（分层隔离的代价）。
+# 测试要看 cue/pipeline/ 的头，得显式链 cue_headers_all —— 与其它测试同一口径。
+target_link_libraries(test_session_registry PRIVATE cue_control cue_headers_all)
+add_test(NAME session_registry COMMAND test_session_registry)
+
 add_executable(test_context tests/test_context.cpp)
 target_link_libraries(test_context PRIVATE cue_agent)
 add_test(NAME context COMMAND test_context)
