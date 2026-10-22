@@ -54,8 +54,12 @@ class X264Encoder {
   X264Encoder& operator=(const X264Encoder&) = delete;
 
   // threads ：x264 线程数（2 vCPU 下默认 1，给解码与网络留核）
+  // level_idc：AVC level ×10（30 = L3.0、40 = L4.0）；0 = 交给 x264 自动推导。
+  //   cued 的转码链一直用自动值（默认参数不变）；采集端按浏览器侧 pickCodec 的
+  //   「coded area」规则显式指定，否则同一分辨率在两条产线上会得到不同的 level，
+  //   probe 侧无法对照「编码参数变了没」。
   bool open(int w, int h, int bitrate_kbps, int fps, int gop, std::string_view preset,
-            std::string& err, int threads = 1);
+            std::string& err, int threads = 1, int level_idc = 0);
   void close();
   bool is_open() const;
 

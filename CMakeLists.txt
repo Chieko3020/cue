@@ -89,11 +89,18 @@ find_package(Boost 1.83 REQUIRED COMPONENTS system)
 find_package(nlohmann_json REQUIRED)
 find_package(PkgConfig REQUIRED)
 
-pkg_check_modules(FFMPEG IMPORTED_TARGET libavcodec libavutil libswscale x264)
+# libswresample：采集端的音频重采样固定走 swr_convert（不手写线性插值）
+pkg_check_modules(FFMPEG IMPORTED_TARGET libavcodec libavutil libswscale libswresample x264)
 if(NOT FFMPEG_FOUND)
   message(FATAL_ERROR
     "缺少 FFmpeg / x264 开发包，执行：\n"
-    "  sudo apt install -y libavcodec-dev libavutil-dev libswscale-dev libx264-dev")
+    "  sudo apt install -y libavcodec-dev libavutil-dev libswscale-dev libswresample-dev libx264-dev")
+endif()
+
+# libopus：采集端音频编码（48 kHz mono / 20 ms / 48 kbps，与浏览器 AudioEncoder 一致）
+pkg_check_modules(OPUS IMPORTED_TARGET opus)
+if(NOT OPUS_FOUND)
+  message(FATAL_ERROR "缺少 libopus 开发包，执行：\n  sudo apt install -y libopus-dev")
 endif()
 
 pkg_check_modules(CURL IMPORTED_TARGET libcurl)
@@ -121,6 +128,22 @@ add_executable(cue-probe apps/cue-probe.cpp src/media/h264_decoder.cpp
   src/media/jitter_buffer.cpp)
 target_link_libraries(cue-probe PRIVATE cue_proto Threads::Threads PkgConfig::FFMPEG)
 target_compile_options(cue-probe PRIVATE -Wno-deprecated-declarations)
+
+# ---- 采集端（T-11 / FR-CAP.1–6）----
+# 采集组件独立成静态库：重采样（libswresample）与 Opus（libopus）都是纯组件，
+# tests/test_capture.cpp 不需要起 ffmpeg 子进程就能验证 44.1k→48k 的样本数。
+# FFmpeg/Opus 随库公开链接：编码器（src/media/encoder.cpp）与 app 都直接用它们的头。
+add_library(cue_capture STATIC
+  src/media/audio_resampler.cpp
+  src/media/opus_encoder.cpp)
+target_link_libraries(cue_capture PUBLIC cue_proto PkgConfig::FFMPEG PkgConfig::OPUS)
+
+# cue-capture：三后端（lavfi / ffmpeg 子进程 / v4l2）+ 上行 WS 客户端。
+# 复用 media/encoder（X264Encoder）而不是再写一份 x264 封装——cued 的转码链与采集端
+# 对同一组 x264 参数必须得到同一个码流形状，两处各写一份迟早漂移。
+add_executable(cue-capture apps/cue-capture.cpp src/media/encoder.cpp)
+target_link_libraries(cue-capture PRIVATE cue_capture Boost::system Threads::Threads)
+target_compile_options(cue-capture PRIVATE -Wno-deprecated-declarations)
 
 # ---- 静态资源目录（供本地 http server 使用）----
 add_custom_target(web ALL SOURCES web/index.html web/app.js)
@@ -310,6 +333,13 @@ add_executable(test_nack tests/test_nack.cpp)
 target_link_libraries(test_nack PRIVATE cue_proto)
 add_test(NAME nack COMMAND test_nack)
 
+# T-11：上行包头分片边界（0/16 KiB/16 KiB+1/超大）、Annex-B 起始码（3/4 字节）、
+# 访问单元分帧、swr 重采样样本数、ffmpeg 子进程命令行（dshow/avfoundation 在 Linux 上也能断言）、
+# Opus 20 ms 帧。全部是纯函数/纯组件，毫秒级跑完。
+add_executable(test_capture tests/test_capture.cpp)
+target_link_libraries(test_capture PRIVATE cue_capture)
+add_test(NAME capture COMMAND test_capture)
+
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
 # 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。
@@ -328,7 +358,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
   foreach(_t wire agent context eval state compare console cassette probe sandbox jitter_buffer
-            control_channel tools delay_injector nack)
+            control_channel tools delay_injector nack capture)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
 endif()

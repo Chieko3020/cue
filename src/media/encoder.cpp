@@ -55,7 +55,7 @@ X264Encoder::~X264Encoder() { close(); }
 bool X264Encoder::is_open() const { return impl_ && impl_->enc != nullptr; }
 
 bool X264Encoder::open(int w, int h, int bitrate_kbps, int fps, int gop, std::string_view preset,
-                       std::string& err, int threads) {
+                       std::string& err, int threads, int level_idc) {
   close();
   if (w <= 0 || h <= 0 || w % 2 || h % 2) {
     err = "invalid dimensions (must be positive and even)";
@@ -97,6 +97,9 @@ bool X264Encoder::open(int w, int h, int bitrate_kbps, int fps, int gop, std::st
     err = "x264_param_apply_profile(high) failed";
     return false;
   }
+  // level 必须在 apply_profile 之后设：apply_profile 会按 profile 限制参数并对部分字段
+  // 做归一化，先写 i_level_idc 会被它覆盖。0 保持 x264 的自动推导（cued 的口径）。
+  if (level_idc > 0) im.param.i_level_idc = level_idc;
   im.enc = x264_encoder_open(&im.param);
   if (!im.enc) {
     err = "x264_encoder_open failed (preset=" + preset_s + ")";
