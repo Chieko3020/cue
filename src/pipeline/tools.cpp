@@ -53,6 +53,32 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"age_ms", age_us < 0 ? -1 : age_us / 1000}};
 }
 
+// 端到端读数（probe 侧）单独一块、键名前缀 e2e_：agent 引用 `e2e_lat_p99_ms=...`
+// 时不会与 cued 的 `encode_p50_ms` 混淆。探针不在时只写 probe_alive=false 与原因，
+// 各分位整段不出现——"没有端到端数据"必须比"端到端是 0 ms"更显眼。
+void add_probe_metrics(json& j, const ProbeMetrics& p) {
+  j["probe_alive"] = p.alive;
+  j["probe_samples"] = p.samples;
+  if (!p.unavailable_reason.empty()) j["probe_reason"] = p.unavailable_reason;
+  if (p.samples == 0) return;
+  auto pct = [](double v) { return has_sample(v) ? json(v) : json(nullptr); };
+  j["e2e_fps"] = p.fps;
+  j["e2e_frames"] = p.frames;
+  j["e2e_decoded"] = p.decoded;
+  j["e2e_decode_errors"] = p.decode_errors;
+  j["e2e_stalls"] = p.stalls;
+  j["e2e_max_stall_ms"] = p.max_stall_us / 1000.0;
+  j["e2e_lat_p50_ms"] = pct(p.lat_p50_ms);
+  j["e2e_lat_p95_ms"] = pct(p.lat_p95_ms);
+  j["e2e_lat_p99_ms"] = pct(p.lat_p99_ms);
+  j["e2e_recv_p50_us"] = pct(p.recv.p50);
+  j["e2e_reassembly_p50_us"] = pct(p.reassembly.p50);
+  j["e2e_decode_p50_us"] = pct(p.decode.p50);
+  // 抖动缓冲段：cued 侧还没实现，probe 如实输出 null 并带原因（不写 0）
+  j["e2e_buffer_p50_us"] = pct(p.buffer.p50);
+  if (!p.buffer_reason.empty()) j["e2e_buffer_reason"] = p.buffer_reason;
+}
+
 namespace {
 
 // 统一的留痕包装：工具 handler 返回前把结果记进 trace（失败也要记，证据校验只认真实观测）
@@ -249,7 +275,8 @@ tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
     text = std::string(decision == std::string("denied") ? "拒绝：" : "执行失败：") +
            "run_shell 未执行（cmd=" + cmd + "）；原因：" + reason + "；白名单：" +
            allowed_commands_text() +
-           "。参数不经过 shell（execv 直投），因此 `;`/`|`/`$()` 无法注入。"
+           "。参数不经过 shell（execve 直投，且只给一份最小环境），"
+           "因此 `;`/`|`/`$()` 无法注入，`env` 也读不到 harness 的环境变量。"
            "（沙箱：landlock + rlimit，无 shell）";
   } else {
     text = "run_shell cmd=" + cmd + " args=" + json(args).dump() +
@@ -317,7 +344,8 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
               return record(trace, "query_metrics",
                             tool::ToolResult{false, "尚无采样（cued 未收到媒体流）", json::object()});
             }
-            const json j = metrics_json(m, now_us());
+            json j = metrics_json(m, now_us());
+            add_probe_metrics(j, pipe.probe_latest());
             return record(trace, "query_metrics", tool::ToolResult{true, "metrics=" + j.dump(), j});
           });
 

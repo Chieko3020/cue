@@ -176,7 +176,11 @@ struct DatagramHeader {
   uint8_t magic = kMagicDown;
   uint8_t type = 0;  // DownType
   uint8_t flags = 0;
-  uint8_t reserved = 0;
+  // 载荷的 codec（Codec 枚举；0 = 发送端未标注）。原来是保留字节、恒为 0，
+  // 现在由 cued 填真实值：probe 只有知道 codec 才能决定「解码」还是「跳过并记事件」，
+  // 靠载荷猜（嗅 AVC 起始码）会把 VP8 当 H264 喂进解码器。字节位置与长度不变，
+  // 旧 probe 读到非 0 也只当它保留位，线格式兼容。
+  uint8_t codec = 0;
   uint32_t session_id = 0;
   uint32_t frame_id = 0;
   uint16_t frag_index = 0;
@@ -189,7 +193,7 @@ inline std::array<uint8_t, kDatagramHeaderSize> encode(const DatagramHeader& h) 
   b[0] = h.magic;
   b[1] = h.type;
   b[2] = h.flags;
-  b[3] = h.reserved;
+  b[3] = h.codec;
   detail::put_u32(&b[4], h.session_id);
   detail::put_u32(&b[8], h.frame_id);
   detail::put_u16(&b[12], h.frag_index);
@@ -205,7 +209,7 @@ inline std::optional<DatagramHeader> decode_datagram(std::span<const uint8_t> b)
   h.magic = b[0];
   h.type = b[1];
   h.flags = b[2];
-  h.reserved = b[3];
+  h.codec = b[3];
   h.session_id = detail::get_u32(&b[4]);
   h.frame_id = detail::get_u32(&b[8]);
   h.frag_index = detail::get_u16(&b[12]);
@@ -282,11 +286,15 @@ inline const char* split_error_reason(SplitError e) {
   return "unknown";
 }
 
+// 载荷 codec 未标注（旧发送端 / 非媒体包）：probe 见到它只能记 skipped，不能猜着解码
+inline constexpr uint8_t kDownCodecUnspecified = 0;
+
 // 把一帧切成 ≤kMaxUdpPayload 的分片，返回每个分片的完整数据报（头 + payload）。
-// why 非空时写回失败原因（成功写 None）。
+// why 非空时写回失败原因（成功写 None）。codec 由调用方给载荷的真实 codec（见 DatagramHeader）。
 inline std::vector<std::vector<uint8_t>> split_into_datagrams(
     std::span<const uint8_t> frame, uint32_t session_id, uint32_t frame_id,
-    uint64_t pts_us, bool keyframe, SplitError* why = nullptr) {
+    uint64_t pts_us, bool keyframe, SplitError* why = nullptr,
+    uint8_t codec = kDownCodecUnspecified) {
   if (why) *why = SplitError::None;
   std::vector<std::vector<uint8_t>> out;
   if (frame.empty()) {
@@ -310,6 +318,7 @@ inline std::vector<std::vector<uint8_t>> split_into_datagrams(
     h.frag_index = static_cast<uint16_t>(i);
     h.frag_count = static_cast<uint16_t>(total);
     h.pts_us = pts_us;
+    h.codec = codec;
     auto hdr = encode(h);
     std::vector<uint8_t> pkt(hdr.begin(), hdr.end());
     pkt.insert(pkt.end(), frame.data() + off, frame.data() + off + len);

@@ -13,6 +13,7 @@
 //
 // 文件格式（<dir>/<case_id>.tools.jsonl，每行一条）：
 //   {"v":1,"op":"latest","ret":{...}}
+//   {"v":1,"op":"probe_latest","ret":{...}}   # 端到端（探针）快照，NaN 同样写 null
 //   {"v":1,"op":"set_param","args":{"key":"bitrate_kbps","value":"800"},"ret":{"ok":true}}
 //   {"v":1,"op":"inject_fault","args":{"kind":"drop","value":5},"ret":{"ok":true}}
 //   {"v":1,"op":"observation","args":{"source":"procs","tail":20},"ret":{"text":"..."}}
@@ -21,8 +22,9 @@
 //   {"v":1,"op":"stop","ret":{}}
 //   {"v":1,"op":"running","ret":{"value":true}}
 //
-// NaN 口径：PipelineMetrics 用 NaN 表示「没采到样本」（kNoSample）。JSON 里写 null，
-// 回读时还原成 NaN，绝不变成 0——「没采到」被写成「花了 0 ms」是最危险的一类假绿。
+// NaN 口径：PipelineMetrics / ProbeMetrics 用 NaN 表示「没采到样本」（kNoSample）。
+// JSON 里写 null，回读时还原成 NaN，绝不变成 0——「没采到」被写成「花了 0 ms」
+// 是最危险的一类假绿。
 #pragma once
 
 #include <cstddef>
@@ -70,6 +72,9 @@ class RecordingPipeline : public IServicePipeline {
   void stop() override;
   bool running() const override;
   PipelineMetrics latest() const override;
+  // 端到端指标也进录制：否则回放时 probe_latest() 恒为空，AC-6 的
+  // 「同一份观测必然得到同一判定」在端到端 SLA 上就不成立。
+  ProbeMetrics probe_latest() const override;
   void set_event_callback(std::function<void(const PipelineEvent&)> cb) override;
   std::vector<PipelineEvent> recent_events(std::size_t n = 0) const override;
   bool set_param(const std::string& key, const std::string& value, std::string& err) override;
@@ -113,6 +118,7 @@ class ReplayPipeline : public IServicePipeline {
   void stop() override;
   bool running() const override;
   PipelineMetrics latest() const override;
+  ProbeMetrics probe_latest() const override;
   void set_event_callback(std::function<void(const PipelineEvent&)> cb) override;
   std::vector<PipelineEvent> recent_events(std::size_t n = 0) const override;
   bool set_param(const std::string& key, const std::string& value, std::string& err) override;
@@ -138,11 +144,12 @@ class ReplayPipeline : public IServicePipeline {
   std::string load_error_;
   std::vector<Record> start_, set_param_, inject_fault_, observation_, running_;
   std::vector<PipelineMetrics> latest_;
+  std::vector<ProbeMetrics> probe_latest_;
   std::vector<EventsRecord> recent_events_;
   std::vector<PipelineEvent> events_for_callback_;
   mutable std::mutex mu_;
   mutable std::size_t i_start_ = 0, i_set_param_ = 0, i_inject_ = 0, i_obs_ = 0,
-                       i_events_ = 0, i_running_ = 0, i_latest_ = 0;
+                       i_events_ = 0, i_running_ = 0, i_latest_ = 0, i_probe_ = 0;
   mutable ReplayStats stats_;
   mutable std::string error_;
   std::function<void(const PipelineEvent&)> cb_;

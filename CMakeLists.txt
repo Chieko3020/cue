@@ -110,9 +110,12 @@ add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.c
 target_link_libraries(cued PRIVATE cue_proto Boost::system Threads::Threads PkgConfig::FFMPEG)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 
-# ---- cue-probe：下行接收端（UDP 重组 + 指标）----
-add_executable(cue-probe apps/cue-probe.cpp)
-target_link_libraries(cue-probe PRIVATE cue_proto Threads::Threads)
+# ---- cue-probe：下行接收端（UDP 重组 + H.264 软解 + 帧统计/端到端指标）----
+# probe 复用 media/h264_decoder（不另写一个解码器）：同一份 libavcodec 封装在
+# cued 与 probe 两侧的行为必须一致，否则两边的"解码耗时"没法对照。
+add_executable(cue-probe apps/cue-probe.cpp src/media/h264_decoder.cpp)
+target_link_libraries(cue-probe PRIVATE cue_proto Threads::Threads PkgConfig::FFMPEG)
+target_compile_options(cue-probe PRIVATE -Wno-deprecated-declarations)
 
 # ---- 静态资源目录（供本地 http server 使用）----
 add_custom_target(web ALL SOURCES web/index.html web/app.js)
@@ -250,10 +253,12 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   if(_cue_san_runtime AND EXISTS "${_cue_san_runtime}")
     list(APPEND CUE_SAN_ENV "LD_PRELOAD=${_cue_san_runtime}")
   endif()
-  # test_sandbox 有意不在这个列表里：CUE_SAN_ENV 的 LD_PRELOAD=libasan 会被
-  # exec 出去的白名单命令继承，而 ASan 的 shadow 映射远超沙箱的 RLIMIT_AS=256 MB，
-  # 子进程会在 main 之前就死掉——那是测试夹具的冲突，不是沙箱的行为。
-  foreach(_t wire agent context eval state compare console cassette)
+  # test_sandbox 也在这个列表里：沙箱子进程现在走 execve + **显式环境白名单**
+  # （src/sandbox/sandbox.cpp），不再继承 LD_PRELOAD，所以既不会出现
+  # "ASan runtime does not come first"，也不会被 ASan 的 shadow 映射撞坏 RLIMIT_AS。
+  # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
+  # 环境变量，包括 CUE_API_KEY。
+  foreach(_t wire agent context eval state compare console cassette probe sandbox)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
 endif()

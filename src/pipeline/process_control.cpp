@@ -71,12 +71,96 @@ void mark_inherited_fds_cloexec() {
   }
 }
 
+// fork + exec 的公共部分（cued 与 probe 共用）：
+//  - pipe2(O_CLOEXEC) 收子进程的 stdout+stderr；
+//  - handshake 管道把 execv 失败的 errno 交回父进程——启动失败必须如实报，不能"假装成功"（review #10）；
+//  - 子进程自成进程组并挂 PDEATHSIG：cue 被 SIGKILL 时它拉起的进程不会留成孤儿（AC-8）。
+struct Child {
+  pid_t pid = 0;  // 0 = 失败（err 有原因）
+  int fd = -1;    // 读端：子进程的 stdout+stderr
+  std::string err;
+};
+
+Child spawn_child(const std::vector<std::string>& args) {
+  Child out;
+  if (args.empty() || args.front().empty()) {
+    out.err = "可执行文件路径为空";
+    return out;
+  }
+  int fds[2];
+  if (::pipe2(fds, O_CLOEXEC) != 0) {
+    out.err = std::string("pipe2: ") + std::strerror(errno);
+    return out;
+  }
+  int hs[2];
+  if (::pipe2(hs, O_CLOEXEC) != 0) {
+    out.err = std::string("pipe2(handshake): ") + std::strerror(errno);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return out;
+  }
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+  argv.push_back(nullptr);
+
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    out.err = std::string("fork: ") + std::strerror(errno);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    ::close(hs[0]);
+    ::close(hs[1]);
+    return out;
+  }
+  if (pid == 0) {
+    ::setpgid(0, 0);
+    ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (::getppid() == 1) _exit(127);  // 父进程在 prctl 之前就没了
+    ::dup2(fds[1], STDOUT_FILENO);
+    ::dup2(fds[1], STDERR_FILENO);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    ::close(hs[0]);
+    mark_inherited_fds_cloexec();  // hs[1] 也已被标 CLOEXEC（本来就有）
+    ::execv(args.front().c_str(), argv.data());
+    const int exec_errno = errno;
+    // 唯一的出口：把 errno 交给父进程；_exit 不走 atexit/析构。
+    const ssize_t ignored = ::write(hs[1], &exec_errno, sizeof(exec_errno));
+    (void)ignored;
+    _exit(127);
+  }
+
+  ::close(fds[1]);
+  ::close(hs[1]);
+  int child_errno = 0;
+  ssize_t hn = 0;
+  do {
+    hn = ::read(hs[0], &child_errno, sizeof(child_errno));
+  } while (hn < 0 && errno == EINTR);
+  ::close(hs[0]);
+
+  if (hn == static_cast<ssize_t>(sizeof(child_errno))) {
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    ::close(fds[0]);
+    out.err = "exec " + args.front() + ": " + std::strerror(child_errno);
+    return out;
+  }
+  out.pid = pid;
+  out.fd = fds[0];
+  return out;
+}
+
 }  // namespace
 
 ProcessPipelineControl::ProcessPipelineControl(Config cfg) : cfg_(std::move(cfg)) {
   // 回调单独存一份：cfg_ 会被 set_param/inject_fault 在别的线程整体赋值，
   // reader 线程每次读 cfg_ 都会与它竞争。
   on_event_ = cfg_.on_event;
+  // 是否托管探针在构造时定死：probe_bin 不是 set_param 能改的键，所以不需要加锁读 cfg_
+  probe_enabled_ = !cfg_.probe_bin.empty();
   supervisor_ = std::thread([this] { supervisor_loop(); });
 }
 
@@ -96,7 +180,31 @@ bool ProcessPipelineControl::spawn_locked(std::string& err) {
     err = "cued already running";
     return false;
   }
-  // 自动重启路径不会经过 stop()：上一代的读线程与日志 fd 必须在这里收干净。
+  // 先起 probe（cued 的下游）：probe 绑定端口之前 cued 发的包会被内核直接丢掉，
+  // 端到端指标就会从第一个窗口起缺样本。probe 起不来也照样起 cued——否则"探针没起来"
+  // 会被报成 pipeline_start_failed，掩盖真正的原因。失败原因留给 probe_latest()。
+  if (probe_enabled_ && probe_pid_.load() == 0) {
+    std::string perr;
+    if (!spawn_probe_locked(perr)) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        probe_unavailable_ = "probe 启动失败：" + perr;
+        push_log_locked("[supervisor] " + probe_unavailable_);
+      }
+      emit_local_event("probe.unavailable", json{{"reason", perr}});
+    }
+  }
+  if (spawn_cued_locked(err)) return true;
+  // cued 起不来：这一次拉起的探针不能留成孤儿。stopping_ 也要挡住监督线程——
+  // 否则它可能把这次"控制面收尾"当成探针崩溃，再拉一代起来占着端口。
+  stopping_.store(true);
+  kill_probe_locked();
+  stopping_.store(false);
+  return false;
+}
+
+bool ProcessPipelineControl::spawn_cued_locked(std::string& err) {
+  // 自动重启 / 改档重启都不会经过 stop()：上一代的读线程与日志 fd 必须在这里收干净。
   // 否则给 joinable 的 std::thread 重新赋值会直接 std::terminate（实测踩过）。
   if (reader_.joinable()) {
     stop_reader_.store(true);
@@ -105,22 +213,6 @@ bool ProcessPipelineControl::spawn_locked(std::string& err) {
   if (log_fd_ >= 0) {
     ::close(log_fd_);
     log_fd_ = -1;
-  }
-
-  // pipe2(O_CLOEXEC)：两个管道都不会被 cued 继承（review #23）
-  int fds[2];
-  if (::pipe2(fds, O_CLOEXEC) != 0) {
-    err = std::string("pipe2: ") + std::strerror(errno);
-    return false;
-  }
-  // exec 握手管道：execv 成功后写端被 CLOEXEC 关掉（父读到 EOF = 成功）；
-  // 失败则子进程写入 errno，父进程据此报"启动失败"而不是假装成功（review #10）
-  int hs[2];
-  if (::pipe2(hs, O_CLOEXEC) != 0) {
-    err = std::string("pipe2(handshake): ") + std::strerror(errno);
-    ::close(fds[0]);
-    ::close(fds[1]);
-    return false;
   }
 
   std::vector<std::string> args{
@@ -154,71 +246,105 @@ bool ProcessPipelineControl::spawn_locked(std::string& err) {
       args.push_back(std::to_string(cfg_.height));
     }
   }
-  std::vector<char*> argv;
-  argv.reserve(args.size() + 1);
-  for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-  argv.push_back(nullptr);
 
-  const pid_t pid = ::fork();
-  if (pid < 0) {
-    err = std::string("fork: ") + std::strerror(errno);
-    ::close(fds[0]);
-    ::close(fds[1]);
-    ::close(hs[0]);
-    ::close(hs[1]);
+  const Child cued = spawn_child(args);
+  if (cued.pid == 0) {
+    err = cued.err;
     return false;
   }
-  if (pid == 0) {
-    // 自己是进程组长：stop() 可以整组回收，probe 之类的孙进程不会成孤儿（AC-8）
-    ::setpgid(0, 0);
-    // cue 被 SIGKILL/崩溃时也要带走 cued：否则 ps 里会留下没人管的 cued（AC-8）
-    ::prctl(PR_SET_PDEATHSIG, SIGKILL);
-    if (::getppid() == 1) _exit(127);  // 父进程在 prctl 之前就没了
-    ::dup2(fds[1], STDOUT_FILENO);
-    ::dup2(fds[1], STDERR_FILENO);
-    ::close(fds[0]);
-    ::close(fds[1]);
-    ::close(hs[0]);
-    mark_inherited_fds_cloexec();  // hs[1] 也已被标 CLOEXEC（本来就有）
-    ::execv(cfg_.cued_bin.c_str(), argv.data());
-    const int exec_errno = errno;
-    // 唯一的出口：把 errno 交给父进程；_exit 不走 atexit/析构。
-    // 写失败只可能是父进程已经不在了，此时无从上报，直接退出。
-    const ssize_t ignored = ::write(hs[1], &exec_errno, sizeof(exec_errno));
-    (void)ignored;
-    _exit(127);
-  }
-
-  ::close(fds[1]);
-  ::close(hs[1]);
-  int child_errno = 0;
-  ssize_t hn = 0;
-  do {
-    hn = ::read(hs[0], &child_errno, sizeof(child_errno));
-  } while (hn < 0 && errno == EINTR);
-  ::close(hs[0]);
-
-  if (hn == static_cast<ssize_t>(sizeof(child_errno))) {
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-    }
-    ::close(fds[0]);
-    err = "exec " + cfg_.cued_bin + ": " + std::strerror(child_errno);
-    return false;
-  }
-
-  log_fd_ = fds[0];
+  log_fd_ = cued.fd;
   {
     std::lock_guard<std::mutex> lk(mu_);
     // 新会话的指标必须清零：否则重启后 1 s 内 latest() 返回上一个 cued 的数字（#25）
     metrics_ = PipelineMetrics{};
-    metrics_.pid = pid;
-    push_log_locked("[supervisor] cued started pid=" + std::to_string(pid));
+    metrics_.pid = cued.pid;
+    push_log_locked("[supervisor] cued started pid=" + std::to_string(cued.pid));
   }
-  pid_.store(pid);
+  pid_.store(cued.pid);
   stop_reader_.store(false);
   reader_ = std::thread([this] { reader_loop(); });
   return true;
+}
+
+bool ProcessPipelineControl::spawn_probe_locked(std::string& err) {
+  if (probe_pid_.load() != 0) {
+    err = "probe already running";
+    return false;
+  }
+  if (probe_reader_.joinable()) {
+    stop_probe_reader_.store(true);
+    probe_reader_.join();
+  }
+  if (probe_fd_ >= 0) {
+    ::close(probe_fd_);
+    probe_fd_ = -1;
+  }
+  std::vector<std::string> args{
+      cfg_.probe_bin, "--port", std::to_string(cfg_.probe_port),
+      "--bind", cfg_.probe_host,
+      // 标称帧率只用来推卡顿阈值（stall_factor × 1/fps），不是测量值
+      "--fps", std::to_string(cfg_.fps),
+  };
+  if (!cfg_.probe_report_addrs.empty()) {
+    // 跨机模式：harness 与 probe 不在同一台机器上时，指标走 TCP JSON-line 上报；
+    // 本机模式下这条通道为空，probe 只打 stdout（我们直接读管道）。
+    args.push_back("--report-addrs");
+    args.push_back(cfg_.probe_report_addrs);
+  }
+  const Child probe = spawn_child(args);
+  if (probe.pid == 0) {
+    err = probe.err;
+    return false;
+  }
+  probe_fd_ = probe.fd;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // 新一代探针：上一代的读数必须清零，否则 probe_latest() 会拿旧指标冒充当前状态
+    probe_metrics_ = ProbeMetrics{};
+    probe_metrics_.pid = probe.pid;
+    probe_unavailable_.clear();
+    probe_last_log_.clear();
+    push_log_locked("[supervisor] probe started pid=" + std::to_string(probe.pid));
+  }
+  probe_pid_.store(probe.pid);
+  stop_probe_reader_.store(false);
+  probe_reader_ = std::thread([this] { probe_reader_loop(); });
+  emit_local_event("probe.spawned",
+                   json{{"pid", probe.pid}, {"port", cfg_.probe_port}, {"bin", cfg_.probe_bin}});
+  return true;
+}
+
+void ProcessPipelineControl::kill_probe_locked() {
+  const pid_t pid = probe_pid_.load();
+  if (pid != 0) {
+    ::kill(pid, SIGTERM);
+    int status = 0;
+    bool gone = false;
+    for (int i = 0; i < 50; ++i) {  // 最多等 500ms
+      const pid_t r = ::waitpid(pid, &status, WNOHANG);
+      if (r == pid || (r < 0 && errno == ECHILD)) {
+        gone = true;
+        break;
+      }
+      ::usleep(10 * 1000);
+    }
+    if (!gone) {
+      ::kill(pid, SIGKILL);
+      while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+      }
+    }
+    // 只清自己那一代：监督线程可能已经 reaped 并重启了一代，直接清零会把新探针
+    // 从账上抹掉（它还在跑、还占着端口，之后再也回收不到）。
+    if (probe_pid_.load() == pid) probe_pid_.store(0);
+    emit_local_event("probe.stopped", json{{"reason", "control"}, {"pid", pid}});
+  }
+  // 先让读线程退出再关 fd（与 cued 侧同一个理由：fd 号被复用后可能读到别人的数据）
+  stop_probe_reader_.store(true);
+  if (probe_reader_.joinable()) probe_reader_.join();
+  if (probe_fd_ >= 0) {
+    ::close(probe_fd_);
+    probe_fd_ = -1;
+  }
 }
 
 bool ProcessPipelineControl::start(std::string& err) {
@@ -229,6 +355,26 @@ bool ProcessPipelineControl::start(std::string& err) {
 void ProcessPipelineControl::stop() {
   std::lock_guard<std::mutex> lk(spawn_mu_);
   stopping_.store(true);
+  kill_cued_locked();
+  // 倒序收下游：cued 停了以后 probe 已经没有数据来源，先停 cued 再停它，
+  // 避免"探针先死、cued 还在往死端口发包"这段窗口里的假计数。
+  kill_probe_locked();
+  restarts_ = 0;
+  probe_restarts_ = 0;
+  stopping_.store(false);
+}
+
+bool ProcessPipelineControl::restart_cued(std::string& err) {
+  std::lock_guard<std::mutex> lk(spawn_mu_);
+  // stopping_ 只在这一小段置位：监督线程据此知道"pid 归零是控制面在改档，不是崩溃"，
+  // 否则它会把这次重启当成崩溃再叠一次自动重启。
+  stopping_.store(true);
+  kill_cued_locked();
+  stopping_.store(false);
+  return spawn_cued_locked(err);
+}
+
+void ProcessPipelineControl::kill_cued_locked() {
   const pid_t pid = pid_.load();
   if (pid != 0) {
     // cued 是进程组长（forked 后 setpgid(0,0)），kill(-pid) 连它拉起的子进程一起收；
@@ -270,86 +416,139 @@ void ProcessPipelineControl::stop() {
     ::close(log_fd_);
     log_fd_ = -1;
   }
-  restarts_ = 0;
-  stopping_.store(false);
 }
 
 void ProcessPipelineControl::supervisor_loop() {
+  // cued 与 probe 各自有独立的 pid 与重启预算：探针崩溃不该重启 cued（那会断流），
+  // cued 崩溃也不该把探针的累计计数清零（端到端样本是接收端视角）。
   while (!stop_super_.load()) {
-    const pid_t pid = pid_.load();
-    if (pid == 0) {
-      std::this_thread::sleep_for(kReapPoll);
-      continue;
-    }
-    int status = 0;
-    const pid_t r = ::waitpid(pid, &status, WNOHANG);
-    if (r == pid) {
-      pid_.store(0);
-      const bool was_stopping = stopping_.load();
-      std::string msg = "[supervisor] cued pid=" + std::to_string(pid) + " exited " +
-                        describe_status(status);
-      if (was_stopping) {
-        push_log(msg);
-        continue;
-      }
-      bool restarted = false;
-      {
-        std::lock_guard<std::mutex> slk(spawn_mu_);
-        if (stopping_.load()) {
-          // stop() 抢到了锁：它会把这一代收干净，不再重启
-        } else if (restarts_ >= kMaxRestarts) {
-          msg += "（自动重启预算 " + std::to_string(kMaxRestarts) + " 次已耗尽，不再重启）";
-        } else {
-          ++restarts_;
-          std::this_thread::sleep_for(kRestartBackoff);
-          std::string rerr;
-          if (spawn_locked(rerr)) {
-            restarted = true;
-            msg += " → 已自动重启 pid=" + std::to_string(pid_.load());
-          } else {
-            msg += " → 重启失败: " + rerr;
-          }
-        }
-      }
-      // 崩溃/被 kill：cued 自己来不及报（SIGKILL 更是没机会），由监督方补事件。
-      // 走到这里 was_stopping 必为 false（true 的分支上面已经 continue）。
-      emit_local_event("pipeline.stopped", json{{"reason", "exit"},
-                                                {"pid", pid},
-                                                {"status", describe_status(status)},
-                                                {"restarting", restarted}});
-      if (restarted) {
-        emit_local_event("pipeline.restart", json{{"reason", "auto_restart"},
-                                                  {"old_pid", pid},
-                                                  {"new_pid", pid_.load()}});
-      }
-      push_log(msg);
-      std::fprintf(stderr, "%s\n", msg.c_str());
-      continue;
-    }
-    if (r < 0 && errno != EINTR && errno != EAGAIN) {
-      // ECHILD：这个 pid 已经被别人回收（或本就是僵尸），保守地认为进程已不在
-      pid_.store(0);
-      push_log("[supervisor] waitpid(" + std::to_string(pid) + ") failed: " +
-               std::strerror(errno));
-      continue;
-    }
+    const pid_t cued = pid_.load();
+    if (cued != 0) supervise_cued_once(cued);
+    const pid_t probe = probe_pid_.load();
+    if (probe != 0) supervise_probe_once(probe);
     std::this_thread::sleep_for(kReapPoll);
   }
 }
 
-void ProcessPipelineControl::reader_loop() {
+void ProcessPipelineControl::supervise_cued_once(pid_t pid) {
+  int status = 0;
+  const pid_t r = ::waitpid(pid, &status, WNOHANG);
+  if (r == pid) {
+    pid_.store(0);
+    const bool was_stopping = stopping_.load();
+    std::string msg = "[supervisor] cued pid=" + std::to_string(pid) + " exited " +
+                      describe_status(status);
+    if (was_stopping) {
+      push_log(msg);
+      return;
+    }
+    bool restarted = false;
+    {
+      std::lock_guard<std::mutex> slk(spawn_mu_);
+      if (stopping_.load()) {
+        // stop() 抢到了锁：它会把这一代收干净，不再重启
+      } else if (restarts_ >= kMaxRestarts) {
+        msg += "（自动重启预算 " + std::to_string(kMaxRestarts) + " 次已耗尽，不再重启）";
+      } else {
+        ++restarts_;
+        std::this_thread::sleep_for(kRestartBackoff);
+        std::string rerr;
+        if (spawn_locked(rerr)) {
+          restarted = true;
+          msg += " → 已自动重启 pid=" + std::to_string(pid_.load());
+        } else {
+          msg += " → 重启失败: " + rerr;
+        }
+      }
+    }
+    // 崩溃/被 kill：cued 自己来不及报（SIGKILL 更是没机会），由监督方补事件。
+    // 走到这里 was_stopping 必为 false（true 的分支上面已经 return）。
+    emit_local_event("pipeline.stopped", json{{"reason", "exit"},
+                                              {"pid", pid},
+                                              {"status", describe_status(status)},
+                                              {"restarting", restarted}});
+    if (restarted) {
+      emit_local_event("pipeline.restart", json{{"reason", "auto_restart"},
+                                                {"old_pid", pid},
+                                                {"new_pid", pid_.load()}});
+    }
+    push_log(msg);
+    std::fprintf(stderr, "%s\n", msg.c_str());
+    return;
+  }
+  if (r < 0 && errno != EINTR && errno != EAGAIN) {
+    // ECHILD：这个 pid 已经被别人回收（或本就是僵尸），保守地认为进程已不在
+    pid_.store(0);
+    push_log("[supervisor] waitpid(" + std::to_string(pid) + ") failed: " + std::strerror(errno));
+  }
+}
+
+void ProcessPipelineControl::supervise_probe_once(pid_t pid) {
+  int status = 0;
+  const pid_t r = ::waitpid(pid, &status, WNOHANG);
+  if (r == pid) {
+    probe_pid_.store(0);
+    const bool was_stopping = stopping_.load();
+    std::string msg = "[supervisor] probe pid=" + std::to_string(pid) + " exited " +
+                      describe_status(status);
+    if (was_stopping) {
+      push_log(msg);
+      return;
+    }
+    bool restarted = false;
+    {
+      std::lock_guard<std::mutex> slk(spawn_mu_);
+      if (stopping_.load()) {
+        // stop() 抢到了锁：它会把这一代收干净，不再重启
+      } else if (probe_restarts_ >= kMaxRestarts) {
+        msg += "（probe 自动重启预算 " + std::to_string(kMaxRestarts) + " 次已耗尽，"
+               "端到端指标将不可用）";
+        std::lock_guard<std::mutex> lk(mu_);
+        probe_unavailable_ = "probe 反复退出且自动重启预算已耗尽";
+      } else {
+        ++probe_restarts_;
+        std::this_thread::sleep_for(kRestartBackoff);
+        std::string perr;
+        if (spawn_probe_locked(perr)) {
+          restarted = true;
+          msg += " → 已自动重启 pid=" + std::to_string(probe_pid_.load());
+        } else {
+          msg += " → 重启失败: " + perr;
+          std::lock_guard<std::mutex> lk(mu_);
+          probe_unavailable_ = "probe 重启失败：" + perr;
+        }
+      }
+    }
+    emit_local_event("probe.exited", json{{"reason", "exit"},
+                                          {"pid", pid},
+                                          {"status", describe_status(status)},
+                                          {"restarting", restarted}});
+    push_log(msg);
+    std::fprintf(stderr, "%s\n", msg.c_str());
+    return;
+  }
+  if (r < 0 && errno != EINTR && errno != EAGAIN) {
+    probe_pid_.store(0);
+    push_log("[supervisor] waitpid(probe " + std::to_string(pid) +
+             ") failed: " + std::strerror(errno));
+  }
+}
+
+// cued 与 probe 的读线程只差一个 fd 和一个停止标志：解析逻辑完全共用
+// （两者都按 wire.h 的 [cue-event] 行格式输出，人读行也都只进 log_tail_）。
+void ProcessPipelineControl::read_loop(int fd, std::atomic<bool>& stop_flag) {
   std::string buf;
   char tmp[4096];
-  while (!stop_reader_.load()) {
-    pollfd pfd{log_fd_, POLLIN, 0};
+  while (!stop_flag.load()) {
+    pollfd pfd{fd, POLLIN, 0};
     const int pr = ::poll(&pfd, 1, 200);  // 200ms 超时：读线程天然可中断（#24）
     if (pr < 0) {
       if (errno == EINTR) continue;
       break;
     }
     if (pr == 0) continue;
-    const ssize_t n = ::read(log_fd_, tmp, sizeof(tmp));
-    if (n == 0) break;  // EOF：cued 已关掉写端
+    const ssize_t n = ::read(fd, tmp, sizeof(tmp));
+    if (n == 0) break;  // EOF：子进程已关掉写端
     if (n < 0) {
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
       break;
@@ -363,6 +562,10 @@ void ProcessPipelineControl::reader_loop() {
     }
   }
 }
+
+void ProcessPipelineControl::reader_loop() { read_loop(log_fd_, stop_reader_); }
+
+void ProcessPipelineControl::probe_reader_loop() { read_loop(probe_fd_, stop_probe_reader_); }
 
 void ProcessPipelineControl::parse_line(const std::string& line) {
   // 结构化事件行：整行标签匹配，与 [cued] 人读行 / METRICS 行互不干扰
@@ -428,6 +631,12 @@ void ProcessPipelineControl::parse_line(const std::string& line) {
   }
   // 人的可读行留在 log_tail_，但每秒的 fps 摘要行不再重复堆进去（指标已结构化）
   if (line.rfind("[cued] fps=", 0) == 0) return;
+  if (line.rfind("[probe] fps=", 0) == 0) return;
+  // probe 的人读行单独留一份：它起不来/绑不上端口时，原因就在这几行里
+  if (line.rfind("[probe]", 0) == 0) {
+    std::lock_guard<std::mutex> lk(mu_);
+    probe_last_log_ = line;
+  }
   push_log(line);
 }
 
@@ -450,7 +659,48 @@ void ProcessPipelineControl::parse_event_line(const std::string& body) {
     ev.t_us = t->get<int64_t>();
   }
   ev.seen_us = now_us();
+  // probe 的每秒指标行同时是「事件」（进缓存/SSE）和「结构化快照」（probe_latest 的数据源）。
+  // 只把它当事件缓存起来是不够的：消费方要的是"当前值"，不是自己去事件流里倒推。
+  if (ev.type == "probe.metric") parse_probe_metric(ev.data);
   record_event(std::move(ev));
+}
+
+void ProcessPipelineControl::parse_probe_metric(const json& data) {
+  ProbeMetrics p;
+  std::string perr;
+  if (!probe_metrics_from_json(data, p, perr)) {
+    push_log("[pipeline] probe.metric 解析失败：" + perr);
+    return;
+  }
+  std::lock_guard<std::mutex> lk(mu_);
+  const pid_t pid = probe_pid_.load();
+  // samples 由 harness 数「收到了几条指标行」，不是从数值里猜的：
+  // 评测侧的「等新采样」逻辑依赖它单调增长。
+  p.samples = probe_metrics_.samples + 1;
+  p.updated_us = now_us();
+  p.pid = pid;
+  p.alive = pid != 0;
+  probe_metrics_ = std::move(p);
+}
+
+ProbeMetrics ProcessPipelineControl::probe_latest() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  ProbeMetrics p = probe_metrics_;
+  p.alive = probe_pid_.load() != 0;
+  // 不可用要**说清是哪一种**：进程没起、起不来、起来了但一条指标都没有，
+  // 三者对使用者意味着不同的处置（换路径 / 查端口 / 查媒体流）。
+  if (!probe_enabled_) {
+    p.unavailable_reason = "probe 未启用（probe_bin 为空）";
+  } else if (!probe_unavailable_.empty()) {
+    p.unavailable_reason = probe_unavailable_;
+    if (!probe_last_log_.empty()) p.unavailable_reason += "；probe 日志：" + probe_last_log_;
+  } else if (!p.alive) {
+    p.unavailable_reason = "probe 进程未运行（起不来或刚退出）";
+  } else if (p.samples == 0) {
+    p.unavailable_reason = "probe 已启动但还没有指标上报（不足 1 s 或没有媒体流）";
+    if (!probe_last_log_.empty()) p.unavailable_reason += "；probe 日志：" + probe_last_log_;
+  }
+  return p;
 }
 
 void ProcessPipelineControl::emit_local_event(std::string type, json data) {
@@ -564,8 +814,7 @@ bool ProcessPipelineControl::set_param(const std::string& key, const std::string
     return true;
   }
   cfg_ = next;
-  stop();
-  if (!spawn(err)) return false;
+  if (!restart_cued(err)) return false;
   emit_local_event("pipeline.restart", json{{"reason", "config_change"},
                                             {"key", key},
                                             {"value", value},
@@ -615,8 +864,7 @@ bool ProcessPipelineControl::inject_fault(const std::string& kind, double value,
     return true;  // 幂等：注入值没变不重启
   }
   cfg_ = next;
-  stop();
-  if (!spawn(err)) return false;
+  if (!restart_cued(err)) return false;
   emit_local_event("pipeline.restart", json{{"reason", "fault_change"}, {"pid", pid_.load()}});
   // 施加故障由 cued 自己报（fault.applied，scope=cued_start）；取消故障 cued 侧无从得知
   // （它只是以未注入的档位启动），所以 cleared 只能由控制面补上。

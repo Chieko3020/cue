@@ -221,6 +221,29 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     m.encode_p50 = cue::pipeline::kNoSample;
     return m;
   }
+  // 端到端快照：这里造一份有样本的（NaN 段保持 NaN，验证录制回放不把"没采到"变 0）
+  cue::pipeline::ProbeMetrics probe_latest() const override {
+    cue::pipeline::ProbeMetrics p;
+    p.alive = true;
+    p.pid = 4242;
+    p.samples = 1;
+    p.fps = 29.5;
+    p.frames = 300;
+    p.decoded = 298;
+    p.stalls = 2;
+    p.max_stall_us = 66000;
+    p.recv = {0.12, 0.48};
+    p.reassembly = {0.9, 4.2};
+    p.decode = {1.5, 6.1};
+    p.lat_p50_ms = 42.5;
+    p.lat_p95_ms = 71.0;
+    p.lat_p99_ms = 96.25;
+    p.synced = true;
+    // buffer 段没有样本：回放后必须仍是 NaN，不能变成 0
+    p.buffer = {};
+    p.buffer_reason = "cued_jitter_buffer_unimplemented";
+    return p;
+  }
   void set_event_callback(std::function<void(const cue::pipeline::PipelineEvent&)> cb) override {
     cb_ = std::move(cb);
   }
@@ -268,6 +291,9 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     check(rp.start(err), "case11 录制 start");
     const auto m = rp.latest();
     check(m.samples == 1 && m.fps == 29.97, "case11 录制 latest 透传");
+    // 端到端快照也必须进录制（否则回放时端到端 SLA 无从判定）
+    const auto p = rp.probe_latest();
+    check(p.samples == 1 && p.lat_p99_ms == 96.25, "case11 录制 probe_latest 透传");
     check(rp.set_param("bitrate_kbps", "800", err), "case11 录制 set_param 成功");
     check(!rp.set_param("gop", "61", err), "case11 录制 set_param 失败也照录");
     err.clear();
@@ -292,6 +318,10 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
   check(file_text.find("\"decode_p99_ms\":null") != std::string::npos, "case11 无样本的分位写 null");
   check(file_text.find("\"encode_p50_ms\":null") != std::string::npos, "case11 无样本的 encode 写 null");
   check(file_text.find("\"decode_p99_ms\":0") == std::string::npos, "case11 无样本绝不写成 0");
+  check(file_text.find("\"op\":\"probe_latest\"") != std::string::npos, "case11 端到端快照进录制");
+  check(file_text.find("\"lat_p99_ms\":96.25") != std::string::npos, "case11 端到端 p99 写数字");
+  check(file_text.find("\"buffer_us\":{\"p50\":null") != std::string::npos,
+        "case11 buffer 段无样本写 null（不写 0）");
 
   {
     ReplayPipeline rp(rec_path);
@@ -300,6 +330,11 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     check(rp.start(err), "case11 回放 start");
     const auto m = rp.latest();
     check(m.samples == 1 && m.fps == 29.97 && m.pid == 4242, "case11 回放指标一致");
+    const auto p = rp.probe_latest();
+    check(p.samples == 1 && p.lat_p99_ms == 96.25 && p.stalls == 2, "case11 回放端到端指标一致");
+    check(cue::pipeline::has_sample(p.decode.p50) && p.decode.p50 == 1.5, "case11 回放 decode 段还原");
+    check(!cue::pipeline::has_sample(p.buffer.p50), "case11 回放 buffer 段仍是 NaN（不是 0）");
+    check(p.buffer_reason == "cued_jitter_buffer_unimplemented", "case11 回放 buffer 原因保留");
     check(cue::pipeline::has_sample(m.decode_p50) && m.decode_p50 == 1.24, "case11 回放 p50 还原");
     check(!cue::pipeline::has_sample(m.decode_p99), "case11 回放 NaN 仍是 NaN（不是 0）");
     check(!cue::pipeline::has_sample(m.encode_p50), "case11 回放 encode NaN 仍是 NaN");

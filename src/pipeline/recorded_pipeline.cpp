@@ -278,6 +278,14 @@ PipelineMetrics RecordingPipeline::latest() const {
   return m;
 }
 
+ProbeMetrics RecordingPipeline::probe_latest() const {
+  const ProbeMetrics p = inner_->probe_latest();
+  std::lock_guard<std::mutex> lk(write_mu_);
+  write_line(
+      json{{"v", kFormatVersion}, {"op", "probe_latest"}, {"ret", probe_metrics_to_json(p)}});
+  return p;
+}
+
 void RecordingPipeline::set_event_callback(std::function<void(const PipelineEvent&)> cb) {
   inner_->set_event_callback(std::move(cb));
 }
@@ -376,6 +384,13 @@ ReplayPipeline::ReplayPipeline(std::string path) : path_(std::move(path)) {
         return;
       }
       latest_.push_back(m);
+    } else if (op == "probe_latest") {
+      ProbeMetrics p;
+      if (!probe_metrics_from_json(ret, p, err)) {
+        load_error_ = path_ + " 第 " + std::to_string(no) + " 行： " + err;
+        return;
+      }
+      probe_latest_.push_back(std::move(p));
     } else if (op == "start") {
       bool ok = false;
       std::string e;
@@ -457,8 +472,9 @@ ReplayPipeline::ReplayPipeline(std::string path) : path_(std::move(path)) {
     load_error_ = "工具录制文件为空或没有可回放的调用：" + path_;
     return;
   }
-  stats_.records = latest_.size() + start_.size() + running_.size() + set_param_.size() +
-                   inject_fault_.size() + observation_.size() + recent_events_.size();
+  stats_.records = latest_.size() + probe_latest_.size() + start_.size() + running_.size() +
+                   set_param_.size() + inject_fault_.size() + observation_.size() +
+                   recent_events_.size();
 
   // 事件回调：把录制里各次 recent_events 看到的事件合并（去重）后按 t_us 排序，
   // 让上层在回放时看到与录制时同一批事件、同一顺序。
@@ -591,6 +607,24 @@ PipelineMetrics ReplayPipeline::latest() const {
   ++i_latest_;
   ++stats_.hits;
   return m;
+}
+
+ProbeMetrics ReplayPipeline::probe_latest() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (i_probe_ < probe_latest_.size()) return probe_latest_[i_probe_++];
+  ProbeMetrics p;
+  if (probe_latest_.empty()) {
+    // 旧录制里本来就没有 probe 指标：这不是"回放 miss"（不是参数不符/录制用尽），
+    // 而是这份录制没录端到端。如实返回不可用，让评测侧报 probe_unavailable，
+    // 而不是伪造一份 0 让端到端 SLA 看起来"达标"。
+    p.unavailable_reason = "录制不含 probe 指标（录制时未托管探针的旧格式）";
+    return p;
+  }
+  // 有录制但消费超量 = 调用序列与录制不一致：必须报错，不能返回默认值
+  fail("工具回放 miss：probe_latest() 第 " + std::to_string(i_probe_ + 1) +
+       " 次调用在录制中没有对应条目（共 " + std::to_string(probe_latest_.size()) + " 条）");
+  p.unavailable_reason = "录制里的 probe 指标已用尽";
+  return p;
 }
 
 void ReplayPipeline::set_event_callback(std::function<void(const PipelineEvent&)> cb) {

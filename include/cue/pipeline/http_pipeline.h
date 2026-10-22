@@ -38,6 +38,9 @@ class HttpServicePipeline : public IServicePipeline {
   void stop() override;
   bool running() const override;
   PipelineMetrics latest() const override;
+  // 假域 / 远端 REST 服务没有探针进程：端到端指标不可用。这里如实返回
+  // alive=false、samples=0 并带上原因，绝不拿 latest() 的服务端自报凑一份"端到端"。
+  ProbeMetrics probe_latest() const override;
   void set_event_callback(std::function<void(const PipelineEvent&)> cb) override;
   std::vector<PipelineEvent> recent_events(std::size_t n = 0) const override;
   bool set_param(const std::string& key, const std::string& value, std::string& err) override;

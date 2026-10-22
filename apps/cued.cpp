@@ -954,6 +954,10 @@ int main(int argc, char** argv) {
       std::span<const uint8_t> payload{frame};
       bool keyframe = fa.keyframe;
       bool skip_send = false;
+      // 下行载荷的真实 codec：passthrough 时是上行声明的 codec，转码后恒为 H264。
+      // probe 靠它决定「解码」还是「跳过」，所以必须跟着**实际发出的字节**走，
+      // 而不是跟着上行包头走（转码路径一旦改成 H264，上行可能是别的 codec）。
+      uint8_t out_codec = h->codec;
       int64_t enc_us = 0;      // 编码段真实耗时（review #3：不再无条件记 0）
       bool enc_sampled = false;  // transcode 关闭时该段不采样，报告里显示 "-"
 
@@ -979,6 +983,7 @@ int main(int argc, char** argv) {
             encoded_buf = std::move(enc->data);
             payload = encoded_buf;
             keyframe = enc->keyframe;
+            out_codec = static_cast<uint8_t>(cue::proto::Codec::H264);
           } else {
             skip_send = true;
             if (enc.error() == cue::media::EncodeError::EncoderDelay) {
@@ -1005,7 +1010,7 @@ int main(int argc, char** argv) {
       bool budget_ok = false;
       if (!skip_send) {
         datagrams = cue::proto::split_into_datagrams(payload, session_id, h->frame_id, fa.pts_us,
-                                                     keyframe, &split_err);
+                                                     keyframe, &split_err, out_codec);
         if (!datagrams.empty()) {
           // SPEC §7.2 令牌桶：按包计费（含 24 B 头）、64 包突发、不足时先丢非关键帧
           budget_ok = keyframe ? bucket.take_key(datagrams.size(), t_send0)
@@ -1064,6 +1069,8 @@ int main(int argc, char** argv) {
           fh.frag_index = 0;
           fh.frag_count = static_cast<uint16_t>(datagrams.size());
           fh.pts_us = fa.pts_us;
+          // 冗余包本身不是可解码帧：显式不标注 codec，免得 probe 拿奇偶校验字节去解码
+          fh.codec = cue::proto::kDownCodecUnspecified;
           const auto hdr = cue::proto::encode(fh);
           std::vector<uint8_t> fpkt(hdr.begin(), hdr.end());
           cue::proto::FecPayloadHeader ph;

@@ -29,6 +29,13 @@ struct PipelineEndpoint {
   std::string cued_bin = "./build/cued";
   int ws_port = 9000;
   int probe_port = 9001;
+  // 探针（cue-probe）由 harness 自己托管：probe 是 cued 的下游，先起 probe 再起 cued，
+  // 停的时候倒序。probe_bin 为空 = 显式不启动本地探针（此时端到端指标必然不可用）。
+  std::string probe_bin = "./build/cue-probe";
+  std::string probe_host = "127.0.0.1";  // probe 的绑定地址 = cued 的下行目标
+  // 跨机上报目标（"host:port,host:port"）：非空时 probe 除 stdout 外再用 TCP 上报
+  // JSON-line；空 = 只打 stdout（本地模式，harness 直接读管道）。
+  std::string probe_report_addrs;
   bool transcode = false;
   int width = 0, height = 0, bitrate_kbps = 1500, fps = 30, gop = 60;
   std::string preset = "veryfast";
@@ -56,6 +63,11 @@ class IServicePipeline {
   virtual void stop() = 0;
   virtual bool running() const = 0;
   virtual PipelineMetrics latest() const = 0;
+  // 端到端观测（探针）。没有探针的后端（假域 / 回放）返回 alive=false、samples=0 并带
+  // unavailable_reason，绝不"用 cued 的数字凑一份端到端"。
+  // 单独一个接口而不是塞进 latest()：两者的样本源与可用性不同，混在一起时
+  // 「cued 有数、probe 没数」会被读成「端到端正常」——那正是要防的假绿灯。
+  virtual ProbeMetrics probe_latest() const = 0;
   virtual void set_event_callback(std::function<void(const PipelineEvent&)> cb) = 0;
   virtual std::vector<PipelineEvent> recent_events(std::size_t n = 0) const = 0;
   virtual bool set_param(const std::string& key, const std::string& value, std::string& err) = 0;

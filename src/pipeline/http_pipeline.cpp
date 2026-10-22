@@ -270,6 +270,16 @@ PipelineMetrics HttpServicePipeline::latest() const {
   return metrics_;
 }
 
+ProbeMetrics HttpServicePipeline::probe_latest() const {
+  ProbeMetrics p;
+  // 这里不是"忘了实现"：探针是一条独立的接收端进程（cue-probe），HTTP 后端背后是
+  // 一个远端服务或本机假域，harness 既没有它的探针、也不该替它编一份端到端读数。
+  // 评测侧读到这条原因时必须报 probe_unavailable（见 eval.cpp 的 require_probe）。
+  p.unavailable_reason =
+      "HTTP 后端（假域/远端服务）没有探针：端到端指标不可用，且不拿服务端自报代替";
+  return p;
+}
+
 void HttpServicePipeline::set_event_callback(std::function<void(const PipelineEvent&)> cb) {
   std::lock_guard<std::mutex> lk(mu_);
   on_event_ = std::move(cb);
