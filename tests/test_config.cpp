@@ -74,9 +74,12 @@ const char* kSyntaxErrorLine5 = R"({
 }
 )";
 
+// 互斥用例**故意不放 cued_bin**：它是相对路径（./build/cued），
+// 而 CI 构建到 build-ci —— 本地能过、CI 必挂。get_existing_file 会先拒绝，
+// 于是根本走不到互斥检查，两条断言一起失败（这个坑只在 CI 暴露过一次）。
+// cued_bin 的存在性校验由下面的 nonexistent 用例单独覆盖，这里不需要它。
 const char* kMutualExclusion = R"({
   "eval": {
-    "cued_bin": "./build/cued",
     "record_tools_dir": "runs/tools-rec",
     "replay_tools_dir": "runs/tools-play"
   }
@@ -123,7 +126,7 @@ int main() {
     auto opt = cue::cli::parse_eval_options(static_cast<int>(argv.size()), argv.data());
     check(!opt, "record_tools_dir 与 replay_tools_dir 同时给 → 拒绝");
     if (!opt) {
-      check(opt.error().line == 5, "互斥项报在后出现的那个键（第 5 行）");
+      check(opt.error().line == 4, "互斥项报在后出现的那个键（第 4 行）");
       check(opt.error().text().find("互斥") != std::string::npos, "错误文案说明互斥");
     }
   }
