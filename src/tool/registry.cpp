@@ -148,6 +148,18 @@ GuardedCall Registry::call_guarded(const std::string& name, const json& args, co
           }
         }
         approved = allowed;
+      } else if (out.risk == Risk::Mutating && !ctx.allowed_mutating.empty()) {
+        // 只有调用方显式给了写白名单才收紧（空 = 全部放行，旧行为不变）。
+        // 这一条是为评测加的：pipeline_stop 会把被测管线停掉，必须受 case 的
+        // allowed_actions 约束，但它不值得升成 Dangerous（那会让所有 case 都要
+        // 重新授权一遍写工具）。
+        approved = false;
+        for (const auto& a : ctx.allowed_mutating) {
+          if (a == name) {
+            approved = true;
+            break;
+          }
+        }
       }
     } else {  // Ask：没有回调就等于没人批准
       approved = ctx.approve ? ctx.approve(*spec, out.risk, args) : false;

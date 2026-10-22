@@ -45,6 +45,11 @@ struct PipelineEndpoint {
   double inject_ingress_drop = 0.0;
   // 发送侧排队节奏（帧/s）：>0 时不丢包，按这个节奏排空发送队列（queue_backlog）。
   double queue_fps = 0.0;
+  // 延迟注入（FR-PIPE.10）：固定延迟与抖动的幅度，单位**毫秒**。
+  // 与上面的百分比注入分开：它们压住的是「什么时候发」而不是「发不发」，
+  // 所以两者的可观测证据不相交（injected 不涨 / send 段分位涨）。
+  double inject_delay_ms = 0.0;
+  double inject_jitter_ms = 0.0;
   uint64_t inject_seed = 42;
   bool fec = true;
   double send_mbps = 10.0;

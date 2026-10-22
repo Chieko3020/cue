@@ -1,0 +1,227 @@
+// T-06：FR-TOOL.1 的 8 个工具必须真的注册在 agent 侧（过去 lifecycle 三个只在
+// cue-serve 里，agent 根本调不到）。这里用假管线把「注册了什么」钉死：
+//  - 名字集合恰好 8 个（多一个少一个都失败）；
+//  - lifecycle 三个的风险级是 Mutating（pipeline_stop 不该被当成只读）；
+//  - profile 真的映射成 set_param（不是"仅记录"）；
+//  - inject_fault 的 kind 覆盖 delay / jitter，单位在描述里写清（毫秒 vs 百分比）。
+#include <algorithm>
+#include <cstdio>
+#include <functional>
+#include <set>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "cue/pipeline/tools.h"
+#include "cue/tool/tool.h"
+
+using json = nlohmann::json;
+namespace tool = cue::tool;
+namespace pipeline = cue::pipeline;
+
+namespace {
+
+int failures = 0;
+void check(bool cond, const char* what) {
+  if (!cond) {
+    std::printf("FAIL: %s\n", what);
+    ++failures;
+  }
+}
+
+// 只记录"被要求做什么"的管线后端：工具层的行为（注册、参数、profile 映射）
+// 不需要真 cued，也就不需要 FFmpeg/WS。
+class FakePipeline : public pipeline::IServicePipeline {
+ public:
+  bool start(std::string&) override {
+    ++starts;
+    running_ = true;
+    return start_ok;
+  }
+  void stop() override {
+    ++stops;
+    running_ = false;
+  }
+  bool running() const override { return running_; }
+  pipeline::PipelineMetrics latest() const override { return {}; }
+  pipeline::ProbeMetrics probe_latest() const override { return {}; }
+  void set_event_callback(std::function<void(const pipeline::PipelineEvent&)>) override {}
+  std::vector<pipeline::PipelineEvent> recent_events(std::size_t) const override { return {}; }
+  bool set_param(const std::string& key, const std::string& value, std::string& err) override {
+    if (reject_key == key) {
+      err = "假后端拒绝 " + key;
+      return false;
+    }
+    set_calls.push_back(key + "=" + value);
+    return true;
+  }
+  bool inject_fault(const std::string& kind, double value, std::string& err) override {
+    (void)err;
+    faults.push_back(kind + "=" + std::to_string(value));
+    return true;
+  }
+  std::string observation(const std::string&, int, std::string&) const override { return {}; }
+
+  bool running_ = false;
+  bool start_ok = true;
+  std::string reject_key;
+  int starts = 0;
+  int stops = 0;
+  std::vector<std::string> set_calls;
+  std::vector<std::string> faults;
+};
+
+std::set<std::string> names_of(const tool::Registry& reg) {
+  std::set<std::string> out;
+  for (const auto& s : reg.specs()) out.insert(s.name);
+  return out;
+}
+
+const tool::ToolSpec* spec_of(const tool::Registry& reg, const std::string& name) {
+  return reg.find_spec(name);
+}
+
+bool has_value(const std::vector<std::string>& v, const std::string& x) {
+  return std::find(v.begin(), v.end(), x) != v.end();
+}
+
+}  // namespace
+
+int main() {
+  FakePipeline pipe;
+  pipe.running_ = true;  // 避免 pipeline_start 真的去 start（各用例自己控制）
+  tool::Registry reg;
+  pipeline::build_real_tools(reg, pipe, nullptr);
+
+  // ---------- 1) 恰好 8 个工具，名字与 FR-TOOL.1 一致 ----------
+  {
+    const std::set<std::string> expected = {
+        "query_metrics",  "pipeline_set_param", "inject_fault", "fetch_observation",
+        "run_shell",      "pipeline_start",     "pipeline_stop", "pipeline_restart"};
+    const auto got = names_of(reg);
+    check(reg.specs().size() == 8, "build_real_tools 产出恰好 8 个工具");
+    check(got == expected, "8 个工具名与 FR-TOOL.1 的清单一致");
+  }
+
+  // ---------- 2) 风险级：lifecycle 三个是 Mutating ----------
+  {
+    for (const char* n : {"pipeline_start", "pipeline_stop", "pipeline_restart"}) {
+      const auto* s = spec_of(reg, n);
+      check(s != nullptr, "lifecycle 工具存在");
+      if (s != nullptr) check(s->risk == tool::Risk::Mutating, "lifecycle 工具 risk == Mutating");
+    }
+    // 观测工具必须仍是 ReadOnly：把只读升成写会让 collect 阶段的守卫失去意义
+    check(reg.risk_of("query_metrics") == tool::Risk::ReadOnly, "query_metrics 仍是只读");
+    check(reg.risk_of("fetch_observation") == tool::Risk::ReadOnly, "fetch_observation 仍是只读");
+    check(reg.risk_of("inject_fault") == tool::Risk::Dangerous, "inject_fault 仍是 dangerous");
+  }
+
+  // ---------- 3) profile 真的生效（映射成 set_param），且 stop 不带这个参数 ----------
+  {
+    FakePipeline p;
+    p.running_ = false;
+    tool::Registry r;
+    pipeline::add_lifecycle_tools(r, p);
+
+    const auto res = r.call("pipeline_start", json{{"profile", "std-1500k"}});
+    check(res.has_value() && res->ok, "pipeline_start(profile=std-1500k) 成功");
+    check(p.starts == 1, "pipeline_start 真的启动了管线");
+    check(has_value(p.set_calls, "transcode=on") && has_value(p.set_calls, "bitrate_kbps=1500") &&
+              has_value(p.set_calls, "fps=30") && has_value(p.set_calls, "gop=60") &&
+              has_value(p.set_calls, "preset=veryfast"),
+          "profile=std-1500k 映射成 5 个 set_param（不是仅记录）");
+    check(res.has_value() && res->content.find("profile=std-1500k") != std::string::npos,
+          "返回文本如实说明应用了哪个档位");
+
+    // passthrough 只关转码：档位之间互不残留
+    p.set_calls.clear();
+    const auto res2 = r.call("pipeline_start", json{{"profile", "passthrough"}});
+    check(res2.has_value() && p.set_calls.size() == 1 && p.set_calls[0] == "transcode=off",
+          "profile=passthrough 只关转码");
+
+    // 已在运行：不重复 start，但档位仍然应用
+    p.set_calls.clear();
+    const auto res3 = r.call("pipeline_start", json{{"profile", "low-600k"}});
+    check(p.starts == 1, "已在运行时 pipeline_start 不再 spawn");
+    check(res3.has_value() && p.set_calls.size() == 5, "已在运行时仍然套用 profile");
+
+    // profile 失败必须如实报失败（不能因为 start 成功就整体报成功）
+    p.reject_key = "bitrate_kbps";
+    const auto res4 = r.call("pipeline_restart", json{{"profile", "high-4000k"}});
+    check(res4.has_value() && !res4->ok, "profile 某一步被拒 → 工具返回失败");
+    check(res4.has_value() && res4->content.find("未生效") != std::string::npos,
+          "失败文本指明档位未生效");
+
+    // pipeline_stop 没有 profile 参数（否则就是个"看起来能改、实际不动"的旋钮）
+    const auto* stop = r.find_spec("pipeline_stop");
+    check(stop != nullptr && stop->params.empty(), "pipeline_stop 不带 profile 参数");
+  }
+
+  // ---------- 4) profile 是闭集：未知档位在 schema 层就被拒 ----------
+  {
+    check(!reg.call("pipeline_start", json{{"profile", "8k-ultra"}}).has_value(),
+          "未知 profile 被 schema 拒绝");
+  }
+
+  // ---------- 5) inject_fault 覆盖 delay / jitter，单位写清楚 ----------
+  {
+    const auto* s = spec_of(reg, "inject_fault");
+    check(s != nullptr, "inject_fault 存在");
+    if (s != nullptr) {
+      const auto& kind = s->params.at(0);
+      const bool has_delay = has_value(kind.enum_values, "delay");
+      const bool has_jitter = has_value(kind.enum_values, "jitter");
+      check(has_delay && has_jitter, "inject_fault.kind 含 delay / jitter");
+      check(s->params.at(0).desc.find("delay") != std::string::npos, "kind 描述列出 delay");
+      const auto& value = s->params.at(1);
+      check(value.desc.find("毫秒") != std::string::npos, "value 描述写明 delay/jitter 是毫秒");
+      check(value.desc.find("2000") != std::string::npos, "value 描述写明延迟上界 2000");
+      check(!value.has_range, "混合单位下不给单一 [min,max]（校验只有 cued 侧一份）");
+    }
+
+    FakePipeline p;
+    tool::Registry r;
+    pipeline::build_real_tools(r, p, nullptr);
+    (void)r.call("inject_fault", json{{"kind", "delay"}, {"value", 200}});
+    (void)r.call("inject_fault", json{{"kind", "jitter"}, {"value", 25}});
+    check(has_value(p.faults, "delay=200.000000"), "delay 注入透传到后端（毫秒原样）");
+    check(has_value(p.faults, "jitter=25.000000"), "jitter 注入透传到后端");
+    check(!r.call("inject_fault", json{{"kind", "latency"}, {"value", 1}}).has_value(),
+          "未知 kind 在 schema 层就被拒");
+  }
+
+  // ---------- 6) 写白名单只影响 Auto；空列表 = 全部放行（旧行为不变） ----------
+  {
+    tool::CallContext open;
+    open.mode = tool::ApprovalMode::Auto;
+    check(reg.call_guarded("pipeline_stop", json::object(), open).status ==
+              tool::GuardedCall::Status::Executed,
+          "Auto + 空写白名单：mutating 照旧放行");
+    check(reg.risk_of("pipeline_stop") == tool::Risk::Mutating,
+          "pipeline_stop 没有升成 dangerous（审批口径不变）");
+
+    tool::CallContext restricted;
+    restricted.mode = tool::ApprovalMode::Auto;
+    restricted.allowed_mutating = {"pipeline_set_param"};
+    check(reg.call_guarded("pipeline_stop", json::object(), restricted).status ==
+              tool::GuardedCall::Status::ApprovalDenied,
+          "Auto + case 写白名单不含 pipeline_stop：拒绝（评测里不能停被测管线）");
+    check(reg.call_guarded("pipeline_set_param", json{{"key", "gop"}, {"value", "30"}}, restricted)
+                  .status == tool::GuardedCall::Status::Executed,
+          "白名单内的写工具照常放行");
+
+    tool::CallContext deny;
+    deny.mode = tool::ApprovalMode::Deny;
+    check(reg.call_guarded("pipeline_start", json::object(), deny).status ==
+              tool::GuardedCall::Status::ApprovalDenied,
+          "Deny 模式仍然拒绝 lifecycle");
+  }
+
+  if (failures == 0) {
+    std::printf("test_tools: OK (6 groups)\n");
+    return 0;
+  }
+  std::printf("test_tools: %d failure(s)\n", failures);
+  return 1;
+}

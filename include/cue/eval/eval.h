@@ -182,6 +182,9 @@ struct PipelineConfig {
   double queue_fps = 0.0;
   // 发送速率上限（fault.kind=rate 时生效；默认 10 Mbps = SPEC §7.2 的链路）
   double send_mbps = 10.0;
+  // 延迟注入（fault.kind=delay / jitter 时生效；单位毫秒，0 = 关）
+  double inject_delay_ms = 0.0;
+  double inject_jitter_ms = 0.0;
   uint64_t inject_seed = 42;
 };
 

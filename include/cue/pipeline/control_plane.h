@@ -47,6 +47,12 @@ struct RuntimeParams {
   // 注入档位（%）
   double inject_drop = 0.0;
   double inject_ingress_drop = 0.0;
+  // 延迟注入（FR-PIPE.10）：固定延迟与抖动幅度，单位**毫秒**。
+  // 与上面的百分比注入分开两个字段：两者在指标上留下的证据不同
+  // （丢包只涨 injected，延迟只涨 delayed_pkts / send 段分位），混成一个"value"
+  // 会让 agent 没法从读数反推是哪种根因。0 = 关闭。
+  double inject_delay_ms = 0.0;
+  double inject_jitter_ms = 0.0;
   uint64_t inject_seed = 42;
 };
 

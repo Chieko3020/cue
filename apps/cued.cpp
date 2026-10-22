@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -46,10 +47,11 @@ extern "C" {
 }
 
 #include "cue/common/clock.h"
+#include "cue/media/delay_injector.h"
 #include "cue/media/encoder.h"
-#include "cue/pipeline/control_plane.h"
 #include "cue/media/h264_decoder.h"
 #include "cue/media/jitter_buffer.h"
+#include "cue/pipeline/control_plane.h"
 #include "cue/proto/wire.h"
 
 namespace beast = boost::beast;
@@ -192,6 +194,12 @@ class Ring {
     return v[static_cast<std::size_t>(p * double(v.size() - 1))];
   }
   std::size_t size() const { return buf_.size(); }
+  // 换测量窗口。只用于「样本分布换了一族」的场景（见 send 段的延迟注入），
+  // 不是给"想让读数好看"准备的。
+  void clear() {
+    buf_.clear();
+    head_ = 0;
+  }
 
  private:
   static constexpr std::size_t kCap = 4096;
@@ -328,6 +336,11 @@ struct Counters {
   uint64_t encode_delays = 0;  // 编码器内部延迟：正常路径，无可发数据
   uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
   uint64_t queue_dropped = 0;  // 排队策略切换时被丢弃的积压帧（见 process_frame 里的注释）
+  // 延迟注入（FR-PIPE.10 的 delay / jitter）：被压进延迟队列的数据报数、以及单个数据报
+  // 被压住的最长时间（us）。它们是"晚到而不是丢了"的正面证据——只有它们涨、
+  // injected / budget_drops 不涨，才能说明包最终都发出去了。
+  uint64_t delayed_pkts = 0;
+  uint64_t delayed_max_us = 0;
   // 迟到帧丢弃（实时流不追赶积压）。旧实现在编码器慢下来时会把 WS 上行积压一路读完，
   // 恢复后以 100+ fps 追帧，端到端延迟要好几秒才回来——实时流宁可丢帧也不排队。
   uint64_t ingress_late = 0;
@@ -494,6 +507,7 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
         << " serr=" << c.send_errors << " enc_err=" << c.encode_errors
         << " dec=" << c.frames_decoded << " dec_err=" << c.decode_errors
         << " dec_drop=" << c.decode_drops << " rej=" << c.rejected
+        << " dly=" << c.delayed_pkts << "/" << double(c.delayed_max_us) / 1000.0 << "ms"
         << " aud=" << c.audio_frames_in << " MB=" << std::setprecision(2)
         << double(c.bytes_in) / (1024.0 * 1024.0);
   for (int i = 0; i < 6; ++i) {
@@ -532,6 +546,9 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
          {"encode_delays", c.encode_delays},
          {"decode_drops", c.decode_drops},
          {"queue_dropped", c.queue_dropped},
+         // 延迟注入：与 injected/budget_drops 互补的一对"没有丢包"的证据
+         {"delayed_pkts", c.delayed_pkts},
+         {"delayed_max_us", c.delayed_max_us},
          // 迟到帧：相对最小延迟基线晚到超过预算而被丢弃的帧。它与 queue_dropped 的区别是
          // 「时间维度的背压」vs「策略切换的清空」——都丢帧，但触发条件与排查方向不同。
          {"ingress_late", c.ingress_late},
@@ -584,6 +601,8 @@ void report(const Ring rings[6], Counters& c, int64_t now_us, int64_t& t_last,
                                      {"decode_errors", c.decode_errors},
                                      {"rejected", c.rejected},
                                      {"budget_drops", c.budget_drops},
+                                     {"delayed_pkts", c.delayed_pkts},
+                                     {"delayed_max_us", c.delayed_max_us},
                                      {"send_errors", c.send_errors},
                                      {"encode_errors", c.encode_errors},
                                      {"decode_drops", c.decode_drops},
@@ -679,6 +698,11 @@ int main(int argc, char** argv) {
   // 发送侧排队：>0 时帧不立即发出，而是按这个节奏排空（丢包策略换成了排队）。
   // 0 = 关（默认，保持 SPEC §7.2 的「令牌桶不足就丢」语义）。
   double queue_fps = 0.0;
+  // 延迟注入（FR-PIPE.10）：固定延迟与抖动幅度，单位毫秒。0 = 关（默认，发送路径与
+  // M2 逐字节一致）。上限 2000 ms：再大就不只是"网络时延"，而是"链路断了在攒帧"，
+  // 那不是延迟注入能表达的东西。
+  double inject_delay_ms = 0.0;
+  double inject_jitter_ms = 0.0;
   uint64_t inject_seed = 42;
   std::string inject_trace;
   bool fec_enabled = true;
@@ -757,6 +781,12 @@ int main(int argc, char** argv) {
     } else if (a == "--queue-fps") {
       const auto val = next();
       if (!parse_double(val, 0.0, 240.0, queue_fps)) bad(val);
+    } else if (a == "--inject-delay-ms") {
+      const auto val = next();
+      if (!parse_double(val, 0.0, 2000.0, inject_delay_ms)) bad(val);
+    } else if (a == "--inject-jitter-ms") {
+      const auto val = next();
+      if (!parse_double(val, 0.0, 2000.0, inject_jitter_ms)) bad(val);
     } else if (a == "--inject-seed") {
       const auto val = next();
       if (val.empty()) bad(val);
@@ -790,6 +820,7 @@ int main(int argc, char** argv) {
           "     [--transcode on|off] [--width N --height N] [--bitrate kbps] [--fps N]\n"
           "     [--gop N] [--preset NAME] [--threads N] [--send-mbps F]\n"
           "     [--inject-drop 0..100] [--inject-ingress-drop 0..100] [--queue-fps N]\n"
+          "     [--inject-delay-ms 0..2000] [--inject-jitter-ms 0..2000]\n"
           "     [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
           "     [--jitter on|off] [--jitter-target-frames 2] [--jitter-max-frames 8]\n"
           "     [--jitter-budget-ms 40] [--max-ingress-lag-ms 300]\n"
@@ -836,6 +867,8 @@ int main(int argc, char** argv) {
   initial_params.queue_fps = queue_fps;
   initial_params.inject_drop = inject_drop;
   initial_params.inject_ingress_drop = inject_ingress_drop;
+  initial_params.inject_delay_ms = inject_delay_ms;
+  initial_params.inject_jitter_ms = inject_jitter_ms;
   initial_params.inject_seed = inject_seed;
 
   cue::media::H264Decoder decoder;
@@ -1090,6 +1123,8 @@ int main(int argc, char** argv) {
                   {"transcode", transcode_enabled ? "on" : "off"},
                   {"fec", fec_enabled ? "on" : "off"},
                   {"inject_drop", inject_drop},
+                  {"inject_delay_ms", inject_delay_ms},
+                  {"inject_jitter_ms", inject_jitter_ms},
                   {"inject_seed", inject_seed},
                   {"control_channel", control.channel_tag()},
                   {"control_socket", control.degraded()
@@ -1103,6 +1138,19 @@ int main(int argc, char** argv) {
   if (inject_drop > 0.0) {
     emit_event("fault.applied", json{{"kind", "drop"},
                                      {"value", inject_drop},
+                                     {"seed", inject_seed},
+                                     {"scope", "cued_start"}});
+  }
+  // 延迟注入同样是"上电即生效"的一类故障（命令行参数与 ParamStore 初值同源）
+  if (inject_delay_ms > 0.0) {
+    emit_event("fault.applied", json{{"kind", "delay"},
+                                     {"value", inject_delay_ms},
+                                     {"seed", inject_seed},
+                                     {"scope", "cued_start"}});
+  }
+  if (inject_jitter_ms > 0.0) {
+    emit_event("fault.applied", json{{"kind", "jitter"},
+                                     {"value", inject_jitter_ms},
                                      {"seed", inject_seed},
                                      {"scope", "cued_start"}});
   }
@@ -1153,6 +1201,10 @@ int main(int argc, char** argv) {
     struct QueuedSend {
       std::vector<std::vector<uint8_t>> datagrams;
       int64_t due_us = 0;
+      // send 段起点与帧号：帧被延迟注入压住时，send 段与 frames_out 要在
+      // 「真正发出」的时刻结算，这两个值得跟着帧走（不能现查，排到时已经换帧了）。
+      int64_t t_send0 = 0;
+      uint32_t frame_id = 0;
     };
     std::deque<QueuedSend> sendq;
     int64_t send_due_us = 0;
@@ -1173,18 +1225,127 @@ int main(int argc, char** argv) {
       }
       return true;
     };
-    // 到期的排队帧按顺序发出；fps 因此由 --queue-fps 决定，而不是由「收到多少帧」决定
+    // ---------------------------------------------------------------- 延迟注入
+    //
+    // 与 sendq 是**串联的两段**，不是合并的一个队列：
+    //   sendq  管「节奏」——按 --queue-fps 等距排空，due 由帧序推出来，切策略时整队清空；
+    //   delayq 管「额外延迟」——due 由注入参数 + RNG 算出来，逐包独立（jitter 的基础）。
+    // 合并会带来两个错误读数：fault.set backlog 的"清空积压"会把在途的延迟包算成
+    // queue_dropped（延迟撤销不该丢帧）；反过来延迟队列被当成发送节奏，又会让
+    // frames_in−frames_out 的增长看起来像 queue_backlog。
+    struct DelayedFrame {
+      std::size_t pending = 0;   // 还没真正 sendto 的包数
+      bool all_ok = true;        // 有没有包 sendto 失败（失败帧不计 frames_out）
+      int64_t t_send0 = 0;       // send 段起点：分片完成时刻
+    };
+    struct DelayedPkt {
+      std::vector<uint8_t> data;
+      std::shared_ptr<DelayedFrame> frame;  // 一帧的所有包共享一个结算点
+      int64_t enqueued_us = 0;
+    };
+    // 按 due 排序（multimap 而不是 deque）：jitter 让同一帧的包 due 不同、跨帧也可能反序，
+    // 单调队列会让队首页把后面已到期的包堵住（head-of-line blocking），
+    // 结果就是"抖动被放大成固定延迟"，指标上反而看不出抖动。
+    std::multimap<int64_t, DelayedPkt> delayq;
+    // 兜底上限：正常注入（≤2 s × 帧率 × 每帧包数）远达不到。到了只说明上游在灌，
+    // 此时"立即发出"比"无限涨内存"诚实——没压住的包不计入 delayed_pkts。
+    constexpr std::size_t kDelayQueueMaxDgrams = 16384;
+    cue::media::DelayInjector delay_inj;
+    // 延迟注入当前是否生效（由 process_frame 每帧从快照更新）。它只影响"发送最后一段
+    // 走哪条分支"，不参与任何判定：参数本身永远从快照读。
+    bool session_delay_on = false;
+
+    // 到期的延迟包按 due 顺序发出；一帧的**最后一个**包发出时才结算 frames_out 与 send 段，
+    // 所以这两个读数反映的是"真正离开本机"的时刻，而不是"进了队列"。
+    auto flush_delayq = [&](int64_t now_us) {
+      while (!delayq.empty() && delayq.begin()->first <= now_us) {
+        auto it = delayq.begin();
+        DelayedPkt& p = it->second;
+        if (!send_dgram(p.data)) p.frame->all_ok = false;
+        const int64_t held = now_us - p.enqueued_us;
+        if (held > 0 && static_cast<uint64_t>(held) > c.delayed_max_us) {
+          c.delayed_max_us = static_cast<uint64_t>(held);
+        }
+        if (--p.frame->pending == 0) {
+          if (p.frame->all_ok) {
+            ++c.frames_out;
+            g_frames_out_total.fetch_add(1, std::memory_order_relaxed);
+          }
+          rings[5].push(now_us - p.frame->t_send0);
+        }
+        delayq.erase(it);
+      }
+    };
+
+    // 一帧数据报的最后一跳。返回 true = 已交给延迟队列（send 段稍后由 flush_delayq 结算），
+    // false = 现场发完（send 段由调用方按旧口径结算）。
+    auto deliver_frame = [&](std::vector<std::vector<uint8_t>>&& dgrams, uint32_t frame_id,
+                             int64_t t_send0) -> bool {
+      // 每帧取一次快照：同一帧的所有包看到同一组注入值，不会出现"前半帧延迟 200、
+      // 后半帧 0"这种半截状态。
+      const auto dsnap = params.snapshot();
+      const cue::pipeline::RuntimeParams& rp = dsnap.params;
+      delay_inj.sync(rp.inject_seed, rp.inject_delay_ms, rp.inject_jitter_ms);
+      const auto direct_send = [&] {
+        bool all_sent = true;
+        for (const auto& d : dgrams) {
+          if (!send_dgram(d)) all_sent = false;
+        }
+        // 与旧口径一致：包全丢（100% 注入）时也能走到这里，frames_out 照样 +1，
+        // 于是「丢包但 fps 正常」这条与"时延"完全不同的证据得以保留。
+        if (all_sent) {
+          ++c.frames_out;
+          g_frames_out_total.fetch_add(1, std::memory_order_relaxed);
+        }
+      };
+      if (!delay_inj.active() || dgrams.empty()) {
+        direct_send();
+        return false;
+      }
+      if (delayq.size() + dgrams.size() > kDelayQueueMaxDgrams) {
+        err_log.log(cue::now_us(), "延迟注入队列已满（>16384 包）：这一帧按不延迟发出");
+        direct_send();
+        return false;
+      }
+      auto frame = std::make_shared<DelayedFrame>();
+      frame->t_send0 = t_send0;
+      frame->pending = dgrams.size();
+      const int64_t now = cue::now_us();
+      for (std::size_t pk = 0; pk < dgrams.size(); ++pk) {
+        const int64_t extra_us = delay_inj.extra_us();
+        // 逐包决策落 trace（同一 seed 逐项可复现）：j 行与丢包的 `<frame> <pk>` 行
+        // 共用一个文件，前缀区分行类型。
+        if (trace_fp && rp.inject_jitter_ms > 0.0) {
+          std::fprintf(trace_fp, "j %u %zu %lld\n", frame_id, pk,
+                       static_cast<long long>(extra_us));
+        }
+        delayq.emplace(now + extra_us, DelayedPkt{std::move(dgrams[pk]), frame, now});
+        ++c.delayed_pkts;
+      }
+      return true;
+    };
+
+    // 到期的排队帧按顺序发出；fps 因此由 --queue-fps 决定，而不是由「收到多少帧」决定。
+    // 最后一段有两个分支，是为了让**没有延迟注入**时的行为与 M2 逐字节相同：
+    // 每次 drain 都去参数快照里问一次"延迟生效了吗"会给排队路径加一次锁 + 一次
+    // string 拷贝，虽然代价极小，但这条路径是 AC-15 五类既有 case 的地基，不值得为
+    // 一个未启用的特性付出任何时序扰动。session_delay_on 由 process_frame 每帧更新。
     auto drain_sendq = [&](int64_t now_us) {
       while (!sendq.empty() && sendq.front().due_us <= now_us) {
+        QueuedSend q = std::move(sendq.front());
+        sendq.pop_front();
+        if (session_delay_on) {
+          (void)deliver_frame(std::move(q.datagrams), q.frame_id, q.t_send0);
+          continue;
+        }
         bool ok = true;
-        for (const auto& d : sendq.front().datagrams) {
+        for (const auto& d : q.datagrams) {
           if (!send_dgram(d)) ok = false;
         }
         if (ok) {
           ++c.frames_out;
           g_frames_out_total.fetch_add(1, std::memory_order_relaxed);
         }
-        sendq.pop_front();
       }
     };
 
@@ -1193,6 +1354,12 @@ int main(int argc, char** argv) {
     //    充当跨机时钟差的基线；上行 PTS 来自设备时钟，绝对值不可比，但相对值可比。
     //  · 基线不重置：客户端时钟漂移典型 <100 ppm（每秒 0.1 ms），相对 300 ms 的阈值可忽略。
     int64_t ingress_min_offset = std::numeric_limits<int64_t>::max();
+    // 已应用的延迟注入档位（NaN = 还没应用过）。它只用来判断"send 段的样本分布是否
+    // 换了一族"：直发是 ≈0.05 ms，延迟注入是 ≈delay ms，两者混在一个 4096 样本的
+    // 窗口里时，p50 会被历史样本按住、清除注入后 p99 也会被历史样本按住 136 s
+    // （实测：清除 9 s 后 send p99 仍是 233 ms，agent 会读成"修了没好"）。
+    double applied_delay_ms = std::numeric_limits<double>::quiet_NaN();
+    double applied_jitter_ms = std::numeric_limits<double>::quiet_NaN();
 
     // 一帧「重组完成之后」的全部处理：解码 → 处理器链 → 编码 → 令牌桶 → FEC → 发送。
     // 抽成 lambda 是因为抖动缓冲在**三个不同时刻**放行帧（push 当场 / 周期 tick / 断连接 flush），
@@ -1377,6 +1544,19 @@ int main(int argc, char** argv) {
                                : bucket.take_nonkey(datagrams.size(), t_send0);
         }
       }
+      // 延迟注入是否生效（用本帧已经取好的快照，避免同一帧看到两组注入值）。
+      // 生效时 send 段与 frames_out 在"真正发出"时结算，而不是在分片完成时——否则
+      // 延迟注入在指标上完全不可见（D-7 的成因就是这个）。
+      const bool delay_on = rp.inject_delay_ms > 0.0 || rp.inject_jitter_ms > 0.0;
+      session_delay_on = delay_on;
+      bool send_settled = false;  // send 段已经由真正发出的一方采样过
+      if (rp.inject_delay_ms != applied_delay_ms || rp.inject_jitter_ms != applied_jitter_ms) {
+        // 注入档位变了：send 段从现在起测的是另一种分布，旧样本一并丢弃。
+        // 不清的话"清除注入"在指标上要等 4096 帧（≈136 s @30fps）才看得出来。
+        rings[5].clear();
+        applied_delay_ms = rp.inject_delay_ms;
+        applied_jitter_ms = rp.inject_jitter_ms;
+      }
       if (skip_send) {
         ++c.frames_dropped;
       } else if (split_err != cue::proto::SplitError::None) {
@@ -1456,22 +1636,20 @@ int main(int argc, char** argv) {
           } else {
             const int64_t due = send_due_us > 0 ? send_due_us : t_send0;
             send_due_us = due + static_cast<int64_t>(queue_period_us);
-            sendq.push_back(QueuedSend{std::move(outgoing), due});
+            sendq.push_back(QueuedSend{std::move(outgoing), due, t_send0, frame_id});
             drain_sendq(t_send0);
+            // 无延迟注入时沿用旧口径（send 段 = 入队耗时）；有延迟注入时，
+            // 这一帧的 send 段由 flush_delayq 在实际发出时采样。
+            send_settled = delay_on;
           }
         } else {
           // 真实上线率：只要有一包没被内核接受，这一帧就不算发出去（review #16）
-          bool all_sent = true;
-          for (const auto& d : outgoing) {
-            if (!send_dgram(d)) all_sent = false;
-          }
-          if (all_sent) {
-            ++c.frames_out;
-            g_frames_out_total.fetch_add(1, std::memory_order_relaxed);
-          }
+          send_settled = deliver_frame(std::move(outgoing), frame_id, t_send0);
         }
       }
-      rings[5].push(cue::now_us() - t_send0);
+      // 没被延迟注入压住的帧在这里采样；被压住的帧由 flush_delayq 在实际发出时采样
+      // （含压住的时长），所以 send 段能反映真实延迟而不是"进队耗时"。
+      if (!send_settled) rings[5].push(cue::now_us() - t_send0);
     };
 
     for (;;) {
@@ -1484,6 +1662,9 @@ int main(int argc, char** argv) {
       // 500 ms 一次真正清理。
       {
         const int64_t now_tick = cue::now_us();
+        // 延迟注入的到期包必须由时间驱动发出：只靠"下一帧到达"驱动的话，
+        // 推流一停，最后一批被压住的数据报要等下一秒的报点才动（延迟被放大成 1 s）。
+        flush_delayq(now_tick);
         if (now_tick - t_last_cleanup >= 500'000) {
           // 抖动缓冲的到期帧必须由时间驱动放行：只靠 push 驱动的话，缺帧把前端挡住时
           // 要等到下一个包才动，"等待预算"就变成了"等下一个包"（弱网下可能是几百 ms）。
@@ -1494,6 +1675,9 @@ int main(int argc, char** argv) {
         // 报告同样不能挂在「帧完成」上：整帧持续丢尾片时 fps/丢帧仍要可见
         if (now_tick - t_last_report >= 1'000'000) {
           drain_sendq(now_tick);  // 报点前先把到期帧发出去
+          // 刚由 sendq 挪进延迟队列的包如果已到期（延迟很小），同一拍也发出去，
+          // 否则这一秒的 send 段会漏采这些帧。
+          flush_delayq(now_tick);
           // 报点前同样先放行抖动缓冲里的到期帧：否则这一秒的 jb_depth 会把"其实已经到期"
           // 的帧算成积压，buffer 段也会少采样几帧。
           for (auto& ready : jb.poll(now_tick)) process_frame(std::move(ready));
@@ -1676,6 +1860,9 @@ int main(int argc, char** argv) {
     // 丢掉的话每次断流都少几帧，probe 侧会把它看成 PTS 空洞（一次误判的"丢包"）。
     // 这里用"远未来"的 poll 让它们在到期判据上无条件放行。
     for (auto& ready : jb.poll(cue::now_us() + 10'000'000)) process_frame(std::move(ready));
+    // 同样把延迟队列里在途的包放出去：断连接时静默丢弃会让每秒少发几十个包，
+    // probe 侧看到的是 PTS 空洞（一次误判的"丢包"）。
+    flush_delayq(cue::now_us() + 10'000'000);
     std::fprintf(stderr, "[cued] client disconnected\n");
   }
 }

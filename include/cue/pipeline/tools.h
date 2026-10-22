@@ -42,9 +42,19 @@ struct RealToolsOptions {
   const std::atomic<bool>* cancel = nullptr;
 };
 
-// 注册 5 个真实工具：query_metrics / pipeline_set_param / inject_fault / fetch_observation /
-// run_shell。trace 可为空（交互模式不需要留痕）。
+// 注册 8 个真实工具（FR-TOOL.1 的完整清单）：
+//   query_metrics / pipeline_set_param / inject_fault / fetch_observation / run_shell
+//   + pipeline_start / pipeline_stop / pipeline_restart（见 add_lifecycle_tools）
+// trace 可为空（交互模式不需要留痕）。
 void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<ToolTrace>* trace,
                       const RealToolsOptions& opts = {});
+
+// 三个 lifecycle 工具的唯一实现（SPEC §7.4 的 mutating 动作）。
+// cue-serve 与 build_real_tools 都调它：schema、风险级、profile 档位表只允许有一份，
+// 两份拷贝迟早漂移（"控制台能做的 agent 不能做"就是这么长出来的）。
+// profile 只作用于 start/restart，且真的映射成一串 set_param（不是仅记录）。
+// trace 可为空：与 build_real_tools 同一套留痕约定（评测用它做证据校验）。
+void add_lifecycle_tools(tool::Registry& reg, IServicePipeline& pipe,
+                         std::vector<ToolTrace>* trace = nullptr);
 
 }  // namespace cue::pipeline

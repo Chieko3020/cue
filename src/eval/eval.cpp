@@ -516,16 +516,18 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
       }
       if (c.fault_kind.empty()) c.fault_kind = "none";
       // 不支持的注入器必须报错：静默变基线会产出"故障未注入却 100% 通过"的假绿灯
-      static const std::set<std::string> kKinds = {"none", "drop", "ingress_drop", "rate", "backlog"};
+      static const std::set<std::string> kKinds = {"none",    "drop",   "ingress_drop", "rate",
+                                                   "backlog", "delay",  "jitter"};
       if (kKinds.count(c.fault_kind) == 0) {
         return std::unexpected("case " + c.id + ": 不支持的 fault.kind \"" + c.fault_kind +
-                               "\"（可用：none / drop / ingress_drop / rate / backlog）");
+                               "\"（可用：none / drop / ingress_drop / rate / backlog / "
+                               "delay / jitter）");
       }
       if (f.contains("params")) {
         const auto& p = f["params"];
         if (!p.is_object()) return std::unexpected("case " + c.id + ": fault.params 必须是对象");
         if (!check_keys(p, {"inject_drop_pct", "drop_pct", "inject_ingress_pct", "rate_mbps",
-                            "queue_fps"},
+                            "queue_fps", "delay_ms", "jitter_ms"},
                         "case.fault.params", err)) {
           return std::unexpected("case " + c.id + ": " + err);
         }
@@ -542,6 +544,12 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
           key = "rate_mbps";
         } else if (c.fault_kind == "backlog") {
           key = "queue_fps";
+        } else if (c.fault_kind == "delay") {
+          // delay/jitter 的单位是**毫秒**，与上面三种（% / Mbps / 帧每秒）不同，
+          // 所以键名也分开：一个 "value" 会让人分不清 100 是 100 ms 还是 100%。
+          key = "delay_ms";
+        } else if (c.fault_kind == "jitter") {
+          key = "jitter_ms";
         }
         if (key != nullptr) {
           if (!p.contains(key)) {
@@ -552,8 +560,13 @@ std::expected<Case, std::string> parse_case(const json& j, const std::string& su
             return std::unexpected("case " + c.id + ": " + err);
           }
         }
-        if (c.fault_value < 0.0 || c.fault_value > 100.0) {
-          return std::unexpected("case " + c.id + ": fault.params 注入值必须在 [0,100]");
+        // 单位不同 → 上界不同：百分比类 100、速率类 100 Mbps、延迟类 2000 ms
+        const bool delay_kind = c.fault_kind == "delay" || c.fault_kind == "jitter";
+        const double upper = delay_kind ? 2000.0 : 100.0;
+        if (c.fault_value < 0.0 || c.fault_value > upper) {
+          return std::unexpected("case " + c.id + ": fault.params 注入值必须在 [0," +
+                                 std::to_string(static_cast<int>(upper)) + "]" +
+                                 (delay_kind ? "（毫秒）" : ""));
         }
       }
       if (c.fault_kind != "none" && c.fault_value <= 0.0) {
@@ -848,6 +861,10 @@ PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
   pc.inject_ingress_drop = (c.fault_kind == "ingress_drop") ? c.fault_value : 0.0;
   pc.send_mbps = (c.fault_kind == "rate") ? c.fault_value : 10.0;
   pc.queue_fps = (c.fault_kind == "backlog") ? c.fault_value : 0.0;
+  // 延迟注入也"启动即生效"：与 drop/rate 同一条规则，评测器不替 agent 制造结论，
+  // 但故障本身必须在 agent 动手之前就存在。
+  pc.inject_delay_ms = (c.fault_kind == "delay") ? c.fault_value : 0.0;
+  pc.inject_jitter_ms = (c.fault_kind == "jitter") ? c.fault_value : 0.0;
   pc.inject_seed = c.seed;
   pc.transcode = c.transcode;
   pc.width = c.width;
@@ -885,6 +902,8 @@ pipeline::ProcessPipelineControl::Config to_pipeline_config(const PipelineConfig
   out.inject_ingress_drop = pc.inject_ingress_drop;
   out.send_mbps = pc.send_mbps;
   out.queue_fps = pc.queue_fps;
+  out.inject_delay_ms = pc.inject_delay_ms;
+  out.inject_jitter_ms = pc.inject_jitter_ms;
   out.inject_seed = pc.inject_seed;
   out.transcode = pc.transcode;
   out.width = pc.width;
@@ -1166,11 +1185,18 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   Observation ob;
   ob.tool = "query_metrics";
   // 假观测覆盖各类 case 会声明的候选指标（不同故障类的证据键不同：injected / budget_drops /
-  // frames_in-frames_out / encode_p50_ms ...）。值写死是自检路径的既定前提，报告顶部有 banner。
+  // frames_in-frames_out / encode_p50_ms / send_p99_ms / delayed_pkts ...）。
+  // 值写死是自检路径的既定前提，报告顶部有 banner。
+  //
+  // send 段分位与延迟计数是 T-10 新增的候选键：这条自检路径不跑管线，所以这里给的
+  // 是"时延类故障会看到的那组数"（send 段被压住、延迟计数在涨），不是实测值——
+  // 与上面 injected=59 同性质。真管线路径（--record-tools / --endpoint）的读数才是证据。
   ob.data = json{{"fps", 30.3},        {"frames_in", 247},   {"frames_out", 247},
                  {"dropped", 0},       {"injected", 59},     {"decoded", 247},
                  {"decode_errors", 0}, {"budget_drops", 0},  {"encode_p50_ms", 6.4},
-                 {"encode_p99_ms", 9.1}, {"op_p50_ms", 0.3}, {"samples", 1}};
+                 {"encode_p99_ms", 9.1}, {"op_p50_ms", 0.3}, {"samples", 1},
+                 {"send_p50_ms", 201.2}, {"send_p99_ms", 233.0},
+                 {"delayed_pkts", 120},  {"delayed_max_us", 233000}, {"ingress_late", 0}};
   ob.text = "metrics=" + ob.data.dump();
   obs.push_back(ob);
 
@@ -1808,6 +1834,9 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   ac.ctx.mode = tool::ApprovalMode::Auto;
   // SPEC §7.4：dangerous 工具必须由 case 显式授权；空集合 = 一个都不允许
   ac.ctx.allowed_dangerous = c.allowed_actions;
+  // 写工具（含 lifecycle）同样受 case 的 allowed_actions 约束：pipeline_stop 会直接
+  // 停掉被测管线，让 case 断流（脚本路径不走 agent，所以只影响 real 模式）。
+  ac.ctx.allowed_mutating = c.allowed_actions;
   ac.yuan_per_mtok = cfg_.yuan_per_mtok;
   // AC-8：评测路径同样要能被打断。RunConfig::cancel 由 apps/cue-eval.cpp 的信号处理置位，
   // Runner 每轮/每次 LLM 调用前检查，并把指针写进 ChatRequest.cancel 交给 curl 的中止回调。

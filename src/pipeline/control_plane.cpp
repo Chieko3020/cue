@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <exception>
 #include <string_view>
 #include <utility>
@@ -87,7 +88,9 @@ bool same_params(const RuntimeParams& a, const RuntimeParams& b) {
          a.bitrate_kbps == b.bitrate_kbps && a.fps == b.fps && a.gop == b.gop &&
          a.threads == b.threads && a.preset == b.preset && a.send_mbps == b.send_mbps &&
          a.queue_fps == b.queue_fps && a.inject_drop == b.inject_drop &&
-         a.inject_ingress_drop == b.inject_ingress_drop && a.inject_seed == b.inject_seed;
+         a.inject_ingress_drop == b.inject_ingress_drop &&
+         a.inject_delay_ms == b.inject_delay_ms && a.inject_jitter_ms == b.inject_jitter_ms &&
+         a.inject_seed == b.inject_seed;
 }
 
 json encoder_params_json(const RuntimeParams& p) {
@@ -109,6 +112,8 @@ json runtime_params_json(const RuntimeParams& p) {
   j["queue_fps"] = p.queue_fps;
   j["inject_drop"] = p.inject_drop;
   j["inject_ingress_drop"] = p.inject_ingress_drop;
+  j["inject_delay_ms"] = p.inject_delay_ms;
+  j["inject_jitter_ms"] = p.inject_jitter_ms;
   j["inject_seed"] = p.inject_seed;
   return j;
 }
@@ -199,11 +204,28 @@ bool apply_param(const std::string& key, const std::string& value, RuntimeParams
 }
 
 bool apply_fault(const std::string& kind, double value, RuntimeParams& draft, std::string& err) {
-  if (kind != "drop" && kind != "ingress_drop" && kind != "rate" && kind != "backlog") {
-    err = "不支持的注入类型 \"" + kind + "\"（可用：drop / ingress_drop / rate / backlog）";
+  static constexpr double kMaxDelayMs = 2000.0;  // 延迟注入上限（见下面的注释）
+  const bool is_delay = kind == "delay" || kind == "jitter";
+  if (kind != "drop" && kind != "ingress_drop" && kind != "rate" && kind != "backlog" &&
+      !is_delay) {
+    err = "不支持的注入类型 \"" + kind +
+          "\"（可用：drop / ingress_drop / rate / backlog / delay / jitter）";
     return false;
   }
-  if (!(value >= 0.0 && value <= 100.0)) {  // 同时挡掉 NaN
+  // 单位不能混：delay/jitter 是**毫秒**，其余是百分比/Mbps/帧每秒。
+  // 两种口径放在同一个 [0,100] 里会让「delay=100」既可能是 100 ms 又可能是 100%，
+  // 所以范围按 kind 分开，而不是一刀切。
+  if (!std::isfinite(value) || value < 0.0) {
+    err = "注入值必须是非负有限数（0 = 清除全部注入）";
+    return false;
+  }
+  if (is_delay) {
+    if (value > kMaxDelayMs) {
+      err = kind + " 注入值必须在 [0, " + std::to_string(static_cast<int>(kMaxDelayMs)) +
+            "] 毫秒（单位是毫秒，不是百分比）";
+      return false;
+    }
+  } else if (value > 100.0) {
     err = "注入值超出范围 [0, 100]（0 = 清除全部注入）";
     return false;
   }
@@ -219,14 +241,20 @@ bool apply_fault(const std::string& kind, double value, RuntimeParams& draft, st
     next.inject_ingress_drop = 0.0;
     next.send_mbps = 10.0;  // SPEC §7.2 的默认链路：10 Mbps / 64 包突发
     next.queue_fps = 0.0;
+    next.inject_delay_ms = 0.0;
+    next.inject_jitter_ms = 0.0;
   } else if (kind == "drop") {
     next.inject_drop = value;
   } else if (kind == "ingress_drop") {
     next.inject_ingress_drop = value;
   } else if (kind == "rate") {
     next.send_mbps = value;
-  } else {
+  } else if (kind == "backlog") {
     next.queue_fps = value;
+  } else if (kind == "delay") {
+    next.inject_delay_ms = value;
+  } else {
+    next.inject_jitter_ms = value;
   }
   draft = next;
   return true;
@@ -550,7 +578,8 @@ json ControlPlane::op_obs(const json& args, std::int64_t id) {
 
 json ControlPlane::op_fault(const json& args, std::int64_t id) {
   if (!args.contains("kind") || !args["kind"].is_string()) {
-    return make_error(id, "缺 args.kind（drop / ingress_drop / rate / backlog）");
+    return make_error(id,
+                      "缺 args.kind（drop / ingress_drop / rate / backlog / delay / jitter）");
   }
   if (!args.contains("value") || !args["value"].is_number()) {
     return make_error(id, "缺 args.value（数字；0 = 清除全部注入）");
@@ -579,7 +608,9 @@ json ControlPlane::op_fault(const json& args, std::int64_t id) {
                           {"respawn", json{{"inject_drop", full["inject_drop"]},
                                            {"inject_ingress_drop", full["inject_ingress_drop"]},
                                            {"send_mbps", full["send_mbps"]},
-                                           {"queue_fps", full["queue_fps"]}}},
+                                           {"queue_fps", full["queue_fps"]},
+                                           {"inject_delay_ms", full["inject_delay_ms"]},
+                                           {"inject_jitter_ms", full["inject_jitter_ms"]}}},
                           {"params", store_.encoder_json()}});
 }
 

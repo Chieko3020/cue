@@ -40,6 +40,9 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"encode_p50_ms", pct(m.encode_p50)},
               {"encode_p99_ms", pct(m.encode_p99)},
               {"send_p50_ms", pct(m.send_p50)},
+              // send 段 p99：延迟注入（FR-PIPE.10 的 delay / jitter）的主观测点。
+              // 没有它，网络时延类根因在 cued 侧就没有任何可引用的分位（D-7）。
+              {"send_p99_ms", pct(m.send_p99)},
               // 进程身份/存活：pid=null 表示当前没有 cued（不是 pid 0 的真进程）
               {"pid", m.pid == 0 ? json(nullptr) : json(static_cast<int64_t>(m.pid))},
               {"alive", m.alive},
@@ -50,6 +53,13 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"decode_drops", m.decode_drops},
               {"budget_drops", m.budget_drops},
               {"queue_dropped", m.queue_dropped},
+              // 延迟注入的两个计数：被压住的数据报数 + 最长压住时长（微秒）。
+              // 「延迟而非丢包」的判据就在这一对与 injected/budget_drops 的对照上。
+              {"delayed_pkts", m.delayed_pkts},
+              {"delayed_max_us", m.delayed_max_us},
+              // 迟到帧：延迟注入**不**该让它涨（注入只压下行包，不改帧年龄）。
+              // 它涨了说明问题在积压/时钟，而不是网络时延——这是区分两种根因的一票。
+              {"ingress_late", m.ingress_late},
               {"samples", m.samples},
               // 控制面（T-05）：通道类型与 cued 侧累计处理的控制请求数。旧版 cued 不上报
               // 时 control_channel 为 null——"不知道"不能写成 "stdout"。
@@ -322,6 +332,90 @@ tool::ToolResult run_shell_tool(const json& a, std::vector<ToolTrace>* trace,
   return record(trace, "run_shell", tool::ToolResult{ok, text, data});
 }
 
+// ---------------------------------------------------------------- lifecycle 档位
+//
+// profile 是**真生效**的：它映射成一串 set_param（走同一个控制通道，不重启进程）。
+// 早期版本只把它记在文本里、不改变任何参数——那种"看起来能改、实际不动"的参数
+// 比没有更坏：agent 会以为改完了，然后再去别处找根因。
+//
+// 为什么刻意不含 width/height：控制面要求这两个键成对下发（0/0 = 沿用解码尺寸），
+// 而 IServicePipeline::set_param 一次只改一个键；从 0/0 出发先改任一边都会被
+// "必须成对"拒掉。与其留一个"一半会失败"的档位，不如让 profile 只管单键就能
+// 一致生效的码控参数，分辨率仍然由 pipeline_set_param 成对修改。
+struct ProfileStep {
+  const char* key;
+  const char* value;
+};
+
+struct Profile {
+  const char* name;
+  std::vector<ProfileStep> steps;
+};
+
+const std::vector<Profile>& profile_table() {
+  static const std::vector<Profile> kProfiles = {
+      {"passthrough", {{"transcode", "off"}}},
+      // 码档：transcode 打开 + 一路码控参数。fps=30 与推流侧一致，
+      // 否则 x264 的码率控制会按错误的帧率分配 bit，改完档反而更糟。
+      {"low-600k",
+       {{"transcode", "on"}, {"bitrate_kbps", "600"}, {"fps", "30"}, {"gop", "60"},
+        {"preset", "veryfast"}}},
+      {"std-1500k",
+       {{"transcode", "on"}, {"bitrate_kbps", "1500"}, {"fps", "30"}, {"gop", "60"},
+        {"preset", "veryfast"}}},
+      {"high-4000k",
+       {{"transcode", "on"}, {"bitrate_kbps", "4000"}, {"fps", "30"}, {"gop", "60"},
+        {"preset", "faster"}}},
+  };
+  return kProfiles;
+}
+
+std::vector<std::string> profile_names() {
+  std::vector<std::string> out;
+  out.reserve(profile_table().size());
+  for (const auto& p : profile_table()) out.emplace_back(p.name);
+  return out;
+}
+
+// 应用一个档位。失败时把"卡在哪一步"写进 err：只说"profile 应用失败"会让调用方
+// 以为档位名写错了，而真实原因往往是被拒的键（例如运行期不允许的键）。
+bool apply_profile(IServicePipeline& pipe, const std::string& name, std::string& applied,
+                   std::string& err) {
+  const Profile* hit = nullptr;
+  for (const auto& p : profile_table()) {
+    if (name == p.name) {
+      hit = &p;
+      break;
+    }
+  }
+  if (hit == nullptr) {
+    err = "未知 profile \"" + name + "\"（可用：" + [&] {
+      std::string s;
+      for (const auto& n : profile_names()) {
+        if (!s.empty()) s += " / ";
+        s += n;
+      }
+      return s;
+    }() + "）";
+    return false;
+  }
+  std::string out;
+  for (const auto& step : hit->steps) {
+    std::string serr;
+    if (!pipe.set_param(step.key, step.value, serr)) {
+      err = std::string("profile=") + name + " 的 " + step.key + "=" + step.value +
+            " 未生效: " + serr;
+      return false;
+    }
+    if (!out.empty()) out += ", ";
+    out += step.key;
+    out += "=";
+    out += step.value;
+  }
+  applied = out;
+  return true;
+}
+
 }  // namespace
 
 
@@ -331,12 +425,115 @@ const char* real_ops_system_prompt() {
          "根因必须使用枚举值：network_loss / network_delay / bandwidth_insufficient / "
          "encoder_too_slow / resolution_too_high / queue_backlog / keyframe_storm / clock_drift。"
          "inject_fault 的 kind 可选 drop（下行丢包 %）/ ingress_drop（上行丢包 %）/ "
-         "rate（发送速率上限 Mbps）/ backlog（发送排队节奏 fps）；"
-         "value=0 表示清除全部注入（不区分是哪一路）。"
+         "rate（发送速率上限 Mbps）/ backlog（发送排队节奏 fps）/ delay（固定延迟 ms）/ "
+         "jitter（抖动幅度 ms）；value=0 表示清除全部注入（不区分是哪一路）。"
+         "区分丢包与时延：丢包涨 injected / budget_drops，时延涨 delayed_pkts 与 send 段分位"
+         "（send_p50_ms / send_p99_ms）而 injected 不涨。"
+         "pipeline_start / pipeline_restart 可带 profile（passthrough / low-600k / "
+         "std-1500k / high-4000k）一键套用码控档位。"
          "diagnose 阶段提交 evidence 时，每条只从某次工具返回里逐字摘抄 key=value 片段"
          "（例如 injected=59、fps=30.3、decode_p99_ms=3.199），最多 4 条；"
          "严格禁止解释性文字、中文句子、根因说明或把多次观测合并成一条——"
          "判分会逐条校验：只要出现引用之外的文字，该条证据即判伪。";
+}
+
+// SPEC §7.4 的三个 mutating 工具。抽成一份、两处（cue-serve 与 build_real_tools）共用的理由：
+// 它们描述的是**同一组动作**，schema/风险级/档位表任何一处改了两边就会分叉——
+// 「控制台能做的 agent 不能做」正是这种分叉最直观的症状。
+//
+// profile 只挂在 start/restart 上：stop 没有任何"档位"可套，把 profile 留在 stop 的
+// schema 里就是那个「看起来能改、实际不动」的参数，这里直接不给。
+void add_lifecycle_tools(tool::Registry& reg, IServicePipeline& pipe,
+                         std::vector<ToolTrace>* trace) {
+  const tool::ParamSpec profile_param{.name = "profile",
+                                      .type = "string",
+                                      .desc = "码控档位（真的生效：映射成一串 set_param，"
+                                              "不重启进程）：passthrough=关转码；"
+                                              "low-600k / std-1500k / high-4000k=开转码 + "
+                                              "对应码率/fps30/gop60/preset。"
+                                              "分辨率不在档位里（width/height 必须成对设置，"
+                                              "用 pipeline_set_param 改）。",
+                                      .required = false,
+                                      .enum_values = profile_names(),
+                                      .has_range = false,
+                                      .min = 0,
+                                      .max = 0};
+
+  reg.add(tool::ToolSpec{.name = "pipeline_start",
+                         .desc = "启动媒体管线（cued 子进程）；已在运行时只套用 profile",
+                         .risk = tool::Risk::Mutating,
+                         .params = {profile_param}},
+          [&pipe, trace](const json& a) {
+            const std::string profile =
+                a.contains("profile") ? a["profile"].get<std::string>() : std::string();
+            const bool was_running = pipe.running();
+            if (!was_running) {
+              std::string err;
+              if (!pipe.start(err)) {
+                return record(trace, "pipeline_start",
+                              tool::ToolResult{false, "启动失败: " + err,
+                                               json{{"running", false}}});
+              }
+            }
+            std::string note = was_running ? "管线已在运行" : "管线已启动";
+            json data{{"running", true}, {"already_running", was_running}};
+            if (!profile.empty()) {
+              std::string applied;
+              std::string perr;
+              if (!apply_profile(pipe, profile, applied, perr)) {
+                // 启动成功但档位失败：必须如实分开说，不能因为 start 成功就报整体成功
+                return record(trace, "pipeline_start",
+                              tool::ToolResult{false, note + "，但 profile 未生效: " + perr,
+                                               data});
+              }
+              note += "；profile=" + profile + " → " + applied;
+              data["profile"] = profile;
+            }
+            return record(trace, "pipeline_start",
+                          tool::ToolResult{true, note, std::move(data)});
+          });
+
+  reg.add(tool::ToolSpec{.name = "pipeline_stop",
+                         .desc = "停止媒体管线（cued 子进程）。评测里这会让当前 case 断流，"
+                                 "只在确实需要重启时才用；能用 pipeline_set_param / "
+                                 "inject_fault 解决的不要停进程。",
+                         .risk = tool::Risk::Mutating,
+                         .params = {}},
+          [&pipe, trace](const json&) {
+            pipe.stop();
+            return record(trace, "pipeline_stop",
+                          tool::ToolResult{true, "管线已停止", json{{"running", false}}});
+          });
+
+  reg.add(tool::ToolSpec{.name = "pipeline_restart",
+                         .desc = "重启媒体管线（会造成短暂断流）；可顺带套用 profile",
+                         .risk = tool::Risk::Mutating,
+                         .params = {profile_param}},
+          [&pipe, trace](const json& a) {
+            pipe.stop();
+            std::string err;
+            if (!pipe.start(err)) {
+              return record(trace, "pipeline_restart",
+                            tool::ToolResult{false, "重启失败: " + err,
+                                             json{{"running", false}}});
+            }
+            std::string note = "管线已重启";
+            json data{{"running", true}};
+            const std::string profile =
+                a.contains("profile") ? a["profile"].get<std::string>() : std::string();
+            if (!profile.empty()) {
+              std::string applied;
+              std::string perr;
+              if (!apply_profile(pipe, profile, applied, perr)) {
+                return record(trace, "pipeline_restart",
+                              tool::ToolResult{false, note + "，但 profile 未生效: " + perr,
+                                               data});
+              }
+              note += "；profile=" + profile + " → " + applied;
+              data["profile"] = profile;
+            }
+            return record(trace, "pipeline_restart", tool::ToolResult{true, note, std::move(data)});
+          });
 }
 
 void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<ToolTrace>* trace,
@@ -380,7 +577,7 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
                                      .desc = "参数名",
                                      .required = true,
                                      .enum_values = {"bitrate_kbps", "gop", "preset", "transcode", "width",
-                                                                  "height"}},
+                                                     "height", "fps"}},
                                     {.name = "value",
                                      .type = "string",
                                      .desc = "目标值",
@@ -402,23 +599,34 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
           });
 
   reg.add(tool::ToolSpec{.name = "inject_fault",
-                         .desc = "注入网络损伤（危险动作；value=0 清除全部注入）",
+                         .desc = "注入网络损伤（危险动作；value=0 清除全部注入）。"
+                                 "drop/ingress_drop 让包丢失（injected 涨）；"
+                                 "delay/jitter 只让包晚到（delayed_pkts 与 send 段分位涨，"
+                                 "injected 不涨）——两者在指标上可区分，不要混用。",
                          .risk = tool::Risk::Dangerous,
                          .params = {{.name = "kind",
                                      .type = "string",
                                      .desc = "类型：drop=下行丢包% / ingress_drop=上行丢包% / "
-                                             "rate=发送速率上限Mbps / backlog=发送排队节奏fps",
+                                             "rate=发送速率上限Mbps / backlog=发送排队节奏fps / "
+                                             "delay=固定延迟ms / jitter=抖动幅度ms",
                                      .required = true,
-                                     .enum_values = {"drop", "ingress_drop", "rate", "backlog"}},
+                                     .enum_values = {"drop", "ingress_drop", "rate", "backlog",
+                                                     "delay", "jitter"}},
                                     {.name = "value",
                                      .type = "number",
-                                     .desc = "注入值（drop/ingress_drop 为百分比，rate 为 Mbps，"
-                                             "backlog 为帧/s；0 = 清除全部注入）",
+                                     .desc = "注入值，单位随 kind：drop/ingress_drop 是百分比 "
+                                             "(0..100)，rate 是 Mbps (0.1..100)，backlog 是帧/s "
+                                             "(0..100)，delay/jitter 是**毫秒** (0..2000)。"
+                                             "0 = 清除全部注入（不分哪一路）。",
                                      .required = true,
                                      .enum_values = {},
-                                     .has_range = true,
+                                     // 不做 schema 级范围：四个 kind 的单位不同（% / Mbps /
+                                     // 帧每秒 / 毫秒），一个 [min,max] 无论取哪一边都是错的。
+                                     // 范围与单位校验只有一份，在 control_plane 的 apply_fault
+                                     // （cued 与工具层共用），这里不重复也不放宽。
+                                     .has_range = false,
                                      .min = 0,
-                                     .max = 100}}},
+                                     .max = 0}}},
           [&pipe, trace](const json& a) {
             std::string err;
             const std::string k = a["kind"].get<std::string>();
@@ -498,6 +706,11 @@ void build_real_tools(tool::Registry& reg, IServicePipeline& pipe, std::vector<T
                           .min = 200,
                           .max = 30000}}},
           [trace, opts](const json& a) { return run_shell_tool(a, trace, opts); });
+
+  // 第 6~8 个工具：lifecycle（与 cue-serve 共用同一份实现，见 add_lifecycle_tools）。
+  // 放在这里而不是各入口自己注册：需求 FR-TOOL.1 列的是 8 个工具，agent 侧缺这三个
+  // 就是一条真实的功能缺口（agent 无法自己重启管线，也就无法验证「重启后是否恢复」）。
+  add_lifecycle_tools(reg, pipe, trace);
 }
 
 }  // namespace cue::pipeline

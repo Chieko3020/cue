@@ -254,12 +254,23 @@ struct PipelineMetrics {
   // 排队策略切换（fault.set kind=backlog 改了发送节奏）时主动丢弃的积压帧。
   // 与 dropped 分开：那一刻丢弃是控制面的策略决定，不是链路故障。
   uint64_t queue_dropped = 0;
+  // 延迟注入（FR-PIPE.10 的 delay / jitter）的实际效果：被压进延迟队列的数据报数，
+  // 以及单个数据报被压住的最长时间（微秒）。它们是「延迟而不是丢包」的正面证据：
+  // 只有这两个数涨而 injected / budget_drops 不涨，才说明数据报最终都发出去了、只是晚了。
+  uint64_t delayed_pkts = 0;
+  uint64_t delayed_max_us = 0;
+  // 迟到帧（相对最小延迟基线晚到超过 --max-ingress-lag-ms 而被丢弃）。
+  // 它和延迟注入的关系必须能读出来：延迟注入只压下行数据报，**不**改变帧的年龄，
+  // 所以注入 delay 时这个计数应该保持 0；一旦它涨，说明是真的积压/时钟问题，不是注入。
+  uint64_t ingress_late = 0;
   // 六段 p50（ms）。NaN = 这一段没有样本（cued 的 METRICS 对应段是 null）：
   // "没采到"与"花了 0 ms"是两件事，消费者必须输出 null/n/a，不能用 0 冒充。
   double recv_p50 = kNoSample, buffer_p50 = kNoSample, decode_p50 = kNoSample,
          op_p50 = kNoSample, encode_p50 = kNoSample, send_p50 = kNoSample;
   // 六段 p99（ms，同上：只有 cued 真正打印了 p99 的段才有值）
   double decode_p99 = kNoSample, op_p99 = kNoSample, encode_p99 = kNoSample;
+  // send 段 p99：延迟注入的主观测点（延迟只体现在发送侧尾部，不体现在计数上）
+  double send_p99 = kNoSample;
   int64_t updated_us = 0;
   uint64_t samples = 0;
   // 快照时的存活状态：cued 被 kill 后 latest() 不能继续撒谎（review #11）

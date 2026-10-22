@@ -275,6 +275,19 @@ add_executable(test_control_channel tests/test_control_channel.cpp)
 target_link_libraries(test_control_channel PRIVATE cue_control)
 add_test(NAME control_channel COMMAND test_control_channel)
 
+# T-06：FR-TOOL.1 的 8 个工具（含 lifecycle）必须真的注册在 agent 侧，
+# profile 必须真的映射成 set_param。只链 cue_pipeline + cue_agent 的工具层，
+# 不需要 cued/FFmpeg。
+add_executable(test_tools tests/test_tools.cpp)
+target_link_libraries(test_tools PRIVATE cue_pipeline cue_agent)
+add_test(NAME tools COMMAND test_tools)
+
+# T-10：延迟注入的决策序列（同一 seed 可复现、单侧均匀、注入值变化即重置）。
+# 纯算术，不起 cued。
+add_executable(test_delay_injector tests/test_delay_injector.cpp)
+target_link_libraries(test_delay_injector PRIVATE cue_proto)
+add_test(NAME delay_injector COMMAND test_delay_injector)
+
 # ---- sanitizer 运行参数（ctest）----
 # 报告带行号、出错即终止（不静默继续）。ASan 的泄漏检查保持默认开启：
 # 若第三方全局对象造成误报，应在报告处逐条说明，而不是整体 detect_leaks=0。
@@ -292,7 +305,8 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # "ASan runtime does not come first"，也不会被 ASan 的 shadow 映射撞坏 RLIMIT_AS。
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
-  foreach(_t wire agent context eval state compare console cassette probe sandbox jitter_buffer)
+  foreach(_t wire agent context eval state compare console cassette probe sandbox jitter_buffer
+            control_channel tools delay_injector)
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
 endif()

@@ -25,6 +25,14 @@ struct CallContext {
   ApprovalMode mode = ApprovalMode::Auto;
   // 评测模式下 case 允许的危险动作白名单（空 = 不允许 dangerous）
   std::vector<std::string> allowed_dangerous;
+  // 评测模式下 case 允许的**写动作**白名单（空 = 全部放行，保持 Mutating 的既有语义）。
+  // 存在的理由：pipeline_stop / pipeline_restart 是 Mutating 而不是 Dangerous——
+  // 它们不需要"危险动作"那一级审批（不碰沙箱、不改代码），但一次 pipeline_stop
+  // 会让正在评测的 case 直接断流、计数器归零，等于把判分对象拆掉。
+  // 所以评测器把 case.expect.allowed_actions 也传进来，当白名单**非空**时，
+  // Auto 模式下未列出的写工具一律拒绝；交互模式（cue run / cue serve）不设这一项，
+  // Mutating 的行为与以前完全一致。
+  std::vector<std::string> allowed_mutating;
   // Ask 模式的回调，返回是否批准。参数带 Risk 是为了让审批 UI 能按风险分级呈现；
   // 阶段（agent::Stage）不在这里传——tool 层不得 include agent 层（SPEC §7.3）。
   std::function<bool(const ToolSpec&, Risk, const json& args)> approve;

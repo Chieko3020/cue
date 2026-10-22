@@ -238,10 +238,11 @@ class ConsoleApp {
     // 工具层与 agent 完全同源（build_real_tools），控制台不再另开一条"后门"。
     // 控制台也是交互入口：run_shell 一样要落审计（AC-11），关停信号 g_stop 兼作
     // 取消指针——否则一个正在跑的诊断命令会把 shutdown 拖到工具超时。
+    // lifecycle 三个工具也由 build_real_tools 注册（同一个 Registry、同一份 schema），
+    // 控制台与 agent 看到的是同样 8 个工具。
     pipeline::build_real_tools(
         reg_, *pipe_, nullptr,
         pipeline::RealToolsOptions{.audit_log_path = "runs/audit.jsonl", .cancel = &g_stop});
-    add_pipeline_lifecycle_tools();
   }
 
   int port() const { return opt_.port; }
@@ -405,66 +406,22 @@ class ConsoleApp {
   json runs() const { return cow::scan_runs(opt_.runs_dir, 20); }
 
  private:
-  // pipeline_start / stop / restart：SPEC §7.4 的三个 mutating 工具。
-  // 它们不放进 build_real_tools 是有意的：agent 在评测里没有"启停"预算语义，
-  // 控制台的操作员才有。风险级与审批规则完全一致（走同一个 Registry）。
-  void add_pipeline_lifecycle_tools() {
-    auto profile_param = tool::ParamSpec{.name = "profile",
-                                         .type = "string",
-                                         .desc = "档位名（当前版本仅记录，不改变参数）",
-                                         .required = false,
-                                         .enum_values = {},
-                                         .has_range = false,
-                                         .min = 0,
-                                         .max = 0};
-
-    reg_.add(tool::ToolSpec{.name = "pipeline_start",
-                            .desc = "启动媒体管线（cued 子进程）",
-                            .risk = tool::Risk::Mutating,
-                            .params = {profile_param}},
-             [this](const json&) {
-               std::string err;
-               if (pipe_->running()) {
-                 return tool::ToolResult{true, "管线已在运行", json{{"running", true}}};
-               }
-               if (!pipe_->start(err)) {
-                 return tool::ToolResult{false, "启动失败: " + err, json::object()};
-               }
-               return tool::ToolResult{true, "管线已启动", json{{"running", true}}};
-             });
-
-    reg_.add(tool::ToolSpec{.name = "pipeline_stop",
-                            .desc = "停止媒体管线（cued 子进程）",
-                            .risk = tool::Risk::Mutating,
-                            .params = {profile_param}},
-             [this](const json&) {
-               pipe_->stop();
-               return tool::ToolResult{true, "管线已停止", json{{"running", false}}};
-             });
-
-    reg_.add(tool::ToolSpec{.name = "pipeline_restart",
-                            .desc = "重启媒体管线（会造成短暂断流）",
-                            .risk = tool::Risk::Mutating,
-                            .params = {profile_param}},
-             [this](const json&) {
-               pipe_->stop();
-               std::string err;
-               if (!pipe_->start(err)) {
-                 return tool::ToolResult{false, "重启失败: " + err, json{{"running", false}}};
-               }
-               return tool::ToolResult{true, "管线已重启", json{{"running", true}}};
-             });
-  }
-
   // body 里的 {action, key, value, kind} → 工具名 + args
   bool map_action(const json& body, std::string& name, json& args) {
     const std::string a = body["action"].get<std::string>();
     if (a == "start") {
       name = "pipeline_start";
+      // profile 原样转交（工具层校验枚举）：控制台与 agent 走同一条生效路径
+      if (body.contains("profile") && body["profile"].is_string()) {
+        args = {{"profile", body["profile"]}};
+      }
     } else if (a == "stop") {
       name = "pipeline_stop";
     } else if (a == "restart") {
       name = "pipeline_restart";
+      if (body.contains("profile") && body["profile"].is_string()) {
+        args = {{"profile", body["profile"]}};
+      }
     } else if (a == "metrics") {
       name = "query_metrics";
       if (body.contains("window_ms")) args = {{"window_ms", body["window_ms"]}};

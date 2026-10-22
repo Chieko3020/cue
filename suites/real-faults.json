@@ -1,7 +1,7 @@
 {
   "suite": "real-faults",
   "version": 1,
-  "note": "AC-15 的真实故障复现集：5 类根因（全部落在 SPEC §7.6 的 8 类枚举内），每类一个 case，全部可从 cued 侧工具面（query_metrics / fetch_observation）诊断，不含任何前雇主代码/日志/数据/指标原值。阈值与数值都是本机实测（2 vCPU、g++-14 构建的 cued、30 fps 合成推流；每个 case 单独跑「故障态→修复态」3 次，故障态读数取假 agent 那次真 query_metrics，修复态取 harness 重测的 final_fps）：network_loss 上行丢包 50% → fps 15.0~15.6（更长的 10 s 观测里逐秒 9.9~17.0）、injected 逐秒增长（4 s 时 60+ 个包）、dropped=0、frames_in==frames_out、budget_drops=0；inject_fault value=0 后 fps 28.5~28.7。bandwidth_insufficient 发送上限 0.1 Mbps（720p@4000kbps）→ fps 10.6~14.0（1 s 窗口在不同相位读数不同，稳态约 10）、budget_drops=dropped（4 s 时 17~32）、encode_p50≈6.5 ms 正常；清除注入后 fps 28.5~28.7。queue_backlog 发送节奏 12 帧/s → fps 11.7~12.0、frames_in/out=59~122/24~49（积压深度单调增长）、dropped=budget_drops=0；清除注入后 fps 28.5~28.7。encoder_too_slow 1600x900 + preset=placebo → encode_p50 108~112 ms（帧预算 33 ms 的 3.3 倍）、op_p50≈0.46 ms（缩放几乎不耗时）、dropped=budget_drops=0、fps 8.5~8.8；改 preset=ultrafast 后 fps 28.5~28.7。resolution_too_high 输出 3840x2160 + veryfast（源 64x64 上采样）→ encode_p50 53~57 ms、op_p50 2.1~2.2 ms（缩放开销随输出像素线性增长，这是它与 preset 慢的区分点）、dropped=budget_drops=0、fps 15.3~16.9；降到 1280x720 后 encode_p50≈6.3 ms、op_p50≈0.33 ms、fps 28.5~28.7。五类统一 fps_min=25：故障态 8.5~16.9（低于阈值 ≥8 fps），修复态 28.5~28.7（高于阈值 ≥3.5 fps）。被淘汰的候选类（实测口径）：keyframe_storm —— 本机 x264 走 ABR+VBV，GOP 不改变平均码率，I 帧又不比 P 帧贵：gop=1 与 gop=60 的 encode_p50 相差 <10%（1080p 15.2 vs 14.4、1440p 26.5 vs 25.4、4K 60.8 vs 54.8 ms），budget_drops 恒为 0（10 Mbps 链路、20 Mbps 码率下也不丢），没有可校准的 SLA 信号；network_delay / clock_drift —— cued 侧没有对应可观测量：时延只体现在 probe 的端到端分位（工具面看不到），上行 PTS 只被透传给下游，不参与 cued 的任何计时。queue_backlog 与 bandwidth_insufficient 只有在限速策略被区分成『排队』与『丢包』后才可区分：前者 frames_in−frames_out 增长且 dropped/budget_drops 均为 0，后者 budget_drops 增长——不是同一类故障换名字。",
+  "note": "AC-15 的真实故障复现集：6 类根因（全部落在 SPEC §7.6 的 8 类枚举内），每类一个 case，全部可从 cued 侧工具面（query_metrics / fetch_observation）诊断，不含任何前雇主代码/日志/数据/指标原值。阈值与数值都是本机实测（2 vCPU、g++-14 构建的 cued、30 fps 合成推流；每个 case 单独跑「故障态→修复态」3 次，故障态读数取假 agent 那次真 query_metrics，修复态取 harness 重测的 final_fps）：network_loss 上行丢包 50% → fps 15.0~15.6（更长的 10 s 观测里逐秒 9.9~17.0）、injected 逐秒增长（4 s 时 60+ 个包）、dropped=0、frames_in==frames_out、budget_drops=0；inject_fault value=0 后 fps 28.5~28.7。bandwidth_insufficient 发送上限 0.1 Mbps（720p@4000kbps）→ fps 10.6~14.0（1 s 窗口在不同相位读数不同，稳态约 10）、budget_drops=dropped（4 s 时 17~32）、encode_p50≈6.5 ms 正常；清除注入后 fps 28.5~28.7。queue_backlog 发送节奏 12 帧/s → fps 11.7~12.0、frames_in/out=59~122/24~49（积压深度单调增长）、dropped=budget_drops=0；清除注入后 fps 28.5~28.7。encoder_too_slow 1600x900 + preset=placebo → encode_p50 108~112 ms（帧预算 33 ms 的 3.3 倍）、op_p50≈0.46 ms（缩放几乎不耗时）、dropped=budget_drops=0、fps 8.5~8.8；改 preset=ultrafast 后 fps 28.5~28.7。resolution_too_high 输出 3840x2160 + veryfast（源 64x64 上采样）→ encode_p50 53~57 ms、op_p50 2.1~2.2 ms（缩放开销随输出像素线性增长，这是它与 preset 慢的区分点）、dropped=budget_drops=0、fps 15.3~16.9；降到 1280x720 后 encode_p50≈6.3 ms、op_p50≈0.33 ms、fps 28.5~28.7。network_delay（T-10 新增，唯一不降 fps 的一类）200 ms 固定延迟 → fps 29.9~30.1（不降，这正是它与丢包的区分点）、injected=dropped=budget_drops=0、ingress_late=0、send_p50≈201~232 ms、send_p99≈233~234 ms（无注入时 send≈0.04/0.06 ms）、delayed_pkts 逐秒增长（4 s 约 119~122 包）、delayed_max_us≈233~234 ms；清除注入后 probe e2e p99 从 233~235 ms 回落到 34 ms（残余 34 ms 是探针抖动缓冲降档前的驻留，之后 0.5~1 ms），SLA 用 fps_min=25 + lat_p99_ms=120（故障态 fps 本就达标，所以判分靠 send 段证据链而不是 fps 阈值）。前五类统一 fps_min=25：故障态 8.5~16.9（低于阈值 ≥8 fps），修复态 28.5~28.7（高于阈值 ≥3.5 fps）。被淘汰的候选类（实测口径）：keyframe_storm —— 本机 x264 走 ABR+VBV，GOP 不改变平均码率，I 帧又不比 P 帧贵：gop=1 与 gop=60 的 encode_p50 相差 <10%（1080p 15.2 vs 14.4、1440p 26.5 vs 25.4、4K 60.8 vs 54.8 ms），budget_drops 恒为 0（10 Mbps 链路、20 Mbps 码率下也不丢），没有可校准的 SLA 信号；network_delay —— T-10 之后 cued 侧有了对应可观测量（delay 注入 → send 段 p50/p99 涨、delayed_pkts/delayed_max_us 涨，而 injected/budget_drops 不涨），因此本集新增 netdelay-200ms：注入 200 ms 固定延迟，fps 与 dropped 全程正常，agent 只能靠 send 段分位与延迟计数定位；clock_drift —— 仍然没有对应可观测量：上行 PTS 只被透传给下游，不参与 cued 的任何计时。queue_backlog 与 bandwidth_insufficient 只有在限速策略被区分成『排队』与『丢包』后才可区分：前者 frames_in−frames_out 增长且 dropped/budget_drops 均为 0，后者 budget_drops 增长——不是同一类故障换名字。",
   "cases": [
     {
       "id": "netloss-uplink-50pct",
@@ -195,6 +195,44 @@
         ],
         "sla": {
           "fps_min": 25
+        }
+      },
+      "budget": {
+        "max_turns": 16,
+        "max_yuan": 0.3,
+        "max_wall_s": 180
+      }
+    },
+    {
+      "id": "netdelay-200ms",
+      "seed": 46,
+      "fault": {
+        "kind": "delay",
+        "params": {
+          "delay_ms": 200
+        }
+      },
+      "pipeline": {
+        "bitrate_kbps": 1500,
+        "gop": 60
+      },
+      "prompt": "下行链路时延异常：fps 正常、dropped / injected / budget_drops 都没有增长，但发送侧耗时（send 段）与延迟计数明显上升。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上、端到端 p99 回落到 120 ms 以内。",
+      "expect": {
+        "root_cause": "network_delay",
+        "evidence_candidates": [
+          "send_p99_ms",
+          "delayed_pkts",
+          "injected"
+        ],
+        "allowed_actions": [
+          "inject_fault",
+          "pipeline_set_param",
+          "query_metrics",
+          "fetch_observation"
+        ],
+        "sla": {
+          "fps_min": 25,
+          "lat_p99_ms": 120
         }
       },
       "budget": {

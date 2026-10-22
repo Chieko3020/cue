@@ -418,6 +418,16 @@ bool ProcessPipelineControl::spawn_cued_locked(std::string& err) {
     args.push_back("--queue-fps");
     args.push_back(std::to_string(cfg.queue_fps));
   }
+  // 延迟注入同样只在开启时下传：不带参数时 cued 的发送路径与 M2 逐字节一致
+  // （多一个默认 0 的开关会让人以为「默认就在压包」）。
+  if (cfg.inject_delay_ms > 0.0) {
+    args.push_back("--inject-delay-ms");
+    args.push_back(std::to_string(cfg.inject_delay_ms));
+  }
+  if (cfg.inject_jitter_ms > 0.0) {
+    args.push_back("--inject-jitter-ms");
+    args.push_back(std::to_string(cfg.inject_jitter_ms));
+  }
   if (cfg.transcode) {
     args.push_back("--transcode");
     args.push_back("on");
@@ -786,6 +796,9 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   m.decode_drops = count("decode_drops");
   m.budget_drops = count("budget_drops");
   m.queue_dropped = count("queue_dropped");
+  m.delayed_pkts = count("delayed_pkts");
+  m.delayed_max_us = count("delayed_max_us");
+  m.ingress_late = count("ingress_late");
   // 段分位：cued 写 null（本秒没有样本）或整段缺失 → 保持 NaN，绝不写成 0
   auto stage = [&j](const char* key, double& p50, double& p95, double& p99) {
     const auto it = j.find(key);
@@ -805,7 +818,9 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   stage("decode", m.decode_p50, sink_p95, m.decode_p99);
   stage("op", m.op_p50, sink_p95, m.op_p99);
   stage("encode", m.encode_p50, sink_p95, m.encode_p99);
-  stage("send", m.send_p50, sink_p95, sink_p95);
+  // send 段的 p99 是延迟注入的主证据（send 段涨、计数不涨），必须单独解析，
+  // 不能再塞进 sink_p95（那样工具面永远看不到它）。
+  stage("send", m.send_p50, sink_p95, m.send_p99);
   // 控制面字段（T-05）：通道类型与 cued 累计处理的控制请求数
   if (const auto it = j.find("control_channel"); it != j.end() && it->is_string()) {
     m.control_channel = it->get<std::string>();
@@ -1029,6 +1044,8 @@ bool ProcessPipelineControl::inject_fault(const std::string& kind, double value,
   //   ingress_drop  上行丢包（%）：帧重组超时 → dropped 涨、frames_out 掉
   //   rate          发送速率上限（Mbps）：令牌桶不足 → budget_drops 涨、帧被丢
   //   backlog       发送排队节奏（帧/s）：不丢包，队列积压 → frames_in−frames_out 涨
+  //   delay / jitter 延迟注入（毫秒）：不丢包，delayed_pkts 涨、send 段分位涨，
+  //                  injected / budget_drops 都不动（这是与丢包最直接的区分点）
   json result;
   if (!control_call("fault.set", json{{"kind", kind}, {"value", value}}, result, err)) {
     return false;
@@ -1049,6 +1066,12 @@ bool ProcessPipelineControl::inject_fault(const std::string& kind, double value,
     }
     if (r.contains("queue_fps") && r["queue_fps"].is_number()) {
       cfg_.queue_fps = r["queue_fps"].get<double>();
+    }
+    if (r.contains("inject_delay_ms") && r["inject_delay_ms"].is_number()) {
+      cfg_.inject_delay_ms = r["inject_delay_ms"].get<double>();
+    }
+    if (r.contains("inject_jitter_ms") && r["inject_jitter_ms"].is_number()) {
+      cfg_.inject_jitter_ms = r["inject_jitter_ms"].get<double>();
     }
   }
   // fault.applied / fault.cleared 由 cued 自己发（它才知道注入到底生效了没有）；
