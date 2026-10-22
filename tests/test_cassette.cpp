@@ -173,7 +173,11 @@ class FakeServer {
   }
 
   std::vector<std::string> responses_;
-  int fd_ = -1;
+  // fd_ 必须是原子：serve() 线程在 accept 里读它，stop() 在主线程写 -1，两者无同步
+  // （TSan 在 CI 首次真跑时报的正是这条 data race，见 test_cassette.cpp:103 与 :137）。
+  // shutdown(2) 不会释放 fd 号，所以 accept 最坏是拿到 EBADF 再由 stop_ 退出循环，
+  // 不会出现"fd 号被别的 socket 复用"这种更坏的情况。
+  std::atomic<int> fd_{-1};
   int port_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<int> served_{0};
