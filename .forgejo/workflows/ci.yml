@@ -202,14 +202,23 @@ jobs:
           # 本机 /etc/ld.so.preload 预加载 libonion.so，会把 libasan 挤到第二位：
           # verify_asan_link_order=0 是这台机器上唯一的让步（见 CMakeLists.txt 的说明）。
           export ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0
-          for t in decode_media decode_datagram fec_header; do
-            mkdir -p "$WORK/$t"
-            cp tests/fuzz/corpus/$t/* "$WORK/$t/"
-            # decode_media 的 FragmentTooLarge（单分片 >16 KiB）需要 >16416 字节的输入，
-            # libFuzzer 默认上限 4096 到不了；另外两个入口的合法输入 ≤24/8 字节，不用放宽。
-            EXTRA=""
-            if [ "$t" = "decode_media" ]; then EXTRA="-max_len=18432"; fi
-            echo "===== fuzz_decode_$t 60s ====="
-            "./build-fuzz/fuzz_decode_$t" "$WORK/$t" \
-              -max_total_time=60 -print_final_stats=1 $EXTRA -artifact_prefix="$WORK/artifacts/"
-          done
+          # 二进制的名字与语料目录的名字**并不一一对应**：
+          #   corpus/decode_media   → fuzz_decode_media
+          #   corpus/decode_datagram→ fuzz_decode_datagram
+          #   corpus/fec_header     → fuzz_decode_fec_header   （这个没有 decode_ 前缀）
+          # 之前这里写的是 "./build-fuzz/fuzz_decode_$t"，而 $t 已经是 decode_media 这种
+          # 带前缀的名字，拼出来是 fuzz_decode_decode_media —— 只在 CI 里报 exit 127。
+          # 第一次真正跑（之前一直是 skipped）就露出来了，所以改成显式配对。
+          run_one() {
+            local target="$1" corpus="$2" extra="${3:-}"
+            mkdir -p "$WORK/$corpus"
+            cp tests/fuzz/corpus/"$corpus"/* "$WORK/$corpus/"
+            echo "===== $target 60s ====="
+            "./build-fuzz/$target" "$WORK/$corpus" \
+              -max_total_time=60 -print_final_stats=1 $extra -artifact_prefix="$WORK/artifacts/"
+          }
+          # decode_media 的 FragmentTooLarge（单分片 >16 KiB）需要 >16416 字节的输入，
+          # libFuzzer 默认上限 4096 到不了；另外两个入口的合法输入 ≤24/8 字节，不用放宽。
+          run_one fuzz_decode_media    decode_media    "-max_len=18432"
+          run_one fuzz_decode_datagram decode_datagram ""
+          run_one fuzz_decode_fec_header fec_header   ""
