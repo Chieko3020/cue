@@ -88,7 +88,13 @@ function start(name, cmd, args, opts = {}) {
 
 
 // 直接读一段 SSE 流（用于验证 Last-Event-ID 补齐；浏览器页面之外的独立检查）
-async function readSse(headers, ms = 2500) {
+// 读一段 SSE，**收到 console.ready 就返回**，而不是死等 1500 个字符。
+//
+// 为什么改：补齐帧只有几条（几百字符），永远到不了 1500；旧实现会一直读到 2500ms
+// 超时才返回。CI 的慢环境下，服务端「retry → 补齐 → console.ready」这三步
+// 在超时前走不完，于是只拿到 "retry: 3000" 就断言失败——run14 绿、run15 红就是这个。
+// 判据应该是「补齐完成」这个事件，而不是一个与内容量无关的字符数阈值。
+async function readSse(headers, ms = 8000) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), ms);
   let text = '';
@@ -96,7 +102,8 @@ async function readSse(headers, ms = 2500) {
     const res = await fetch(`${BASE}/events`, { headers, signal: ac.signal, cache: 'no-store' });
     const reader = res.body.getReader();
     const dec = new TextDecoder();
-    while (text.length < 1500) {
+    // console.ready 是服务端在补发完之后无条件发的那一条，看到它就可以停了。
+    while (!text.includes('console.ready')) {
       const { value, done } = await reader.read();
       if (done) break;
       text += dec.decode(value, { stream: true });
