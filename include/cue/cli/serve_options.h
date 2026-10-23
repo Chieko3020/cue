@@ -17,6 +17,9 @@ struct ServeOptions {
   std::string bind = "127.0.0.1";
   int port = 8080;
   std::string web_dir;  // 空 = 自动探测 web/dist → web
+  // 推流页（原生 JS，不参与 Vite 构建）的根目录。空 = 由 web_dir 推导：
+  // web/dist → web（dist 的父目录），web → web。干净 clone 与构建后行为一致。
+  std::string stream_dir;
   std::string cued_bin = "./build/cued";
   std::string runs_dir = "./runs";
   std::string approval = "ask";  // ask | auto | deny

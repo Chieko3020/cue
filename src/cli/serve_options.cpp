@@ -42,7 +42,7 @@ bool parse_double(std::string_view s, double& out, double lo, double hi) {
 
 std::expected<void, config::Error> apply_serve_config(const config::Doc& doc, ServeOptions& o) {
   static constexpr std::string_view kKnown[] = {
-      "bind",     "port",        "web_dir",    "cued_bin", "runs_dir", "approval",
+      "bind",     "port",        "web_dir",    "stream_dir", "cued_bin", "runs_dir", "approval",
       "ws_port",  "probe_port",  "approval_timeout_s", "no_pipeline", "bitrate_kbps",
       "gop",      "preset",      "transcode",  "inject_drop"};
   if (auto ok = doc.reject_unknown_keys("serve", kKnown); !ok) {
@@ -70,6 +70,18 @@ std::expected<void, config::Error> apply_serve_config(const config::Doc& doc, Se
       }
     }
     o.web_dir = *v;
+  }
+  if (doc.contains("serve.stream_dir")) {
+    auto v = doc.get_string("serve.stream_dir");
+    if (!v) return std::unexpected(v.error());
+    if (!v->empty()) {
+      std::error_code ec;
+      if (!std::filesystem::is_directory(*v, ec)) {
+        return std::unexpected(
+            doc.error("serve.stream_dir", "serve.stream_dir 指向的目录不存在：" + *v));
+      }
+    }
+    o.stream_dir = *v;
   }
   if (doc.contains("serve.cued_bin")) {
     auto v = doc.get_existing_file("serve.cued_bin");
@@ -164,6 +176,7 @@ void print_serve_usage() {
       "  --bind ADDR            监听地址（默认 127.0.0.1，仅回环）\n"
       "  --port N               监听端口（默认 8080）\n"
       "  --web DIR              静态目录（默认自动：web/dist 存在则用它，否则 web/）\n"
+      "  --stream-dir DIR       推流页根（默认由 --web 推导：dist 的父目录；/stream 走它）\n"
       "  --cued BIN             cued 可执行文件（默认 ./build/cued）\n"
       "  --runs DIR             评测产物目录（默认 ./runs）\n"
       "  --approval MODE        ask（默认，审批 UI 决定）/ auto（自动批准）/ deny（拒绝非只读）\n"
@@ -225,6 +238,9 @@ std::expected<ServeOptions, config::Error> parse_serve_options(int argc, char** 
     } else if (name == "--web") {
       if (!take_value(argc, argv, i, v)) return std::unexpected(cli_error("--web 缺少取值"));
       o.web_dir = v;
+    } else if (name == "--stream-dir") {
+      if (!take_value(argc, argv, i, v)) return std::unexpected(cli_error("--stream-dir 缺少取值"));
+      o.stream_dir = v;
     } else if (name == "--cued") {
       if (!take_value(argc, argv, i, v)) return std::unexpected(cli_error("--cued 缺少取值"));
       o.cued_bin = v;

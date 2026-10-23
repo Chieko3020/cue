@@ -130,6 +130,20 @@ class ConsoleApp {
 
   int port() const { return opt_.port; }
   const std::string& bind_addr() const { return opt_.bind; }
+  // 推流页（web/index.html + web/app.js）是**原生 JS、不参与 Vite 构建**，
+  // 所以它永远不在 web/dist 里。而 web_dir() 在 dist 存在时只指向 dist ——
+  // 结果就是"构建过控制台的人再也打不开推流页"，干净 clone 与构建后行为相反。
+  // 这里给它一个独立的根，并允许 --stream-dir 覆盖。
+  std::string stream_dir() const {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!opt_.stream_dir.empty()) return opt_.stream_dir;
+    // 默认取 web_dir 的父目录：web/dist → web；web → web（干净 clone 时两者同根）
+    const fs::path w(web_dir());
+    if (w.filename() == "dist") return w.parent_path().string();
+    return w.string();
+  }
+
   std::string web_dir() const {
     namespace fs = std::filesystem;
     if (!opt_.web_dir.empty()) return opt_.web_dir;
@@ -998,9 +1012,10 @@ class Server {
       return json_res({{"ok", false}, {"error", "bad path"}}, req, http::status::bad_request);
     }
     const std::string web = app_.web_dir();
-    auto open_file = [&](const std::string& rel) -> std::optional<std::string> {
+    const std::string stream = app_.stream_dir();
+    auto read_at = [](const std::string& root, const std::string& rel) -> std::optional<std::string> {
       std::error_code ec;
-      const fs::path p = fs::path(web) / rel;
+      const fs::path p = fs::path(root) / rel;
       if (!fs::is_regular_file(p, ec)) return std::nullopt;
       std::ifstream in(p, std::ios::binary);
       if (!in) return std::nullopt;
@@ -1008,6 +1023,20 @@ class Server {
       buf << in.rdbuf();
       return buf.str();
     };
+    // 先控制台根，再推流页根：`/app.js` 这类资源不在 dist 里，但从 web/ 取得到。
+    auto open_file = [&](const std::string& rel) -> std::optional<std::string> {
+      if (auto body = read_at(web, rel)) return body;
+      if (stream != web) return read_at(stream, rel);
+      return std::nullopt;
+    };
+
+    // 推流页入口：/stream 与 /stream/ 都返回 web 根的 index.html。
+    // 页面里的 `./app.js` 在 URL 为 /stream（无尾斜杠）时解析成 /app.js，正好落到上面的回退逻辑。
+    if (target == "/stream" || target == "/stream/") {
+      if (auto body = read_at(stream, "index.html")) {
+        return make_res(http::status::ok, std::move(*body), req, "text/html; charset=utf-8");
+      }
+    }
 
     std::string rel = target == "/" ? "index.html" : target.substr(1);
     if (!rel.empty() && rel.back() == '/') rel += "index.html";
@@ -1018,7 +1047,8 @@ class Server {
         return make_res(http::status::ok, std::move(*body), req, "text/html; charset=utf-8");
       }
     }
-    std::string msg = "404 " + target + " 不存在（静态目录：" + web + "，执行 cd web/console && npm run build 生成 web/dist）\n";
+    std::string msg = "404 " + target + " 不存在（控制台：" + web + "，推流页：" + stream +
+                      "；控制台需要 cd web/console && npm run build 生成 web/dist）\n";
     return make_res(http::status::not_found, msg, req, "text/plain; charset=utf-8");
   }
 

@@ -152,7 +152,7 @@ ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0 \
 | `cued` | 媒体管线进程（WS 进、UDP 出） | 起管线 |
 | `cue-probe` | 下行接收端：重组、NACK、FEC、帧率与端到端分位 | 起管线 |
 | `cue-capture` | 原生采集端：`lavfi` / `ffmpeg`（dshow·avfoundation）/ V4L2 三后端，上行 WS 协议与浏览器同一套 | 起管线（`demo-min` 的默认采集源） |
-| `cue-serve` | 控制台后端：HTTP + SSE + 静态托管 + 审批队列 | 起控制台 |
+| `cue-serve` | 控制台后端：HTTP + SSE + 静态托管 + 审批队列。**`/` 是控制台（五页），`/stream` 是推流页（原生 JS，不参与构建）** | 起控制台 |
 | `cue-mock-svc` | 确定性假域服务，实现同一套 REST 控制协议 | 起假域 |
 
 停全部进程用 `./scripts/stop.sh`：按**精确进程名**（不是 `pkill -f 路径`，那会把自己也杀掉——这个坑踩过两次）依次 SIGTERM → 宽限 5 s → SIGKILL，并清理被 SIGKILL 的进程留下的 `/tmp/cue/<pid>/` 控制 socket 目录。
@@ -264,6 +264,7 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 - **sanitizer 不在常驻 CI 里**：见顶部说明。`ASan/UBSan/TSan 无报告` 这条由本地验证 + 手动 workflow 承担，不是每次 push 的证据。
 - **推流页不发送 `codec_config`（0x03）**：`cued` 侧有接收与缓存实现，浏览器侧没发，`fetch_observation(frames)` 的媒体元信息段因此为空。
 - **控制台前端产物（`web/dist`）不入库**：干净 clone 首次 `serve.sh` 需要联网装前端依赖；CI 里同样要现场 `npm ci`，无网时 e2e 走显式跳过（有 `===== 跳过原因 =====` 横幅与 `ci-skipped.txt`，AC-13 由独立的静态检查 job 兜底）。
+- **推流页不依赖前端构建**：它是 `web/index.html` + `web/app.js` 的原生实现，`cue-serve` 现在同时托管两个根（控制台 `web/dist`、推流页 `web/`），`/stream` 走后者。此前 dist 存在时推流页会 404——干净 clone（无 dist）反而能打开，行为与直觉相反。
 - **集成测试只在 `CUE_SANITIZE=none` 下注册**：它起真进程，而 sanitizer 构建的 `LD_PRELOAD` 会传给子进程，2 vCPU 上不稳定，且它测的不是内存安全；ASan/TSan 仍跑全部单测。
 - **能力协商的端到端未测**：夹取逻辑（配置超过设备上限时夹分辨率/码率）有单测覆盖，但"真客户端发 `0x05` 上报能力 → 服务端按能力下发档位"这条链路没跑过——`cue-capture` 不发 `0x05`，只有浏览器发，而服务器无浏览器。实测两路设备时 `caps_declared` 都是 `false`，走的是"无上报按配置下发"的分支。
 - **`cue-serve` 不转发 `--max-sessions` / `--lease-ms`**：这两个参数只能直接给 `cued`（控制台走 `ProcessPipelineControl` 的 spawn 参数，目前没暴露）。想让控制台配并发与租约，需要给 `ServeOptions` + `PipelineEndpoint` + spawn args 各加一处。
