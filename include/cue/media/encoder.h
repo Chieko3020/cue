@@ -62,6 +62,11 @@ class X264Encoder {
             std::string& err, int threads = 1, int level_idc = 0);
   void close();
   bool is_open() const;
+  // 让**下一帧**编码成 IDR。接收端丢帧后参考链就断了，它只能等下一个 IDR 才恢复；
+  // 与其等满一个 GOP（默认 1 秒），不如由它主动请求、这里立刻插一个关键帧。
+  // 用"置位等下一帧"而不是立刻编码：编码必须在编码线程里做，而且中间帧不能跳过
+  // （跳过会让时间戳与帧序错位）。
+  void force_keyframe() { force_keyframe_ = true; }
 
   // encode_ns：非空时写回「拷入 + x264_encoder_encode」的耗时（微秒），供六段埋点把
   // encode 从 op 里拆出来；失败/无输出时也会写回已发生的耗时（0 表示未进入编码）。
@@ -73,6 +78,8 @@ class X264Encoder {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  // 下一次 encode 是否强制 IDR（见 force_keyframe）
+  bool force_keyframe_ = false;
 };
 
 class TranscodeChain {

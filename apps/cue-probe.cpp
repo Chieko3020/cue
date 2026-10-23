@@ -1014,6 +1014,11 @@ int main(int argc, char** argv) {
   // 不加就只剩"画面偶尔冻一下"这种主观描述。
   // 参考链断裂次数。**只计数不修**，理由见 note_refchain_break 的注释。
   uint64_t refchain_breaks = 0;
+  // 主动请求关键帧的次数与被冷却挡下的次数。没有这两个数，
+  // "请求到底发没发出去、是不是被自己的限流吃掉了"就只能猜。
+  uint64_t kf_req_sent = 0;
+  uint64_t kf_req_suppressed = 0;
+  bool kf_needed = false;  // 参考链断了、还没发出请求（主循环消费）
   uint64_t rejected = 0, lat_invalid = 0, stats_reqs = 0, fb_sent = 0;
   // 下行音频数据报计数。当前结构上恒为 0：cued 的下行只有 Video / Fec / StatsReq /
   // Feedback 四种，DownType::Audio 在 cued 里没有任何发送方（2026-10 的代码里
@@ -1318,6 +1323,10 @@ int main(int argc, char** argv) {
     // （同一条理由也让我们去掉了渲染的 vsync）。真要在接收端修，正确位置是
     // 能主动请求 IDR —— 对应 RTP 的 PLI/FIR，现在下行协议里还没有这个类型。
     ++refchain_breaks;
+    // 断了就该主动要一个 IDR：否则只能等发送端的 GOP 到期（默认 1 秒），这段时间
+    // 画面持续错参考。这里只置位，真正发送放在主循环（那里才有 now 与发送助手，
+    // 也只有一处限流状态）——顺序依赖靠"置位 + 轮询"解掉，比前向声明干净。
+    kf_needed = true;
     emit("probe.refchain_break",
          json{{"reason", "jitter_skip"},
               {"missing_delta", delta},
@@ -1405,6 +1414,33 @@ int main(int argc, char** argv) {
                     reinterpret_cast<const sockaddr*>(&peer),
                     sizeof(peer)) == static_cast<ssize_t>(pkt.size());
   };
+  // 请求一个关键帧（对应 RTCP 的 PLI）。
+  //
+  // 触发者只有丢帧：H.264 的 P/B 帧依赖前一帧，抖动缓冲跳过一帧之后参考链就断了，
+  // 而解码器**看不出**这件事（它只收到一串连续的 Annex-B 字节，没有缺口标记）——
+  // 所以"要不要请求"必须由这一层判断，这也正是它放在 probe 而不是解码器里的原因。
+  //
+  // 冷却 300 ms：丢包常常成串，每跳一帧就发一次只会把 cued 的上游请求刷满。
+  // 300 ms 比 cued→采集端那个 500 ms 冷却短一档，让"连续两次独立故障"仍然能各要一次。
+  int64_t last_kf_req_us = 0;
+  auto request_keyframe = [&](int64_t now, const char* reason) {
+    if (!have_peer) return;
+    if (kf_req_sent > 0 && now - last_kf_req_us < 300'000) {
+      ++kf_req_suppressed;
+      return;
+    }
+    last_kf_req_us = now;
+    cue::proto::DatagramHeader h;
+    h.type = static_cast<uint8_t>(cue::proto::DownType::KeyframeReq);
+    h.session_id = session_seen;
+    // 空载荷：只表达"我需要一个能重新起步的点"，怎么给由发送端决定
+    const auto hdr = cue::proto::encode(h);
+    std::vector<uint8_t> pkt(hdr.begin(), hdr.end());
+    if (send_udp(pkt)) {
+      ++kf_req_sent;
+      emit("probe.keyframe_request", json{{"reason", reason}, {"total", kf_req_sent}});
+    }
+  };
   auto send_stats_request = [&](int64_t now) {
     if (!have_peer) return;
     cue::proto::DatagramHeader h;
@@ -1481,6 +1517,13 @@ int main(int argc, char** argv) {
     // 抖动缓冲的到期帧先放行：后面的周期任务（清理/窗口/指标行）这一拍就该看到它们，
     // 否则 buffer_us 的采样与 jb_depth 会慢一拍。
     drain_jb(now_tick);
+    // 关键帧请求必须在**每轮**都检查。一开始它被放在下面那个 stats 批量分支里，
+    // 而那一支的间隔会退化到 30 秒——实测 52 次参考链断裂只发出了 1 次请求。
+    // 限流由 request_keyframe 自己的 300 ms 冷却负责，这里不需要额外节拍。
+    if (kf_needed) {
+      kf_needed = false;
+      request_keyframe(now_tick, "jitter_skip");
+    }
     if (now_tick >= next_stats_us) {
       if (stats_burst_left == kStatsBurst) clk.begin_batch();  // 批首：批内取 RTT 最小者
       send_stats_request(now_tick);
@@ -1671,6 +1714,8 @@ int main(int argc, char** argv) {
           {"waiting_idr", dec.dec.waiting_keyframe()},
           // 因抖动缓冲跳帧而 flush 解码器的次数（参考链断开的处置次数）
           {"refchain_breaks", refchain_breaks},
+          {"kf_req_sent", kf_req_sent},
+          {"kf_req_suppressed", kf_req_suppressed},
           {"bad_frame_events", bad_frame_events},
           {"report_sent", reporters.sent()},
           {"report_drops", reporters.dropped()},

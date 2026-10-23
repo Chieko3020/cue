@@ -28,7 +28,19 @@ inline constexpr uint32_t kMaxFragPerFrame = 1024;
 
 enum class MediaType : uint8_t { Video = 0x01, Audio = 0x02, CodecConfig = 0x03, KeyframeReq = 0x04, Stats = 0x05 };
 enum class Codec : uint8_t { H264 = 0x01, VP8 = 0x02, Opus = 0x03 };
-enum class DownType : uint8_t { Video = 0x01, Audio = 0x02, Fec = 0x03, Nack = 0x04, StatsReq = 0x05, Feedback = 0x06 };
+enum class DownType : uint8_t {
+  Video = 0x01,
+  Audio = 0x02,
+  Fec = 0x03,
+  Nack = 0x04,
+  StatsReq = 0x05,
+  Feedback = 0x06,
+  // 接收端请求一个关键帧（对应 RTP/RTCP 的 PLI）。丢包打断 H.264 参考链之后，
+  // 接收端除了"等下一个 IDR"之外没有任何恢复手段，而 IDR 间隔由发送端的 GOP 决定
+  // （默认 30 帧 = 1 秒）。有了这条请求，恢复时间从"最坏一个 GOP"变成"一个 RTT"。
+  // 载荷为空：接收端只表达"我需要一个能重新起步的点"，具体怎么做由发送端决定。
+  KeyframeReq = 0x07,
+};
 
 // 上行 flags
 inline constexpr uint8_t kUpFlagKeyframe = 0x01;

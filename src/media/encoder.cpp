@@ -173,6 +173,15 @@ std::expected<EncodedResult, EncodeError> X264Encoder::encode(const AVFrame* fra
     }
   }
   im.pic_in.i_pts = im.frame_count++;
+  // 强制 IDR：接收端丢帧后主动请求（见 X264Encoder::force_keyframe）。
+  // 必须显式清掉 i_type，否则下一帧会继续被标成 keyframe —— x264 只在
+  // 调用方把 i_type 改回 X264_TYPE_AUTO 后才恢复按 GOP/scenecut 自动决定。
+  if (force_keyframe_) {
+    im.pic_in.i_type = X264_TYPE_KEYFRAME;
+    force_keyframe_ = false;
+  } else {
+    im.pic_in.i_type = X264_TYPE_AUTO;
+  }
 
   x264_nal_t* nals = nullptr;
   int i_nals = 0;

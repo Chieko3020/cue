@@ -596,6 +596,13 @@ class ChildProcess {
 
 // 上行 WS 客户端。与浏览器使用同一套握手、同一个 ping/pong 时钟同步（§7.1）与
 // 同一套二进制分片——cued 侧没有任何"这是浏览器还是原生端"的分支。
+// 下行关键帧请求：cued 收到 probe 的请求后，会通过同一条 WS 发一个上游
+// KeyframeReq(0x04) 回来。采集端平时只写不读，所以这个请求必须靠 ws.poll_control()
+// 主动取；取到之后置位，由编码循环在**下一帧**插一个 IDR。
+// 用全局标志而不是穿参数：采集端是单实例 CLI，多传一个指针要改三处签名，
+// 而这个标志只被「发送线程置位 / 编码线程消费」两个地方碰到。
+std::atomic<bool> g_want_idr{false};
+
 class WsSender {
  public:
   explicit WsSender(std::string url) : url_(std::move(url)) {}
@@ -634,6 +641,34 @@ class WsSender {
     connected_.store(true, std::memory_order_relaxed);
     sync_clock();
     return true;
+  }
+
+  // 非阻塞地取一个已经到达的控制消息。
+  //
+  // 为什么要 available() 先探测：采集端的发送线程持着 mu_ 写帧，如果这里直接
+  // ws_->read()，socket 上没有数据时会把锁连同发送一起阻塞住（帧就掉节奏了）。
+  // 先问「有没有至少一个上行头那么长」可读，有才进去读，并用 50 ms 超时兜底，
+  // 防止只到了一半的头把线程钉死。
+  //
+  // 目前只认一种控制消息：上游 KeyframeReq(0x04)。读完必须把流恢复成二进制模式，
+  // 否则接下来的 send_binary 会撞上「上一条消息没读完」的错误。
+  void poll_control() {
+    if (!connected_.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!ws_) return;
+    beast::error_code ec;
+    const std::size_t avail = ws_->next_layer().socket().available(ec);
+    if (ec || avail < cue::proto::kMediaHeaderSize) return;
+    ws_->next_layer().expires_after(std::chrono::milliseconds(50));
+    beast::flat_buffer buf;
+    ws_->read(buf, ec);
+    ws_->binary(true);  // 恢复成二进制模式，供发送帧使用
+    if (ec) return;
+    const auto* raw = static_cast<const uint8_t*>(buf.data().data());
+    if (buf.data().size() < cue::proto::kMediaHeaderSize) return;
+    if (raw[0] != cue::proto::kMagicUp) return;
+    if (raw[1] != static_cast<uint8_t>(cue::proto::MediaType::KeyframeReq)) return;
+    g_want_idr.store(true, std::memory_order_relaxed);
   }
 
   bool send_binary(std::span<const uint8_t> data, std::string& err) {
@@ -1025,6 +1060,9 @@ void sender_loop(FrameQueue& q, WsSender& ws, Stats& st, uint32_t stream_id,
                  std::string& err_out) {
   EncodedFrame f;
   while (q.pop(f)) {
+    // 每帧之前顺手取一次控制消息（非阻塞，见 WsSender::poll_control）：
+    // 30 帧/秒的节奏下对关键帧请求的响应延迟不超过一帧。
+    ws.poll_control();
     if (f.data.empty()) continue;
     if (!cue::proto::upstream_frame_fits(f.data.size())) {
       // 超过 1024 分片上限的帧对端会拒（wire.h 的 FragCountTooLarge）：发送端先丢并计数，
@@ -1418,6 +1456,8 @@ int capture_inproc(ChildProcess& video_src, X264Encoder& enc, const Options& o,
     const int64_t pts = sink.frame_pts();
     int64_t enc_us = 0;
     std::string err;
+    // 接收端请求了关键帧：在**这一帧**插 IDR（见 g_want_idr 的注释）。
+    if (g_want_idr.exchange(false, std::memory_order_relaxed)) enc.force_keyframe();
     auto out = enc.encode(frame, pts, err, &enc_us);
     if (!out) {
       if (out.error() == cue::media::EncodeError::EncoderDelay) continue;
@@ -1502,6 +1542,8 @@ int capture_v4l2(V4l2Source& src, X264Encoder& enc, const Options& o, FrameSink&
     window.mark_started();
     const int64_t pts = sink.frame_pts();
     int64_t enc_us = 0;
+    // 接收端请求了关键帧：在**这一帧**插 IDR（见 g_want_idr 的注释）。
+    if (g_want_idr.exchange(false, std::memory_order_relaxed)) enc.force_keyframe();
     auto out = enc.encode(frame, pts, err, &enc_us);
     if (!out) {
       if (out.error() == cue::media::EncodeError::EncoderDelay) continue;

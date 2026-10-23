@@ -664,6 +664,10 @@ struct SharedRings {
 struct CuedSessionShared final : cue::pipeline::SessionPayload {
   RetransmitCache xmit;
   FeedbackStats fb;
+  // 下行关键帧请求的到达计数（NACK 线程 +1，会话线程消费）。
+  // 用计数而不是 bool：会话线程按"值变了"判断，就不会漏掉在它处理期间连发的请求，
+  // 也不需要原子地清零（fetch_add 比 compare_exchange 少一类 ABA 型 bug）。
+  std::atomic<uint64_t> keyframe_reqs{0};
 };
 
 // 一个会话的每秒读数（会话线程算、报告线程读；键名与 METRICS 行一致）。
@@ -1605,6 +1609,9 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   // 下行音频包的独立帧号（与视频的 frame_id 分开）：probe 侧按会话号 + 帧号判丢包，
   // 音频恒单分片，所以这个号就是"第几个音频包"，缺口即丢失。
   uint32_t audio_frame_seq = 0;
+  // 下行转发上来的关键帧请求：按"计数变了"消费，冷却复用上游那套 500 ms 窗口。
+  uint64_t kf_reqs_seen = 0;
+  int64_t last_down_kf_us = 0;
 
   for (;;) {
     beast::flat_buffer buf;
@@ -1614,6 +1621,47 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
     // 放在注入判定之前：--inject-ingress-drop 是**软丢包**注入，客户端其实还活着，
     // 不该因此被判死（半开连接的特征是"一个字节都收不到"）。
     registry.touch(session_id, cue::now_us());
+
+    // ---- 接收端请求关键帧（probe 丢了帧 ⇒ H.264 参考链已断）----
+    //
+    // 为什么必须走到编码侧：cued 是转发器，没有编码控制权。它唯一能做的正确的事
+    // 是把请求透传给采集端，由后者在下一帧插一个 IDR（见 cue-capture 的
+    // WsSender::poll_control + X264Encoder::force_keyframe）。这样恢复时间从
+    // "最坏一个 GOP"（默认 1 秒）降到"一个往返"（本机 <1 ms）。
+    //
+    // 参数集不需要单独补发：repeat-headers 现在是编码侧的契约，每个 IDR 都自带
+    // SPS/PPS，而 probe 自己也会缓存见过的那一组并在需要时前置重喂
+    // （cue-probe.cpp 的 dec.params / params_ready）。所以一次强制 IDR 同时解决
+    // "参考链断了"和"参数集缺了"两件事。
+    {
+      const uint64_t want = shared->keyframe_reqs.load(std::memory_order_relaxed);
+      if (want != kf_reqs_seen) {
+        kf_reqs_seen = want;
+        const int64_t now_kf = cue::now_us();
+        if (now_kf - last_down_kf_us >= kKeyframeReqCooldownUs) {
+          last_down_kf_us = now_kf;
+          cue::proto::MediaHeader kh;
+          kh.type = static_cast<uint8_t>(cue::proto::MediaType::KeyframeReq);
+          kh.stream_id = upstream_stream_id;
+          kh.frame_id = 0;
+          kh.payload_len = 0;
+          const auto kb = cue::proto::encode(kh);
+          beast::error_code kec;
+          ws.binary(true);
+          ws.write(net::buffer(kb.data(), kb.size()), kec);
+          if (kec) {
+            // 写失败说明 WS 已经坏了：交给下一轮的 read 去判定退出，
+            // 这里不额外记错误（否则同一条断开会被记两遍）。
+            emit_event("keyframe.upstream_write_failed", json{{"error", kec.message()}});
+          } else {
+            emit_event("keyframe.forwarded_upstream",
+                       json{{"stream_id", upstream_stream_id},
+                            {"requests_total", want},
+                            {"cooldown_ms", kKeyframeReqCooldownUs / 1000}});
+          }
+        }
+      }
+    }
 
     // 周期任务必须与「帧是否完成」解耦：丢尾片的帧走不到完成路径，若把清理挂在
     // 完成之后，pending 只增不减、2 s 阈值形同虚设（review #5）。这里每包都检查，
@@ -2516,6 +2564,15 @@ int main(int argc, char** argv) {
                           {"bitrate_kbps", snap.params.bitrate_kbps},
                           {"aimd", snap.params.aimd ? "on" : "off"}});
         }
+        continue;
+      }
+      if (nh->type == static_cast<uint8_t>(cue::proto::DownType::KeyframeReq)) {
+        // 接收端丢帧后主动要关键帧（对应 RTCP 的 PLI）。这里只登记意图，
+        // 真正的两件事（向上游要 IDR、把缓存的参数集重发下去）由会话线程做——
+        // 因为上游 WS 和下行参数集都在会话线程手里，跨线程直接动会打架。
+        // 冷却放在会话线程：它是唯一知道"上一次请求什么时候发出去"的地方。
+        auto shared = std::static_pointer_cast<CuedSessionShared>(registry.payload(sid));
+        if (shared) shared->keyframe_reqs.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
       if (nh->type == static_cast<uint8_t>(cue::proto::DownType::StatsReq)) {
