@@ -766,7 +766,11 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
          {"jb_switches", jb.switches},
          {"jb_target_frames", jb.target_frames},
          {"jb_skipped", jb.skipped},
-         {"jb_late", jb.late_dropped}};
+         {"jb_late", jb.late_dropped},
+         // 抖动估计的**原始值**（以帧间隔为单位）。probe 侧早就有这一项，cued 侧一直缺——
+         // 而"抖动估计的基准点该用首片还是组装完成"这种问题正是靠它才能量化：
+         // 只看离散的 jb_level 分不清 0.4 帧与 1.4 帧，那正好是升档门限的两侧。
+         {"jb_jitter_frames", jb.jitter_frames}};
   for (int i = 0; i < 6; ++i) {
     if (rings[i].size() == 0) {
       m[kStageNames[i]] = nullptr;
@@ -2027,6 +2031,11 @@ int main(int argc, char** argv) {
   long long jitter_max_frames = 8;     // 队列容量硬上限（帧）
   long long jitter_budget_ms = 40;     // 缺帧等待预算
   long long jitter_target_frames = 1;  // 固定目标深度（帧）；1 = 不驻留，只靠空洞预算纠乱序
+  // 抖动估计的基准点（与 probe 的 --jitter-basis 同名同义）：
+  //   first = 首片到达时刻（默认）：反映**网络**抖动
+  //   done  = 帧组装完成时刻：混入「整帧在途耗时 ≈ 帧字节数/带宽」，大 IDR 会周期性抬升它
+  // 这个开关是为了能 A/B 量化后者对档位的影响，默认值与 probe 保持一致。
+  std::string jitter_basis = "first";
   // 迟到帧预算（毫秒）：帧相对"最小延迟基线"晚到超过这个值就丢弃，见 process_frame 开头。
   // 0 = 关闭。300 ms 的取法：够编码器换档时的短暂抖动，又远小于"追赶积压"造成的秒级延迟。
   long long max_ingress_lag_ms = 300;
@@ -2127,6 +2136,9 @@ int main(int argc, char** argv) {
       jitter_budget_ms = want_int(0, 2000);
     } else if (a == "--jitter-target-frames") {
       jitter_target_frames = want_int(1, 16);
+    } else if (a == "--jitter-basis") {
+      jitter_basis = next();
+      if (jitter_basis != "first" && jitter_basis != "done") bad(jitter_basis);
     } else if (a == "--max-ingress-lag-ms") {
       max_ingress_lag_ms = want_int(0, 10000);
     } else if (a == "--fec") {
@@ -2149,7 +2161,7 @@ int main(int argc, char** argv) {
           "     [--inject-seed N] [--inject-trace FILE] [--fec on|off]\n"
           "     [--fec-group 1..64] [--aimd on|off]\n"
           "     [--jitter on|off] [--jitter-target-frames 2] [--jitter-max-frames 8]\n"
-          "     [--jitter-budget-ms 40] [--max-ingress-lag-ms 300]\n"
+          "     [--jitter-budget-ms 40] [--jitter-basis first|done] [--max-ingress-lag-ms 300]\n"
           "     [--max-sessions 1..8] [--lease-ms 200..600000]\n"
           "  多设备：第 i 路（槽位 i）的下行发往 --probe-port+i，每路要有一个 cue-probe 在听；\n"
           "  并发上限按 2 vCPU 实测回填（README 已知限制），超了直接拒绝连接。\n"
@@ -2176,6 +2188,8 @@ int main(int argc, char** argv) {
   jb_cfg.max_frames = static_cast<std::size_t>(jitter_max_frames);
   jb_cfg.target_frames = static_cast<std::size_t>(jitter_target_frames);
   jb_cfg.budget_us = jitter_budget_ms * 1000;
+  jb_cfg.basis = (jitter_basis == "done") ? cue::media::JitterBasis::AssemblyDone
+                                          : cue::media::JitterBasis::FirstFragment;
   // 帧间隔由 PTS 增量的 EWMA 自估（浏览器/转码的帧率不一定是 --fps），这里只给起点。
   jb_cfg.nominal_interval_us = 1'000'000 / std::max<int>(out_fps, 1);
 
