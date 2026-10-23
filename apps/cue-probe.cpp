@@ -854,6 +854,9 @@ int main(int argc, char** argv) {
   std::string audio_out;
   // 周期性截图（0 = 关）：把渲染结果存成 BMP，供远程检查画面质量。
   long long snap_ms = 0;
+  // 视频呈现延迟（毫秒）。负数 = 自动跟随音频播放队列深度（两者相等才音画同步）。
+  // 0 = 不延迟（旧行为）。
+  long long av_delay_ms = 0;
   std::string snap_prefix;
   bool list_audio = false;
   long long jitter_max_level = 2;
@@ -907,6 +910,9 @@ int main(int argc, char** argv) {
       if (!parse_int(val, 0, 2000, jitter_budget_ms)) bad(a, val);
     } else if (a == "--audio-out") {
       audio_out = std::string(next());
+    } else if (a == "--av-delay-ms") {
+      const auto val = next();
+      if (!parse_int(val, -1, 5000, av_delay_ms)) bad(a, val);
     } else if (a == "--snap-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 600000, snap_ms)) bad(a, val);
@@ -963,7 +969,8 @@ int main(int argc, char** argv) {
           "          [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..4] [--jitter-target-frames 0..16]\n"
-          "          [--audio-out NAME] [--list-audio] [--snap-ms N --snap-prefix PATH]\n"
+          "          [--audio-out NAME] [--av-delay-ms N] [--list-audio]\n"
+          "          [--snap-ms N --snap-prefix PATH]\n"
           "          [--report-addrs host:port[,host:port]]\n"
           "  --nack-interval-ms 只决定「多长时间尝试一次」；实际发送上限是 8 包/秒\n"
           "  （SPEC §7.2），间隔 <125 ms 会被夹到该上限。冷却/单包探测不需要额外开关。\n"
@@ -1336,6 +1343,89 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---------------------------------------------------------------- 呈现延迟队列
+  //
+  // 音画同步：音频为了吸收"成簇到达"把播放队列垫到 400~600 ms，而视频原来解码完就
+  // 立刻上屏（端到端只有 ~250 ms）⇒ 音频比视频晚 200~300 ms，听起来就是不同步。
+  // 同步的正确方向不是砍音频缓冲（那会退回周期性咔咔），而是**给视频加同等延迟**。
+  //
+  // 为什么要克隆：decode() 返回的是借用指针，只在下次 decode 之前有效（见下面的注释），
+  // 所以想延后画就必须自己持有一份引用。av_frame_clone 只增引用计数，不拷贝像素。
+  struct Deferred { int64_t due_us; AVFrame* frame; };
+  std::deque<Deferred> defer_q;
+  double av_audio_ewma_ms = 0.0;   // 音频播放队列深度的 EWMA（毫秒）
+  double av_video_ewma_ms = 0.0;   // 视频端到端延迟的 EWMA（毫秒）
+  bool av_have_video_lat = false;  // 是否已经测到过视频延迟（需要时钟同步）
+
+  auto take_av_delay_us = [&](int64_t now) -> int64_t {
+    if (av_delay_ms > 0) return av_delay_ms * 1000;
+    if (av_delay_ms == 0) return 0;
+    // 自动模式：让**两端的总延迟相等**，而不是让"额外延迟"相等。
+    //
+    // 视频这边已经自带一段流水线延迟（采集+编码+传输+抖动缓冲，实测端到端约 250 ms），
+    // 音频那边毛延迟就等于播放队列深度（实测 400~600 ms）。所以视频还需要补的是
+    //     音频队列深度 − 视频已有延迟
+    // 而不是直接等于音频队列深度——后者会把视频推到音频**后面**同样的量。
+    // 用户的实际观测印证了这点：在 bilibili 里点暂停，画面先停、音频晚约 0.3 秒才停。
+    //
+    // 两个量都用 EWMA：瞬时值随每个包的进出跳动，会让视频延迟跟着抖，
+    // 反而制造出新的、不断变化的唇音偏移。
+    const int q = render_live ? renderer.queued_ms() : -1;
+    if (q >= 0) av_audio_ewma_ms = av_audio_ewma_ms * 0.9 + double(q) * 0.1;
+    double video_lat_ms = 0.0;
+    if (lat.size() > 0) {
+      video_lat_ms = double(lat.percentile(0.50)) / 1000.0;
+      av_video_ewma_ms = av_video_ewma_ms * 0.9 + video_lat_ms * 0.1;
+      av_have_video_lat = true;
+    }
+    (void)now;
+    // 还没测出视频延迟（时钟未同步）时退化为"跟随音频队列"，至少方向是对的；
+    // 一旦有了实测延迟就改用差值——两者相差正好一个流水线延迟。
+    const double extra = av_have_video_lat ? (av_audio_ewma_ms - av_video_ewma_ms)
+                                           : av_audio_ewma_ms;
+    return static_cast<int64_t>((extra > 0.0 ? extra : 0.0) * 1000.0);
+  };
+
+  auto defer_or_draw = [&](AVFrame* out) {
+    const int64_t now = cue::now_us();
+    const int64_t delay_us = take_av_delay_us(now);
+    if (delay_us <= 0) {
+      renderer.draw_yuv(out);
+      return;
+    }
+    AVFrame* clone = av_frame_clone(out);
+    if (clone == nullptr) {  // 克隆失败就退化成立即上屏，绝不丢这一帧
+      renderer.draw_yuv(out);
+      return;
+    }
+    defer_q.push_back(Deferred{now + delay_us, clone});
+    // 上限：延迟越大堆得越多，但必须有界。按 30 fps 留 2 倍余量即可。
+    const std::size_t cap = static_cast<std::size_t>(delay_us / 33'333) * 2 + 8;
+    while (defer_q.size() > cap) {
+      av_frame_free(&defer_q.front().frame);
+      defer_q.pop_front();
+    }
+  };
+
+  // 每轮把到期的帧画出来。只画最后一帧到期的：中间那些已经过期，
+  // 画出来只会变成"连着闪几下"，与"画面在某个时刻的样子"不符。
+  auto drain_defer = [&](int64_t now) {
+    if (defer_q.empty()) return;
+    std::size_t drawn = 0;
+    while (!defer_q.empty() && defer_q.front().due_us <= now) {
+      AVFrame* f = defer_q.front().frame;
+      defer_q.pop_front();
+      if (!defer_q.empty() && defer_q.front().due_us <= now) {
+        av_frame_free(&f);  // 已过期且后面还有更新的，直接丢
+        continue;
+      }
+      renderer.draw_yuv(f);
+      av_frame_free(&f);
+      ++drawn;
+    }
+    (void)drawn;
+  };
+
   // 一帧解码：补参数集 → 喂解码器 → 记耗时与失败计数。
   // 只借用 FrameAcc 的三个元信息（pts / codec / frag_count），不拷整帧分片：
   // 每帧都拷一遍分片向量，在 720p 关键帧上就是每帧几百 KB 的无谓分配。
@@ -1398,7 +1488,7 @@ int main(int argc, char** argv) {
       // 借用指针只在下次 decode 之前有效，所以这里必须立刻上屏（不能存起来延后画）；
       // 用 render_live 而不是 render_enabled：没打开时 draw_yuv 本来就是空操作，
       // 分开只是为了读代码的人不必去翻实现确认这一条。
-      if (render_live) renderer.draw_yuv(out);
+      if (render_live) defer_or_draw(out);
     } else if (!derr.empty()) {
       ++fs.decode_errors;
       ++dec.fail_streak;
@@ -1698,6 +1788,7 @@ int main(int argc, char** argv) {
     // 抖动缓冲的到期帧先放行：后面的周期任务（清理/窗口/指标行）这一拍就该看到它们，
     // 否则 buffer_us 的采样与 jb_depth 会慢一拍。
     drain_jb(now_tick);
+    drain_defer(now_tick);
     // 关键帧请求必须在**每轮**都检查。一开始它被放在下面那个 stats 批量分支里，
     // 而那一支的间隔会退化到 30 秒——实测 52 次参考链断裂只发出了 1 次请求。
     // 限流由 request_keyframe 自己的 300 ms 冷却负责，这里不需要额外节拍。
@@ -1966,6 +2057,15 @@ int main(int argc, char** argv) {
           // 把这一项暴露出来，"是链路丢了还是自己丢了"才不用靠耳朵猜。
           // -1（设备没打开）写成 null：null 是"没有这个观测"，-1 会被当成一个读数。
           {"audio_queue_ms", audio_queue_ms >= 0 ? json(audio_queue_ms) : json(nullptr)},
+          // 音画同步的实际补偿量。没有这几个数，"补了多少、还差多少"只能靠耳朵判断。
+          {"av_audio_ms", json(av_audio_ewma_ms)},
+          {"av_video_ms", av_have_video_lat ? json(av_video_ewma_ms) : json(nullptr)},
+          {"av_comp_ms",
+           av_have_video_lat ? json(av_audio_ewma_ms > av_video_ewma_ms
+                                        ? av_audio_ewma_ms - av_video_ewma_ms
+                                        : 0.0)
+                             : json(nullptr)},
+
           // 队列账：软上限命中 = 在积压（还放行），硬上限命中 = 清过一次（听感会跳）。
           // 只有这两个数能把"播放侧自己丢的"和"链路丢的"分开。
           {"audio_queue_over_soft", rstats.over_soft},
