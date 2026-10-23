@@ -83,11 +83,18 @@ const char* const kAdditiveCounters[] = {
     "send_errors",     "encode_errors",   "encode_delays",   "decode_drops",
     "queue_dropped",   "delayed_pkts",    "fec_groups",      "ingress_late",
     "audio_frames_in", "audio_bytes_in",  "audio_multi_frag", "bytes_in",
+    // 音频解码：成功帧数（audio_decoded 的判据）、累计 PCM 样本数、失败帧数。
+    // 多路求和天然成立——"整条管线解出了多少样本"就是各路之和。
+    "audio_decoded_frames", "audio_pcm_frames", "audio_decode_errors",
     "jb_depth",        "jb_skipped",      "jb_late",         "jb_switches",
     "fb_rx",           "fb_recv_mbps"};
 // 取 max 的读数：最坏链路不能被另一台的好数字平均掉。
+// audio_decode_p99_us 取最慢的一路（性能问题自然是取最坏）；
+// audio_rms_dbfs 取最响的一路——聚合后的含义是"至少有一路在这个电平上"，
+// 不把不同设备的声压平均成一个数（平均会把静音的那一路藏起来）。
 const char* const kMaxFields[] = {"delayed_max_us", "audio_last_pts_us", "jb_target_frames",
-                                  "fb_loss_rate", "fb_rtt_ms"};
+                                  "fb_loss_rate", "fb_rtt_ms", "audio_decode_p99_us",
+                                  "audio_rms_dbfs"};
 
 nlohmann::json profile_json(const AssignedProfile& p) {
   return nlohmann::json{{"transcode", p.transcode},
@@ -507,6 +514,10 @@ nlohmann::json SessionRegistry::aggregate(int64_t now_us) const {
   for (const char* key : kMaxFields) counters[key] = 0;
   counters["fb_loss_rate"] = nullptr;  // 没有会话报过 feedback 时必须是 null，不是 0
   counters["fb_rtt_ms"] = nullptr;
+  // 同理：没有音频流的会话不能把 audio_rms_dbfs 写成 0（0 dBFS 是满幅！），
+  // 也不能把 p99 写成 0 µs。null 才是"没有这个读数"。
+  counters["audio_decode_p99_us"] = nullptr;
+  counters["audio_rms_dbfs"] = nullptr;
   double fps_sum = 0.0;
   int live_n = 0;
   nlohmann::json per_session = nlohmann::json::array();

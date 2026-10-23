@@ -162,10 +162,11 @@ target_include_directories(cue_proto INTERFACE ${CUE_PROTO_INCLUDE})
 # ---- media 侧可执行：WS 接收 → 重组 → UDP 发送 ----
 # media/jitter_buffer：cued 与 probe 共用同一份实现（两侧的「buffer」段口径必须一致，
 # 否则两张图上的抖动缓冲延迟没法互相对照）。
+# media/audio_decoder：上行音频（type=0x02）的 Opus 解码，PCM 只用来算指标、不下行。
 add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp
-  src/media/jitter_buffer.cpp)
+  src/media/jitter_buffer.cpp src/media/audio_decoder.cpp)
 target_link_libraries(cued PRIVATE cue_proto cue_control cue_headers_all Boost::system
-  Threads::Threads PkgConfig::FFMPEG)
+  Threads::Threads PkgConfig::FFMPEG PkgConfig::OPUS)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 
 # ---- cue-probe：下行接收端（UDP 重组 + H.264 软解 + 帧统计/端到端指标）----
@@ -439,6 +440,14 @@ add_executable(test_capture tests/test_capture.cpp)
 target_link_libraries(test_capture PRIVATE cue_capture)
 add_test(NAME capture COMMAND test_capture)
 
+# T-30（FR-DEV.6）：Opus 解码往返（440 Hz 正弦 vs 数字静音，RMS 差 > 30 dB）、损坏包被拒
+# 且计入错误、空包/超长包在进解码器之前就被拒、20 ms @48k = 960 样本、50 帧连续解码可对账。
+# 编码侧复用 cue_capture（同一个 OpusAudioEncoder），解码侧链新组件；
+# 纯 libopus 往返，不起 ffmpeg、不需要声卡。
+add_executable(test_audio_decoder tests/test_audio_decoder.cpp src/media/audio_decoder.cpp)
+target_link_libraries(test_audio_decoder PRIVATE cue_capture)
+add_test(NAME audio_decoder COMMAND test_audio_decoder)
+
 # T-15（FR-OBS.5）：配置文件解析、命令行覆盖、行号正确性、互斥项、未知键。
 # 全是纯函数（临时文件读写，不起进程），失败信息里直接写出"期望第 N 行"。
 add_executable(test_config tests/test_config.cpp)
@@ -462,7 +471,7 @@ set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_control_channel test_tools test_delay_injector test_nack test_capture
-  test_config test_metrics)
+  test_audio_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
   target_link_libraries(${_t} PRIVATE cue_headers_all)
 endforeach()

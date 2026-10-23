@@ -50,6 +50,7 @@ extern "C" {
 }
 
 #include "cue/common/clock.h"
+#include "cue/media/audio_decoder.h"
 #include "cue/media/delay_injector.h"
 #include "cue/media/encoder.h"
 #include "cue/media/h264_decoder.h"
@@ -346,6 +347,50 @@ struct FrameAcc {
   std::vector<std::vector<uint8_t>> parts;
 };
 
+// 音频 RMS 的窗口口径：最近 kFrames 个**已解码帧**（50 × 20 ms = 1 s）。
+// 为什么按帧数而不是按挂钟：解码是"来一包解一包"的流水，按时间窗截断会在丢包/抖动把
+// 到达节奏拉稀时算出"窗口里只有 2 个样本"，读数抖动比音频本身还大；按帧数则只要流还在，
+// 窗口就总是 1 s 的量。只存每帧的 Σx² 与样本数：算 RMS 只需要这两个量，
+// 不留原始 PCM（1 s 96 KB 的无用内存）。
+struct AudioRmsWindow {
+  static constexpr std::size_t kFrames = 50;  // 50 × 20 ms = 1 s
+  void push(const int16_t* pcm, std::size_t n) {
+    if (pcm == nullptr || n == 0) return;
+    double sum_sq = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double v = static_cast<double>(pcm[i]);
+      sum_sq += v * v;
+    }
+    sums_.push_back(sum_sq);
+    counts_.push_back(n);
+    if (sums_.size() > kFrames) {
+      sums_.pop_front();
+      counts_.pop_front();
+    }
+  }
+  bool empty() const { return sums_.empty(); }
+  std::size_t frames() const { return sums_.size(); }
+  // 窗口内**全部样本**的 RMS，不是各帧 dBFS 的平均（那会让静音帧和响帧按帧等权，
+  // 读出来"比实际响"）。口径与 cue::media::rms_dbfs 同一个参考电平。
+  double dbfs() const {
+    double sum_sq = 0.0;
+    uint64_t n = 0;
+    for (std::size_t i = 0; i < sums_.size(); ++i) {
+      sum_sq += sums_[i];
+      n += counts_[i];
+    }
+    return cue::media::dbfs_from_sum_sq(sum_sq, n);
+  }
+
+ private:
+  std::deque<double> sums_;
+  std::deque<std::size_t> counts_;
+};
+
+// 首个错误原因的截断长度：一帧一个 Opus 包的失败原因是固定短句，
+// 但协议拒绝会带上尺寸数字；500 字节足够读，又不至于把 METRICS 行撑爆。
+constexpr std::size_t kMaxAudioErrorLen = 500;
+
 struct Counters {
   uint64_t frames_in = 0;
   uint64_t frames_out = 0;
@@ -374,14 +419,23 @@ struct Counters {
   uint64_t ingress_late = 0;
   // 关键帧请求的抑制计数（FR-PIPE.11）：冷却窗口内或同 frame_id 的重复请求只计数不落事件。
   uint64_t kf_req_suppressed = 0;
-  // 音频只计数：上行 type=0x02 的包被接收、被计数、出现在指标行里，但不进解码、
-  // 不写下行。audio_decoded 恒 false 是这条链路的真实状态（原因见 METRICS 行的
-  // audio_decode_reason 与处理分支处注释），不是没填的占位值。
+  // 音频解码（FR-DEV.6）：上行 type=0x02 的载荷是**裸 Opus 包**（proto::upstream_pack.h：
+  // 32 字节 MediaHeader 之后直接是编码器输出），本进程用 libopus 真解，解出的 PCM
+  // 只用来算指标（RMS/耗时），不写下行——下行没有音频数据报类型，probe 也没有音频出口。
+  // audio_decoded 的判据是 audio_decoded_frames > 0，不是"收到过音频包"：
+  // 收到包与解得出声音是两件事，混在一起就退化成旧的"只计数"。
   uint64_t audio_frames_in = 0;
   uint64_t audio_bytes_in = 0;
   // 多分片音频不做重组，单独计数：少计会让「音频到底有没有在流」看不出来
   uint64_t audio_multi_frag = 0;
   int64_t audio_last_pts_us = 0;
+  uint64_t audio_decoded_frames = 0;
+  uint64_t audio_pcm_frames = 0;  // 累计解出的 PCM 样本数（mono，等于每声道样本数）
+  uint64_t audio_decode_errors = 0;
+  // 首个失败原因：后续错误不覆盖它（"第一件出的事"比"最后一件"更能定位故障形状）
+  std::string audio_first_error;
+  Ring audio_decode_us;      // 单帧解码耗时（µs），audio_decode_p99_us 的样本源
+  AudioRmsWindow audio_rms;  // 最近 1 s 的 RMS 窗口
 };
 
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counters& c) {
@@ -652,6 +706,21 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
   const double dt = t_last > 0 ? double(now_us - t_last) / 1e6 : 0.0;
   const uint64_t df = c.frames_out >= frames_prev ? c.frames_out - frames_prev : 0;
   const bool have_fb = fb.rx.load(std::memory_order_relaxed) > 0;
+  // 音频读数：一次都没解出帧时 RMS 与 p99 必须是 null，不能拿 0 dBFS（满幅）或
+  // -120 dBFS（静音）冒充"没有音频"。reason 同理：没流说没流，出错说第一件错事。
+  // p99 只统计**解成功**的帧：失败帧不产生 PCM，混进来只会把"错误处理耗时"报成解码耗时。
+  const json audio_rms_dbfs =
+      c.audio_rms.empty() ? json(nullptr) : json(cue::media::dbfs_for_metric(c.audio_rms.dbfs()));
+  const json audio_dec_p99 = c.audio_decode_us.size() == 0
+                                 ? json(nullptr)
+                                 : json(double(c.audio_decode_us.pct(0.99)));
+  json audio_reason = nullptr;
+  if (!c.audio_first_error.empty()) {
+    audio_reason = c.audio_first_error;
+  } else if (c.audio_frames_in == 0) {
+    audio_reason = c.audio_multi_frag > 0 ? "audio_multi_frag_not_reassembled"
+                                          : "no_audio_stream";
+  }
   json m{{"fps", dt > 0.0 ? double(df) / dt : 0.0},
          {"frames_in", c.frames_in},
          {"frames_out", c.frames_out},
@@ -681,6 +750,15 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
          {"audio_bytes_in", c.audio_bytes_in},
          {"audio_multi_frag", c.audio_multi_frag},
          {"audio_last_pts_us", c.audio_last_pts_us},
+         // 音频解码：audio_decoded 是"真解出过帧"的判据，不是"收到过包"。
+         {"audio_decoded", c.audio_decoded_frames > 0},
+         {"audio_decoded_frames", c.audio_decoded_frames},
+         {"audio_pcm_frames", c.audio_pcm_frames},
+         {"audio_decode_errors", c.audio_decode_errors},
+         {"audio_decode_p99_us", audio_dec_p99},
+         {"audio_rms_dbfs", audio_rms_dbfs},
+         {"audio_rms_frames", c.audio_rms.frames()},
+         {"audio_decode_reason", audio_reason},
          {"bytes_in", c.bytes_in},
          {"stream_id", upstream_stream_id},
          {"jb_depth", jb.depth},
@@ -724,6 +802,15 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
   };
   const double fps = agg.contains("fps") && agg["fps"].is_number() ? agg["fps"].get<double>() : 0.0;
   const int sessions = agg.contains("live") && agg["live"].is_number() ? agg["live"].get<int>() : 0;
+  // 顶层音频原因只给**类别**：多会话聚合时"具体哪条错"留给 per_session（那边是首个错误
+  // 原文），顶层不能凭空挑一路的错误当全局原因。
+  json audio_reason = nullptr;
+  if (u64("audio_frames_in") == 0) {
+    audio_reason = u64("audio_multi_frag") > 0 ? "audio_multi_frag_not_reassembled"
+                                               : "no_audio_stream";
+  } else if (u64("audio_decode_errors") > 0) {
+    audio_reason = "decode_errors";
+  }
 
   std::ostringstream human;
   human.setf(std::ios::fixed);
@@ -734,8 +821,14 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
         << " dec=" << u64("decoded") << " dec_err=" << u64("decode_errors")
         << " dec_drop=" << u64("decode_drops") << " rej=" << u64("rejected")
         << " dly=" << u64("delayed_pkts") << "/" << num("delayed_max_us") / 1000.0 << "ms"
-        << " aud=" << u64("audio_frames_in") << " MB=" << std::setprecision(2)
-        << num("bytes_in") / (1024.0 * 1024.0);
+        << " aud=" << u64("audio_frames_in") << " apcm=" << u64("audio_pcm_frames")
+        << " aerr=" << u64("audio_decode_errors");
+  {
+    const json arms = null_or("audio_rms_dbfs");
+    // 没有解出帧时不打这一项：打 -inf / 0 都会被读成"有读数"。
+    if (!arms.is_null()) human << " arms=" << std::setprecision(1) << arms.get<double>() << "dBFS";
+  }
+  human << " MB=" << std::setprecision(2) << num("bytes_in") / (1024.0 * 1024.0);
   for (int i = 0; i < 6; ++i) {
     const json st = shared.summary(i);
     if (st.is_null()) {
@@ -794,8 +887,13 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
          {"audio_bytes_in", u64("audio_bytes_in")},
          {"audio_multi_frag", u64("audio_multi_frag")},
          {"audio_last_pts_us", u64("audio_last_pts_us")},
-         {"audio_decoded", false},
-         {"audio_decode_reason", "opus_decode_not_implemented"},
+         {"audio_decoded", u64("audio_decoded_frames") > 0},
+         {"audio_decoded_frames", u64("audio_decoded_frames")},
+         {"audio_pcm_frames", u64("audio_pcm_frames")},
+         {"audio_decode_errors", u64("audio_decode_errors")},
+         {"audio_decode_p99_us", null_or("audio_decode_p99_us")},
+         {"audio_rms_dbfs", null_or("audio_rms_dbfs")},
+         {"audio_decode_reason", audio_reason},
          {"jb_depth", u64("jb_depth")},
          {"jb_level", u64("jb_level")},
          {"jb_switches", u64("jb_switches")},
@@ -829,7 +927,11 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
                                      {"send_errors", u64("send_errors")},
                                      {"encode_errors", u64("encode_errors")},
                                      {"decode_drops", u64("decode_drops")},
-                                     {"audio_frames_in", u64("audio_frames_in")}});
+                                     {"audio_frames_in", u64("audio_frames_in")},
+                                     {"audio_pcm_frames", u64("audio_pcm_frames")},
+                                     {"audio_decode_errors", u64("audio_decode_errors")},
+                                     {"audio_decode_p99_us", null_or("audio_decode_p99_us")},
+                                     {"audio_rms_dbfs", null_or("audio_rms_dbfs")}});
   json sample{{"fps", fps},
               {"frames_in", u64("frames_in")},
               {"frames_out", u64("frames_out")},
@@ -841,7 +943,10 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
               {"fb_rx", u64("fb_rx")},
               {"aimd_steps", g_aimd_steps.load(std::memory_order_relaxed)},
               {"audio_frames_in", u64("audio_frames_in")},
-              {"audio_decoded", false},
+              {"audio_decoded", u64("audio_decoded_frames") > 0},
+              {"audio_pcm_frames", u64("audio_pcm_frames")},
+              {"audio_decode_errors", u64("audio_decode_errors")},
+              {"audio_rms_dbfs", null_or("audio_rms_dbfs")},
               {"jb_depth", u64("jb_depth")},
               {"jb_skipped", u64("jb_skipped")},
               {"jb_late", u64("jb_late")},
@@ -995,6 +1100,10 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   uint64_t chain_failed_gen = kNoGeneration;
   cue::media::TranscodeChain chain;
   bool chain_ready = false;
+  // 音频解码器（上行 type=0x02 → PCM，只用来算指标）。每会话一份：Opus 解码器是带状态的
+  // （上一帧的尾巴参与下一帧的重叠相加），跨会话共用会把上一路的余音串到下一路。
+  // 懒打开：只推视频的会话不付创建解码器的代价。
+  cue::media::OpusAudioDecoder audio_dec;
   TokenBucket bucket(params.snapshot().params.send_mbps * 1e6);
   CodecConfig codec_cfg;
   uint32_t upstream_stream_id = 0;  // 客户端自报的流号，只作记录（下行用服务端会话号）
@@ -1700,16 +1809,55 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
       continue;
     }
     if (h->type == static_cast<uint8_t>(cue::proto::MediaType::Audio)) {
-      // 音频上行（FR-DEV.6）：**只喂计数，不解码、不下发**。
-      // 之所以不假装处理：opus 真解码要 libavcodec opus 解码器 + 下行音频数据报类型
-      // + 播放侧，是独立一条链路；本批验收只要「音频包能被收端看到」。
-      // 20 ms 的 Opus 帧只有几百字节，远低于 16 KiB 分片上限，浏览器恒单分片，
-      // 所以这里不做重组；见到多分片时单独计数（audio_multi_frag），
-      // 让「音频在流但口径不完整」可见，而不是静默少计成 0。
+      // 音频上行（FR-DEV.6）：载荷是**裸 Opus 包**。依据是协议本身，不是猜的：
+      //   · proto::upstream_pack.h 的 pack_upstream() 只写 32 字节 MediaHeader + 原样载荷；
+      //   · cue-capture 的 audio_loop() 把 OpusAudioEncoder 的输出直接交给它；
+      //   · 浏览器 web/app.js 的 sendMediaPacket 同样是 32 字节头 + EncodedAudioChunk 字节；
+      //   · wire.h 里 MediaType::Audio 没有二级头（sampleRate/声道数只在 0x03/0x05
+      //     的能力上报里，不在每帧路径上）。
+      // 所以这里从 payload 起始处直接解，不跳任何字节。
+      //
+      // 解出的 PCM 只用来算指标，不写下行：DownType::Audio 至今没有任何发送方，
+      // probe 也没有音频出口（见 apps/cue-probe.cpp 的说明）。
+      // 20 ms 的 Opus 帧只有几十~几百字节，远低于 16 KiB 分片上限，浏览器与 cue-capture
+      // 都恒单分片；多分片的包不重组（没有发送端会这么做，重组只会把异常掩盖成正常），
+      // 单独计数（audio_multi_frag），让「音频在流但口径不完整」可见。
       if (h->frag_count == 1) {
         ++c.audio_frames_in;
         c.audio_bytes_in += h->payload_len;
         c.audio_last_pts_us = static_cast<int64_t>(h->pts_us);
+        if (!audio_dec.is_open()) {
+          std::string oerr;
+          if (!audio_dec.open(oerr)) {
+            // 打不开不是"这一帧解不出"，是整条音频路径废了：照样按帧计错误
+            // （否则 audio_decode_errors=0 会被读成"只是没音频"），原因只留第一条。
+            ++c.audio_decode_errors;
+            if (c.audio_first_error.empty()) {
+              c.audio_first_error = oerr.substr(0, kMaxAudioErrorLen);
+            }
+            err_log.log(cue::now_us(), "opus 解码器打开失败：" + oerr);
+            continue;
+          }
+        }
+        const int64_t t_dec0 = cue::now_us();
+        std::string derr;
+        auto frame =
+            audio_dec.decode({p + cue::proto::kMediaHeaderSize, h->payload_len}, derr);
+        const int64_t dec_us = cue::now_us() - t_dec0;
+        if (!frame) {
+          ++c.audio_decode_errors;
+          const std::string why = std::string(cue::media::audio_decode_error_name(frame.error())) +
+                                  ": " + derr;
+          if (c.audio_first_error.empty()) {
+            c.audio_first_error = why.substr(0, kMaxAudioErrorLen);
+          }
+          err_log.log(cue::now_us(), "opus 解码失败（" + why + "）");
+        } else {
+          ++c.audio_decoded_frames;
+          c.audio_pcm_frames += frame->sample_count();
+          c.audio_decode_us.push(dec_us);
+          c.audio_rms.push(frame->samples.data(), frame->samples.size());
+        }
       } else {
         ++c.audio_multi_frag;
       }

@@ -286,7 +286,13 @@ async function runStreamScenario({ label, source, query, expect, launch, initScr
           fail(`摄像头模式下 cued 没收音频包（audio_frames_in=${mLast.m.audio_frames_in}，` +
                `页面音频备注：${finalStats.audio.note || '无'}）`);
         }
-        if (mLast.m.audio_decoded !== false) fail('audio_decoded 应显式为 false（本批只计数不解码）');
+        if (mLast.m.audio_decoded !== true) {
+          fail(`cued 收了音频包却解不出 Opus（audio_decoded=${mLast.m.audio_decoded}，` +
+               `errors=${mLast.m.audio_decode_errors}，原因=${mLast.m.audio_decode_reason}）`);
+        }
+        if (!(typeof mLast.m.audio_rms_dbfs === 'number')) {
+          fail('cued METRICS 里没有可用的 audio_rms_dbfs（真麦克风应是一个负的 dBFS 读数）');
+        }
       }
     }
     // 能力上报在首帧之前就发出，所以按「场景开始时刻」过滤，而不是按首帧时刻

@@ -3,11 +3,11 @@
 Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，并用可复现的自动评测回答「agent 到底有没有把系统变好」。之所以这么拼，是因为链路排障的规律（看哪一段的哪个计数在动）本来就可以交给 agent，但业界没有 C++ 的 agent runtime，也没有框架能回答「改完之后是变好还是变坏」。
 
 - **Harness** — 阶段状态机约束下的 ReAct 内核：领域工具、三级审批、沙箱、上下文预算、cassette
-- **被测域** — 浏览器 Canvas 合成源 → WebCodecs 编码 → WebSocket 上行 → 解码 → 可插拔转码 → 自研 UDP 下行；`cued` 是独立进程，故障注入在用户态、固定种子
+- **被测域** — 三条采集路径（摄像头+麦克风 / 屏幕共享 / Canvas 合成源，前两条在真机验证过）→ WebCodecs 编码 → WebSocket 上行 → 解码 → 可插拔转码 → 自研 UDP 下行；另有 `cue-capture`（原生采集端，`lavfi`/`ffmpeg`/V4L2 三后端）走同一套上行协议；`cued` 是独立进程，故障注入在用户态、固定种子
 - **评测** — 声明式 case、三重判分（根因 / 证据 / SLA）、pass^k、指纹、回归对比、人读报告
 - **可观测** — `cue-serve` + React 控制台五页、SSE 事件流、审批 UI；`cue-probe` 跨机接收端
 
-当前状态：`ctest` **23 项**全部通过（含一个起真进程的集成测试）；控制台五页、SSE 与审批 UI 可用；cassette、benchmark、proto fuzz、CI workflow 都在仓库里。
+当前状态：`ctest` **25 项**全部通过（含一个起真进程的集成测试）；控制台五页、SSE 与审批 UI 可用；cassette、benchmark、proto fuzz、CI workflow 都在仓库里。**AC-15 全量通过**（18 case × REPEAT=3 = 54 次，根因/证据/SLA 全 1.0，三次 repeat 的 stddev 全 0）。**AC-1 已在真机验证**：Windows 的集成摄像头 + Realtek 麦克风经浏览器推流，cued 侧 `frames_in 594` / `audio_frames_in 1000` / `decode_errors 0`。
 
 CI 分两层：**常驻**（每次 push）跑 build + ctest、AC-13 静态检查、e2e-console；**手动**（`workflow_dispatch`）跑 sanitizer（ASan/UBSan、TSan）与 fuzz。sanitizer 不常驻的原因写在 `.forgejo/workflows/sanitizer.yml` 头部：本机 2 vCPU / 1967 MB（DSH 常驻近 1 GB）+ runner 的 `MemoryHigh=700M`，插桩构建连 `-g1` 都压不进预算（`MemoryCurrent` 恒贴 734M，单 TU 编 5 分钟）。
 
@@ -252,8 +252,8 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 
 ## 已知限制 / 未做
 
-- **音频只计数、不解码**：`cue-capture` 与浏览器都能编 Opus 上行，`cued` 也计数（`audio_frames_in`），但服务端没有 Opus 解码器，指标里显式写 `audio_decoded=false` + 原因。所以能证明"音频在流且包数对得上"，不能证明可播。
-- **AC-1 的真摄像头路径未在真机验证**：开发机无摄像头、无声卡（`/dev/snd` 不存在），全部用 Chromium fake device（`--use-fake-device-for-media-stream`）与 `lavfi` 合成源验证。链路上的每个环节都通了，但"真 USB 摄像头 + 真麦克风"这一条要拿到有摄像头的机器上才能签字。
+- **音频解得出，但下行不带音频**：`cue-capture` 与浏览器都能编 Opus 上行，`cued` 用 libopus 真解（48 kHz mono/20 ms，载荷是裸 Opus 包），指标给 `audio_decoded` / `audio_pcm_frames` / `audio_decode_errors` / `audio_decode_p99_us` / `audio_rms_dbfs`（最近 1 s 的 RMS，dBFS 参考 int16 满量程）。解出的 PCM **只用来算指标、不写下行**（`DownType::Audio` 至今没有发送方，probe 也不解音频），所以这能证明"音频解得出、电平对得上"，不能证明"收端能听"。静音流的读数是 `audio_decoded=true` + `audio_rms_dbfs=-120`（下限值，真值是 -inf）——"解出来了但没声"是一个可区分的状态，不是成功。
+- **AC-1 已真机验证，但只在一台机器上**：Windows 的集成摄像头（174f:2460）+ Realtek 麦克风阵列，经 Edge 的 `getUserMedia` + `MediaStreamTrackProcessor` 推流，cued 侧 `frames_in 594` / `audio_frames_in 1000` / `decode_errors 0`。仍缺的是**多样性**：没试过外接 USB 摄像头、虚拟摄像头（OBS/VoiceMeeter 那类）、以及 macOS 的 `avfoundation`。
 - **多设备并发上限受采集端开销限制**：实测 2 路（640×360 + 1280×720 各 30 fps）时 `cued` 占 **25% CPU**、load 1.72、两路零丢帧；但每路 720p 合成源的采集+编码本身约 42%，所以这台 2 vCPU 机器上 2 路是舒适档，3 路以上要先算采集端的账。
   多设备时第 i 路（槽位 i）的下行发往 `--probe-port + i`，**每路要有一个 `cue-probe` 在听**；租约（`--lease-ms`，默认 15 s）靠"租约内有没有收到任何一条 WS 报文"判定，所以客户端崩溃但没发 FIN 的半开连接也能被回收（实测 `SIGSTOP` 冻结客户端 4 s 后得到 `device.lease_expired{basis:no_ws_message_within_lease}`）。
   能力协商：设备用 `type=0x05 Stats` 上报分辨率/帧率/codec 上限，服务端只在"配置值超过设备能力"时夹取（分辨率夹到偶数、码率按像素比例下调），并写 `basis=caps_clamped`；没有上报时与之前逐字节一致。

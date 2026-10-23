@@ -819,6 +819,12 @@ int main(int argc, char** argv) {
   cue::media::JitterBuffer jb(jb_cfg);
   uint64_t frames = 0, lost_frames = 0, bytes = 0, packets = 0;
   uint64_t rejected = 0, lat_invalid = 0, stats_reqs = 0, fb_sent = 0;
+  // 下行音频数据报计数。当前结构上恒为 0：cued 的下行只有 Video / Fec / StatsReq /
+  // Feedback 四种，DownType::Audio 在 cued 里没有任何发送方（2026-10 的代码里
+  // `grep DownType::Audio apps/cued.cpp` 无匹配）。留着这个计数不是为了"以后可能加"，
+  // 而是让"下行到底有没有音频"变成可观测事实：真收到了就会涨，指标里的 audio_note
+  // 也随之改口，不会继续输出一句过时的说明。
+  uint64_t audio_datagrams = 0;
   // FEC 账（FR-PIPE.9）：恢复的片数、有 FEC 覆盖的组数、结算时仍缺 ≥2 片的组与片数。
   // groups_rx 与 recovered/unrecoverable 一起构成「恢复率」的可执行分母：
   //   rate = recovered / (recovered + unrecoverable_pkts)
@@ -1340,6 +1346,15 @@ int main(int argc, char** argv) {
           {"bad_frame_events", bad_frame_events},
           {"report_sent", reporters.sent()},
           {"report_drops", reporters.dropped()},
+          // 音频（FR-DEV.6 的另一半）：下行**没有音频**。cued 的发送路径只有视频数据报，
+          // DownType::Audio 在 cued 里没有发送方；上行的 Opus 在 cued 解成 PCM 后只算指标，
+          // 不回送。所以 probe 这里没有解码器可开——audio_decoded 恒 false 且带原因，
+          // 而不是"解了但没声"。真出现音频数据报时 audio_datagrams 会涨、note 会改口。
+          {"audio_datagrams", audio_datagrams},
+          {"audio_decoded", false},
+          {"audio_note", audio_datagrams == 0
+                             ? "no audio in downlink: cued sends video only (DownType::Audio has no sender)"
+                             : "DownType::Audio datagrams received, but probe has no audio decoder path"},
       };
       emit("probe.metric", metric);
       // 分位环按窗口清零：指标行是「这一秒」的读数，不是进程累计。不清零的话，
@@ -1541,6 +1556,16 @@ int main(int argc, char** argv) {
       // 恢复后必须重新判定完整性：否则被 FEC 修好的帧永远不会被计为完成（实测踩到的坑）
       mark_probe_if_recovered(base_fid);
       finish_if_complete(base_fid, ffa);
+      continue;
+    }
+    if (h->type == static_cast<uint8_t>(cue::proto::DownType::Audio)) {
+      // 下行音频：本端**不做解码**，因为下行根本没有音频可发——
+      // cued 的 process_frame/deliver_frame 只发视频（DownType::Audio 在 cued 里从未
+      // 被赋过值），浏览器与 cue-capture 的 Opus 只走上行。给一条不存在的流写解码器，
+      // 只会让指标看起来"试过了、但解不出来"，那比不写更坏。
+      // 这里只计数并继续：真收到音频数据报时 audio_datagrams 会涨，METRICS 的
+      // audio_note 会从「下行没有音频」变成「收到了但本端不解码」，不伪造成功。
+      ++audio_datagrams;
       continue;
     }
     if (h->type != static_cast<uint8_t>(cue::proto::DownType::Video)) continue;
