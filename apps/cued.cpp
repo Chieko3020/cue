@@ -285,7 +285,18 @@ class RetransmitCache {
 // 不足时先丢非关键帧：关键帧允许透支，但透支上限也是 64 包，关键帧风暴不能无限超发。
 class TokenBucket {
  public:
-  static constexpr double kBurstPackets = 64.0;
+  // 关键帧允许透支的包数上限。
+  //
+  // 原值 64 是按"10 Mbps + 64 包突发"的规格取的，但它有一个隐含前提：**一帧的分片数
+  // 不超过 64**。1080p 的 IDR 有 100~200 个分片，于是令牌一空，整个关键帧必然被丢
+  // （实测 budget_drops 随码率上升反而增多：6 Mbps 时 11 次、12 Mbps 时 41 次，
+  // 因为 IDR 变大）。被丢的关键帧直接打断 H.264 参考链 ⇒ 画面糊一块，而
+  // decode_errors 仍是 0（丢的是整帧不是坏数据），极容易被误判成编码问题。
+  //
+  // 突发量是**容忍度**，不是速率：它决定"一帧之内允许欠多少令牌"，与长期带宽无关。
+  // 取 512 足以覆盖 1080p/4K 的单个 IDR（按 1200 B/包算约 600 KB），同时仍然有界
+  // ——真正限速靠的是 refill()，不是这个上限。
+  static constexpr double kBurstPackets = 512.0;
   static constexpr double kPacketBytes =
       double(cue::proto::kMaxUdpPayload + cue::proto::kDatagramHeaderSize);
 
