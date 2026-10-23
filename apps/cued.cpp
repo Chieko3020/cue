@@ -51,6 +51,7 @@ extern "C" {
 
 #include "cue/common/clock.h"
 #include "cue/media/audio_decoder.h"
+#include "cue/media/audio_rms.h"
 #include "cue/media/delay_injector.h"
 #include "cue/media/encoder.h"
 #include "cue/media/h264_decoder.h"
@@ -347,49 +348,12 @@ struct FrameAcc {
   std::vector<std::vector<uint8_t>> parts;
 };
 
-// 音频 RMS 的窗口口径：最近 kFrames 个**已解码帧**（50 × 20 ms = 1 s）。
-// 为什么按帧数而不是按挂钟：解码是"来一包解一包"的流水，按时间窗截断会在丢包/抖动把
-// 到达节奏拉稀时算出"窗口里只有 2 个样本"，读数抖动比音频本身还大；按帧数则只要流还在，
-// 窗口就总是 1 s 的量。只存每帧的 Σx² 与样本数：算 RMS 只需要这两个量，
-// 不留原始 PCM（1 s 96 KB 的无用内存）。
-struct AudioRmsWindow {
-  static constexpr std::size_t kFrames = 50;  // 50 × 20 ms = 1 s
-  void push(const int16_t* pcm, std::size_t n) {
-    if (pcm == nullptr || n == 0) return;
-    double sum_sq = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-      const double v = static_cast<double>(pcm[i]);
-      sum_sq += v * v;
-    }
-    sums_.push_back(sum_sq);
-    counts_.push_back(n);
-    if (sums_.size() > kFrames) {
-      sums_.pop_front();
-      counts_.pop_front();
-    }
-  }
-  bool empty() const { return sums_.empty(); }
-  std::size_t frames() const { return sums_.size(); }
-  // 窗口内**全部样本**的 RMS，不是各帧 dBFS 的平均（那会让静音帧和响帧按帧等权，
-  // 读出来"比实际响"）。口径与 cue::media::rms_dbfs 同一个参考电平。
-  double dbfs() const {
-    double sum_sq = 0.0;
-    uint64_t n = 0;
-    for (std::size_t i = 0; i < sums_.size(); ++i) {
-      sum_sq += sums_[i];
-      n += counts_[i];
-    }
-    return cue::media::dbfs_from_sum_sq(sum_sq, n);
-  }
-
- private:
-  std::deque<double> sums_;
-  std::deque<std::size_t> counts_;
-};
-
 // 首个错误原因的截断长度：一帧一个 Opus 包的失败原因是固定短句，
 // 但协议拒绝会带上尺寸数字；500 字节足够读，又不至于把 METRICS 行撑爆。
 constexpr std::size_t kMaxAudioErrorLen = 500;
+
+// cued 里沿用原名（历史代码里到处是 AudioRmsWindow），实现已移到公共头。
+using cue::media::AudioRmsWindow;
 
 struct Counters {
   uint64_t frames_in = 0;
@@ -426,6 +390,9 @@ struct Counters {
   // 收到包与解得出声音是两件事，混在一起就退化成旧的"只计数"。
   uint64_t audio_frames_in = 0;
   uint64_t audio_bytes_in = 0;
+  // 下行透传出去的音频包数（DownType::Audio）。与 audio_frames_in 分开计：
+  // 差值是"收进来但没发出去"（解码失败不拦透传，但发送错误会被记下）。
+  uint64_t audio_frames_out = 0;
   // 多分片音频不做重组，单独计数：少计会让「音频到底有没有在流」看不出来
   uint64_t audio_multi_frag = 0;
   int64_t audio_last_pts_us = 0;
@@ -747,6 +714,7 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
          {"ingress_late", c.ingress_late},
          {"kf_req_suppressed", c.kf_req_suppressed},
          {"audio_frames_in", c.audio_frames_in},
+         {"audio_frames_out", c.audio_frames_out},
          {"audio_bytes_in", c.audio_bytes_in},
          {"audio_multi_frag", c.audio_multi_frag},
          {"audio_last_pts_us", c.audio_last_pts_us},
@@ -1634,6 +1602,9 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   int64_t last_kf_req_us = 0;
   uint32_t last_kf_req_frame = 0;
   bool have_kf_req = false;
+  // 下行音频包的独立帧号（与视频的 frame_id 分开）：probe 侧按会话号 + 帧号判丢包，
+  // 音频恒单分片，所以这个号就是"第几个音频包"，缺口即丢失。
+  uint32_t audio_frame_seq = 0;
 
   for (;;) {
     beast::flat_buffer buf;
@@ -1861,6 +1832,33 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
           c.audio_pcm_frames += frame->sample_count();
           c.audio_decode_us.push(dec_us);
           c.audio_rms.push(frame->samples.data(), frame->samples.size());
+        }
+        // ---- 音频下行（FR-PIPE.4 的补全）----
+        // 上行载荷就是**裸 Opus 包**，下行原样转发，不做解码-重编码：这是 passthrough
+        // 语义的正确形态（少一次编解码就少一份延迟），也让"转码开启"只影响视频。
+        //
+        // 三个刻意的取舍：
+        //   · **不进 sendq/delayq**：那两条队列是为视频帧的限速与延迟注入准备的，
+        //     音频帧只有几十~几百字节、20 ms 一发，排队只会把延迟做大；
+        //   · **不参与抖动缓冲**：jb 的状态机是按视频帧间隔估的，混入音频会把
+        //     interval 估计带偏；probe 侧按 pts 自行平滑；
+        //   · **解码失败照发**：解码只是给指标用的旁路，上行包本身是完好的，
+        //     因为"本端解不出"就不转发，等于把本机的解码问题变成对端的静音。
+        {
+          cue::proto::DatagramHeader ah;
+          ah.type = static_cast<uint8_t>(cue::proto::DownType::Audio);
+          ah.flags = 0;  // 下行没有 LastFrag 标志：单分片由 frag_index/frag_count 直接表达
+          ah.session_id = session_id;
+          ah.frame_id = audio_frame_seq++;
+          ah.frag_index = 0;
+          ah.frag_count = 1;   // 20 ms 的 Opus 帧恒 < 16 KiB，不分片
+          ah.pts_us = h->pts_us;
+          ah.codec = 0;        // 音频不标 codec（下行 codec 字段只用于视频解码选择）
+          const auto ahdr = cue::proto::encode(ah);
+          std::vector<uint8_t> apkt(ahdr.begin(), ahdr.end());
+          const uint8_t* ap = p + cue::proto::kMediaHeaderSize;
+          apkt.insert(apkt.end(), ap, ap + h->payload_len);
+          if (send_dgram(apkt)) ++c.audio_frames_out;
         }
       } else {
         ++c.audio_multi_frag;

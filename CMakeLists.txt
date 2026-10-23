@@ -195,10 +195,13 @@ target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 # ---- cue-probe：下行接收端（UDP 重组 + H.264 软解 + 帧统计/端到端指标）----
 # probe 复用 media/h264_decoder（不另写一个解码器）：同一份 libavcodec 封装在
 # cued 与 probe 两侧的行为必须一致，否则两边的"解码耗时"没法对照。
+# 音频解码器现在是 probe 的真依赖（下行有音频了，见 apps/cued.cpp 的"音频下行"），
+# 所以连 audio_decoder.cpp 与 opus 一起链进来——之前 probe 不解音频，链接里没有这些。
 add_executable(cue-probe apps/cue-probe.cpp src/media/h264_decoder.cpp
+  src/media/audio_decoder.cpp
   src/media/jitter_buffer.cpp)
 target_link_libraries(cue-probe PRIVATE cue_proto cue_headers_all Threads::Threads
-  PkgConfig::FFMPEG)
+  PkgConfig::FFMPEG PkgConfig::OPUS)
 target_compile_options(cue-probe PRIVATE -Wno-deprecated-declarations)
 
 # ---- 采集端（T-11 / FR-CAP.1–6）----

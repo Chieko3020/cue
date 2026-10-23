@@ -101,6 +101,8 @@ inline void probe_close_socket(probe_socket_t fd) { ::close(fd); }
 #endif
 
 #include "cue/common/clock.h"
+#include "cue/media/audio_decoder.h"
+#include "cue/media/audio_rms.h"
 #include "cue/media/h264_decoder.h"
 #include "cue/media/jitter_buffer.h"
 #include "cue/proto/nack.h"
@@ -1277,6 +1279,21 @@ int main(int argc, char** argv) {
     ++fb_sent;
   };
 
+  // ---- 下行音频（FR-DEV.6 的另一半）----
+  // cued 现在把上行 Opus 原样透传到下行（DownType::Audio），所以 probe 有了真的音频流可解。
+  // 与视频共用一帧的 4096 字节栈缓冲无关：20 ms 的 Opus 包最多 1275 字节。
+  cue::media::OpusAudioDecoder audio_dec;
+  bool audio_dec_open_failed = false;
+  std::string audio_first_error;
+  cue::media::AudioRmsWindow audio_rms;
+  uint64_t audio_decoded_frames = 0;  // 成功解出的 PCM 帧数
+  uint64_t audio_pcm_frames = 0;      // 累计 PCM 样本数
+  uint64_t audio_decode_errors = 0;
+  uint64_t audio_last_seq = 0;
+  bool audio_have_seq = false;
+  uint64_t audio_seq_gaps = 0;  // 帧号缺口（音频恒单分片，缺口即丢失）
+  constexpr std::size_t kMaxAudioErrLen = 400;
+
   std::array<uint8_t, 4096> buf{};
   for (;;) {
     // ---- 周期任务放在循环顶部：FEC 分支 / 完全没包时都不会被跳过 ----
@@ -1467,15 +1484,23 @@ int main(int argc, char** argv) {
           {"bad_frame_events", bad_frame_events},
           {"report_sent", reporters.sent()},
           {"report_drops", reporters.dropped()},
-          // 音频（FR-DEV.6 的另一半）：下行**没有音频**。cued 的发送路径只有视频数据报，
-          // DownType::Audio 在 cued 里没有发送方；上行的 Opus 在 cued 解成 PCM 后只算指标，
-          // 不回送。所以 probe 这里没有解码器可开——audio_decoded 恒 false 且带原因，
-          // 而不是"解了但没声"。真出现音频数据报时 audio_datagrams 会涨、note 会改口。
+          // 音频（FR-DEV.6 的另一半）：cued 现在把上行 Opus 原样透传到下行，
+          // probe 侧解成 PCM 并算 RMS——与 cued 侧同一套口径（AudioRmsWindow 已移到公共头），
+          // 两端 dBFS 之差就是"链路 + 一次 Opus 编解码"对音量的影响。
           {"audio_datagrams", audio_datagrams},
-          {"audio_decoded", false},
+          {"audio_decoded", audio_decoded_frames > 0},
+          {"audio_decoded_frames", audio_decoded_frames},
+          {"audio_pcm_frames", audio_pcm_frames},
+          {"audio_decode_errors", audio_decode_errors},
+          {"audio_seq_gaps", audio_seq_gaps},
+          {"audio_rms_frames", audio_rms.frames()},
+          {"audio_rms_dbfs",
+           audio_rms.empty() ? json(nullptr) : json(cue::media::dbfs_for_metric(audio_rms.dbfs()))},
           {"audio_note", audio_datagrams == 0
-                             ? "no audio in downlink: cued sends video only (DownType::Audio has no sender)"
-                             : "DownType::Audio datagrams received, but probe has no audio decoder path"},
+                             ? "no audio datagrams in downlink (upstream had no audio, or cued passthrough is off)"
+                             : (audio_decoded_frames == 0
+                                    ? "audio datagrams received but none decoded: " + audio_first_error
+                                    : "decoded")},
       };
       emit("probe.metric", metric);
       // 分位环按窗口清零：指标行是「这一秒」的读数，不是进程累计。不清零的话，
@@ -1687,13 +1712,49 @@ int main(int argc, char** argv) {
       continue;
     }
     if (h->type == static_cast<uint8_t>(cue::proto::DownType::Audio)) {
-      // 下行音频：本端**不做解码**，因为下行根本没有音频可发——
-      // cued 的 process_frame/deliver_frame 只发视频（DownType::Audio 在 cued 里从未
-      // 被赋过值），浏览器与 cue-capture 的 Opus 只走上行。给一条不存在的流写解码器，
-      // 只会让指标看起来"试过了、但解不出来"，那比不写更坏。
-      // 这里只计数并继续：真收到音频数据报时 audio_datagrams 会涨，METRICS 的
-      // audio_note 会从「下行没有音频」变成「收到了但本端不解码」，不伪造成功。
+      // 下行音频：cued 把上行 Opus 原样透传（见 apps/cued.cpp 的"音频下行"那段）。
+      // 恒单分片（20 ms 的 Opus < 16 KiB），所以这里不做重组。
       ++audio_datagrams;
+      // 帧号缺口：音频没有 NACK/FEC，丢了就是丢了，缺口数就是丢包数。
+      if (audio_have_seq && static_cast<uint32_t>(h->frame_id) == static_cast<uint32_t>(audio_last_seq + 1)) {
+        // 连续
+      } else if (audio_have_seq) {
+        const uint32_t gap = static_cast<uint32_t>(h->frame_id - audio_last_seq - 1);
+        if (gap < 0x80000000u) audio_seq_gaps += gap;  // 过滤回绕/重排
+      }
+      audio_last_seq = h->frame_id;
+      audio_have_seq = true;
+      // 会话锁定：音频可能先于视频到达，这里也维护一次（与视频同样的判据）。
+      if (session_seen == 0) session_seen = h->session_id;
+
+      if (!audio_dec.is_open() && !audio_dec_open_failed) {
+        std::string oerr;
+        if (!audio_dec.open(oerr)) {
+          audio_dec_open_failed = true;
+          if (audio_first_error.empty()) {
+            audio_first_error = oerr.substr(0, kMaxAudioErrLen);
+          }
+        }
+      }
+      if (audio_dec.is_open()) {
+        std::string derr;
+        auto aframe =
+            audio_dec.decode({buf.data() + cue::proto::kDatagramHeaderSize,
+                              static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize},
+                             derr);
+        if (!aframe) {
+          ++audio_decode_errors;
+          if (audio_first_error.empty()) {
+            audio_first_error =
+                (std::string(cue::media::audio_decode_error_name(aframe.error())) + ": " + derr)
+                    .substr(0, kMaxAudioErrLen);
+          }
+        } else {
+          ++audio_decoded_frames;
+          audio_pcm_frames += aframe->sample_count();
+          audio_rms.push(aframe->samples.data(), aframe->samples.size());
+        }
+      }
       continue;
     }
     if (h->type != static_cast<uint8_t>(cue::proto::DownType::Video)) continue;
