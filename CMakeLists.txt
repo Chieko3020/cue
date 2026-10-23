@@ -491,6 +491,15 @@ add_executable(test_audio_decoder tests/test_audio_decoder.cpp src/media/audio_d
 target_link_libraries(test_audio_decoder PRIVATE cue_capture)
 add_test(NAME audio_decoder COMMAND test_audio_decoder)
 
+# T-31：H.264 解码器的内存契约。这条测试是为一个真实事故加的——旧实现把上一张输出帧
+# 的引用留到下一次 drain 才放（而 avcodec_send_packet 在那之前就已经引用了它），于是每帧
+# 漏一整个帧缓冲：1080p ≈3.1 MB/帧，cued 与 probe 都涨到 GB 级后被 cgroup OOM 杀掉。
+# 功能断言在故障时**全部通过**（decoded 一直在涨、decode_errors 一直是 0），只有量 RSS
+# 才抓得到，这正是它存在的理由。不依赖外部样本：内嵌一张 64x64 IDR 反复解码。
+add_executable(test_h264_decoder tests/test_h264_decoder.cpp src/media/h264_decoder.cpp)
+target_link_libraries(test_h264_decoder PRIVATE cue_headers_all PkgConfig::FFMPEG)
+add_test(NAME h264_decoder COMMAND test_h264_decoder)
+
 # T-15（FR-OBS.5）：配置文件解析、命令行覆盖、行号正确性、互斥项、未知键。
 # 全是纯函数（临时文件读写，不起进程），失败信息里直接写出"期望第 N 行"。
 add_executable(test_config tests/test_config.cpp)
@@ -514,7 +523,7 @@ set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_control_channel test_tools test_delay_injector test_nack test_capture
-  test_audio_decoder test_config test_metrics)
+  test_audio_decoder test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
   target_link_libraries(${_t} PRIVATE cue_headers_all)
 endforeach()
@@ -619,7 +628,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 环境变量，包括 CUE_API_KEY。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
                      jitter_buffer control_channel tools delay_injector nack capture config metrics
-                     session_registry generator report audio_decoder)
+                     session_registry generator report audio_decoder h264_decoder)
   foreach(_t ${_cue_san_tests})
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()

@@ -51,6 +51,14 @@ void H264Decoder::close() {
 
 AVFrame* H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
   err.clear();  // 调用方常复用同一个 string：不清空会读到上一次的旧错误
+  // 上一张输出帧的引用必须在这里放掉，**不能**留到下一次 drain 里。
+  // avcodec_send_packet 内部会对「调用方仍持有的上一张输出帧」再做一次 av_frame_ref，
+  // 我们若把它留到下一轮才 unref，解码器每帧就多留一个完整帧缓冲，引用计数永远回不到 0。
+  // 泄漏量正好是一帧 YUV：1080p 约 3.1 MB/帧，实测 cued 与 cue-probe 都按这个速率
+  // 涨到 GB 级（1970 MB 的机器上 7 秒涨 666 MB），最终被 cgroup OOM 杀掉，表现为
+  // 「画面声音突然冻住、WS 断开、采集端退出」。
+  // 这里放掉是符合接口约定的：返回值只在「下次 decode 之前」有效。
+  if (last_) av_frame_unref(last_);
   if (!ctx_ || data.empty()) return nullptr;
 
   av_packet_unref(pkt_);
