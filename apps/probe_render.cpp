@@ -362,8 +362,15 @@ void Renderer::queue_audio(const int16_t* pcm, int samples) {
   // 所以上限取 800 ms（两倍于一簇，留出余量），让队列始终装得下一簇还不至于抽干；
   // 代价是音频延迟约 0.4~0.8 s——诊断用接收端完全可以接受，而周期性咔咔不能。
   // 判断依据是可观测的：如果听感仍然每 0.4 s 一咔，说明簇更长，这个值还要往上提。
-  constexpr double kUpperMs = 800.0;
-  constexpr double kPanicMs = 3000.0;
+  // 上限的取值逻辑（这一条是本轮音画同步的关键）：
+  //   下限由"音频成簇到达"决定 —— 实测一簇约 0.4 s，缓冲低于它就必然在簇间抽干，
+  //   表现为每 0.4 s 一声"咔"（这个已经用 250 ms 上限实测复现过）；
+  //   上限由"能否被视频对齐"决定 —— 视频侧只能给一个**固定**延迟，而队列深度会在
+  //   [0, 上限] 之间漂移，上限越大，能对齐的相同时段越短。之前设 800 ms 时实测深度
+  //   在 160 / 320 / 520 / 660 之间来回跳，任何固定延迟都只能偶然对上。
+  // 取 500：刚好高于一簇（不断音），又足够窄（漂移带只有 ~100 ms，可被固定延迟覆盖）。
+  constexpr double kUpperMs = 500.0;
+  constexpr double kPanicMs = 2000.0;
   const double q = double(queued_ms());
   if (q > kPanicMs) {
     SDL_ClearQueuedAudio(impl_->adev);
