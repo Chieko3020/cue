@@ -104,6 +104,8 @@ inline void probe_close_socket(probe_socket_t fd) { ::close(fd); }
 #include "cue/media/audio_decoder.h"
 #include "cue/media/audio_rms.h"
 #include "cue/media/h264_decoder.h"
+
+#include "probe_render.h"
 #include "cue/media/jitter_buffer.h"
 #include "cue/proto/nack.h"
 #include "cue/proto/wire.h"
@@ -668,6 +670,10 @@ int main(int argc, char** argv) {
   // 抖动估计的基准：first（默认，首片到达）| done（组装完成，本改动前行为）。
   // 留 done 是为了能 A/B 量化"帧在途耗时污染抖动估计"的幅度。
   std::string jitter_basis = "first";
+  // 渲染/播放（"能看能听"）：默认关。开着才需要 SDL2，无头环境不受影响。
+  bool render_enabled = false;
+  int render_w = 0;
+  int render_h = 0;
   // 标称帧率只用于「卡顿阈值」的推断（阈值 = stall_factor × 1/fps），不是测量值。
   // 30 是这个项目的默认推流帧率（cued 的 --fps 默认 30）。
   long long nominal_fps = 30;
@@ -740,6 +746,16 @@ int main(int argc, char** argv) {
     } else if (a == "--nack-delay-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 5000, nack_delay_ms)) bad(a, val);
+    } else if (a == "--render") {
+      render_enabled = true;
+    } else if (a == "--render-size") {
+      const auto val = next();
+      int rw = 0, rh = 0;
+      if (std::sscanf(std::string(val).c_str(), "%dx%d", &rw, &rh) != 2 || rw <= 0 || rh <= 0) {
+        bad(a, val);
+      }
+      render_w = rw;
+      render_h = rh;
     } else if (a == "--jitter-basis") {
       const auto val = next();
       if (val != "first" && val != "done") bad(a, val);
@@ -1052,6 +1068,22 @@ int main(int argc, char** argv) {
 #endif
   };
 
+  // 渲染器必须声明在 decode_one **之前**：解码出帧的那一刻就要上屏——AVFrame* 是
+  // 借用指针，下次 decode 就失效，攒着延后画只会画出旧帧或垃圾。
+  // 渲染器：--render 才打开。打不开不致命（降级成"只算指标"），但要打出原因，
+  // 否则"窗口没出现"会被误读成程序没跑。
+  cue::probe::Renderer renderer;
+  if (render_enabled) {
+    cue::probe::RenderConfig rcfg;
+    rcfg.width = render_w;
+    rcfg.height = render_h;
+    std::string rerr;
+    if (!renderer.open(rcfg, rerr)) {
+      std::fprintf(stderr, "[probe] --render 打开失败，降级为只算指标：%s\n", rerr.c_str());
+      emit("probe.render_failed", json{{"error", rerr}, {"backend", cue::probe::Renderer::backend_name()}});
+    }
+  }
+
   // 一帧解码：补参数集 → 喂解码器 → 记耗时与失败计数。
   // 只借用 FrameAcc 的三个元信息（pts / codec / frag_count），不拷整帧分片：
   // 每帧都拷一遍分片向量，在 720p 关键帧上就是每帧几百 KB 的无谓分配。
@@ -1111,6 +1143,8 @@ int main(int argc, char** argv) {
       ++fs.decoded;
       dec.params_ready = true;
       dec.fail_streak = 0;
+      // 借用指针只在下次 decode 前有效，所以必须在这里立刻上屏（不能存起来延后画）。
+      if (render_enabled) renderer.draw_yuv(out);
     } else if (!derr.empty()) {
       ++fs.decode_errors;
       ++dec.fail_streak;
@@ -1296,6 +1330,12 @@ int main(int argc, char** argv) {
 
   std::array<uint8_t, 4096> buf{};
   for (;;) {
+    // 窗口事件在循环顶部 pump：poll 的超时是 200 ms，所以最坏 200 ms 响应一次关闭/ESC。
+    // 用户关了窗口就退出——留着一个看不见的进程继续收流只会让人以为"程序卡住了"。
+    if (render_enabled && !renderer.pump_events()) {
+      std::fprintf(stderr, "[probe] 窗口已关闭，退出\n");
+      return 0;
+    }
     // ---- 周期任务放在循环顶部：FEC 分支 / 完全没包时都不会被跳过 ----
     const int64_t now_tick = cue::now_us();
     // 抖动缓冲的到期帧先放行：后面的周期任务（清理/窗口/指标行）这一拍就该看到它们，
@@ -1753,6 +1793,9 @@ int main(int argc, char** argv) {
           ++audio_decoded_frames;
           audio_pcm_frames += aframe->sample_count();
           audio_rms.push(aframe->samples.data(), aframe->samples.size());
+          if (render_enabled) {
+            renderer.queue_audio(aframe->samples.data(), static_cast<int>(aframe->sample_count()));
+          }
         }
       }
       continue;

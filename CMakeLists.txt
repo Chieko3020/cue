@@ -197,11 +197,28 @@ target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 # cued 与 probe 两侧的行为必须一致，否则两边的"解码耗时"没法对照。
 # 音频解码器现在是 probe 的真依赖（下行有音频了，见 apps/cued.cpp 的"音频下行"），
 # 所以连 audio_decoder.cpp 与 opus 一起链进来——之前 probe 不解音频，链接里没有这些。
-add_executable(cue-probe apps/cue-probe.cpp src/media/h264_decoder.cpp
+# 渲染/播放（"能看能听"）：SDL2 是**可选**依赖。无头环境（CI、服务器）没有它，
+# probe 照常工作，只是 --render 在运行期明确报错。
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(SDL2 QUIET sdl2)
+endif()
+if(SDL2_FOUND)
+  message(STATUS "SDL2 ${SDL2_VERSION}：probe 支持 --render（窗口 + 音频）")
+else()
+  message(STATUS "SDL2 未找到：probe 的 --render 不可用（只算指标）")
+endif()
+
+add_executable(cue-probe apps/cue-probe.cpp apps/probe_render.cpp src/media/h264_decoder.cpp
   src/media/audio_decoder.cpp
   src/media/jitter_buffer.cpp)
 target_link_libraries(cue-probe PRIVATE cue_proto cue_headers_all Threads::Threads
   PkgConfig::FFMPEG PkgConfig::OPUS)
+if(SDL2_FOUND)
+  target_compile_definitions(cue-probe PRIVATE CUE_HAVE_SDL2=1)
+  target_include_directories(cue-probe PRIVATE ${SDL2_INCLUDE_DIRS})
+  target_link_libraries(cue-probe PRIVATE ${SDL2_LIBRARIES})
+endif()
 target_compile_options(cue-probe PRIVATE -Wno-deprecated-declarations)
 
 # ---- 采集端（T-11 / FR-CAP.1–6）----
