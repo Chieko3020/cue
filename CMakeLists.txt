@@ -574,9 +574,36 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # "ASan runtime does not come first"，也不会被 ASan 的 shadow 映射撞坏 RLIMIT_AS。
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
-  foreach(_t wire agent session context eval state compare console cassette probe sandbox
-            jitter_buffer
-            control_channel tools delay_injector nack capture config metrics)
+  set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
+                     jitter_buffer control_channel tools delay_injector nack capture config metrics
+                     session_registry generator report audio_decoder)
+  foreach(_t ${_cue_san_tests})
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
+
+  # 守卫：这份名单必须覆盖**所有**测试。
+  # 漏一个的话，它只会在 CI 的 ASan job 里以 "ASan runtime does not come first
+  # in initial library list" 失败——因为本机 /etc/ld.so.preload 预加载了 libonion，
+  # 而本地开发通常不跑 ASan 构建，所以这个坑每次都由 CI 来发现（已经发生两次：
+  # 第一次是 sandbox，第二次是 session_registry / generator / report / audio_decoder）。
+  # 与其靠记性，不如让 configure 直接报错。
+  # 豁免：不是 C++ 二进制，不加载 sanitizer 运行时，LD_PRELOAD 对它们没意义。
+  #   layer_isolation 是 cmake -P 脚本测试；no_external_cdn 是 Python 脚本。
+  set(_cue_san_exempt layer_isolation no_external_cdn)
+  get_property(_cue_all_tests DIRECTORY PROPERTY TESTS)
+  set(_cue_missing "")
+  foreach(_t ${_cue_all_tests})
+    if(_t IN_LIST _cue_san_exempt)
+      continue()
+    endif()
+    if(NOT _t IN_LIST _cue_san_tests)
+      list(APPEND _cue_missing ${_t})
+    endif()
+  endforeach()
+  if(_cue_missing)
+    message(FATAL_ERROR
+      "sanitizer 环境名单漏了这些测试：${_cue_missing}\n"
+      "把它们加进上面 set(_cue_san_tests ...)：否则它们只会在 CI 的 ASan job 里"
+      "以「ASan runtime does not come first」失败（本地看不出来）。")
+  endif()
 endif()
