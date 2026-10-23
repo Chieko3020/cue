@@ -140,6 +140,45 @@ bool parse_double(std::string_view s, double& out) {
 
 // ---------------------------------------------------------------- 选项
 
+// 编码参数这一组默认值的取舍，全部来自"实时 + 丢包后能自愈"这两个约束。
+//
+// 注意：x264 参数的**拼装**不在本文件——进程内编码在 src/media/encoder.cpp
+// （X264Encoder::open），子进程编码在 include/cue/media/ffmpeg_args.h
+// （build_ffmpeg_argv）。本文件只决定"喂给它们什么"。下面每条结论都经过实测
+// （ffmpeg 6.1 + libx264 164，看码流里 x264 写的 SEI options 行）：
+//
+// · deblock/cabac 是 preset 决定的，不是可选的画质旋钮。ultrafast 会同时把
+//   deblock=0:0:0、cabac=0、8x8dct=0、aq=0、mbtree=0、analyse=0:0、subme=0 全关掉。
+//   去块滤波是压制宏块边界的**唯一**工具，关掉之后平坦渐变区（testsrc2 的背景
+//   正是）会露出整片 16×16 方块网格——就是那个"块状棋盘"。这不是码率不够：
+//   给 ultrafast 更多码率只会把方块内部做得更准，方块边界照样跳变。所以本工具
+//   在参数解析阶段就拒绝 ultrafast（见 check_preset），可用下限是 veryfast
+//   （deblock/cabac/aq 都还在）。CPU 有余量时往上走 faster/medium：ref/subme/
+//   trellis 提高，同码率下画质更好，代价是单帧编码耗时与端到端延迟。
+//
+// · B 帧：两条路径都已经是 0，这里不需要额外设置。进程内是 encoder.cpp 的
+//   i_bframe=0 + tune=zerolatency；子进程是 ffmpeg 侧 max_b_frames 默认为 0 再加
+//   -tune zerolatency（实测：medium 默认 bframes=3，加 zerolatency 后 0）。
+//   代价是码率效率——B 帧在同质量下通常省 10~20% 码率，关掉后同码率画质略降。
+//   换到的是不引入重排延迟：低延迟链路上这笔交易是确定的。
+//   （tune=zerolatency 同时把 rc_lookahead/sync_lookahead 归零、mbtree 关掉，
+//     实测 mbtree 1→0、bframes 3→0；sliced_threads=1 在 threads=1 时无实际影响。）
+//
+// · GOP：keyint 就是"丢一帧之后最多多久能自愈"。接收端丢包后必须等下一个自带
+//   SPS/PPS 的 IDR 才能恢复，最坏情况是整整一个 GOP 的花屏。30 fps 下 gop=30 →
+//   最坏 1 s，gop=60 → 2 s，x264 默认的 250 → 8 s（实时链路里等于"丢了就废了"）。
+//   代价是 IDR 变密、同码率画质略降（1 s GOP 的 IDR 开销在 640×360/1.2 Mbps 上
+//   约占 10~20% 码率）。实时优先，所以默认 30。
+//
+// · repeat-headers（每个 IDR 自带 SPS/PPS）是上面"自愈"成立的前提：下行一旦丢掉
+//   开头的 CodecConfig，接收端会对**每一帧**都回 -1094995529（AVERROR_INVALIDDATA）
+//   且永不恢复，画面永久冻住。这一项在两条路径上目前都**是开的**，但依据不同：
+//   子进程路径靠 ffmpeg_args.h 的 -x264-params（实测 -f h264 裸流每帧前都有
+//   SPS PPS：SPS PPS SEI IDR / SPS PPS IDR / …），进程内路径靠 libx264 的
+//   b_repeat_headers 默认值（x264 之所以默认重发，是因为容器侧要它显式关掉才行）。
+//   **注意 x264 的参数名是 repeat-headers（短横线）**，写成 repeat_headers 会被
+//   静默忽略——ffmpeg_args.h 里目前就是下划线写法，靠默认值兜住了。这也说明
+//   "参数写了"不等于"参数生效"：这一条必须靠看码流验证，不能靠读命令行。
 struct Options {
   std::string backend = "lavfi";  // lavfi | ffmpeg | v4l2
   std::string ws_url = "ws://127.0.0.1:9000/";
@@ -147,8 +186,14 @@ struct Options {
   int height = 360;
   int fps = 30;
   int bitrate_kbps = 1200;
-  int gop = 60;
+  int gop = 30;
   std::string preset = "veryfast";
+  // x264 编码线程数。0 = 交给 x264 自己按核数决定（原来的实现把它写死成 1，
+  // 在 1080p 上实测 encode p50 29.5 ms —— 33 ms 的帧预算只剩 10%，采集端直接
+  // 掉到 28 fps，而这台机器上整条链路总共只用了 9% 的 CPU。
+  // 低延迟不靠"少开线程"保证：tune=zerolatency 会把一帧切成多 slice 并行编，
+  // 线程多不会引入帧级排队。真要在小机器上让路，显式传 --threads 1 即可。
+  int threads = 0;
   std::string device = "/dev/video0";
   std::string audio_device;  // 空 = 同 device（dshow/avfoundation 的设备名）
   double duration_s = 0.0;   // 0 = 无限
@@ -172,8 +217,9 @@ void print_usage() {
       "  --size WxH                    采集/编码尺寸（默认 640x360）\n"
       "  --fps N                       帧率（默认 30）\n"
       "  --bitrate N                   视频码率 kbps（默认 1200）\n"
-      "  --gop N                       GOP 帧数（默认 60）\n"
-      "  --preset X                    x264 preset（默认 veryfast）\n"
+      "  --gop N                       GOP 帧数（默认 30：30 fps 下最坏 1 s 自愈；见源码注释）\n"
+      "  --preset X                    x264 preset（默认 veryfast；ultrafast 被拒绝，见源码注释）\n"
+      "  --threads N                   x264 编码线程数（默认 0 = 按核数自动；小机器可显式压到 1）\n"
       "  --device NAME                 v4l2 设备路径（默认 /dev/video0）/ dshow 设备名 /\n"
       "                                avfoundation 索引（如 0 或 0:1）\n"
       "  --audio-device NAME           dshow/avfoundation 音频设备（默认同 --device）\n"
@@ -189,6 +235,44 @@ void print_usage() {
       "\n"
       "每条统计按秒打到 stdout（JSON 行，前缀 CAPTURE）：capture_fps / frames_in / frames_out /\n"
       "dropped / encode_ms_p50 / encode_ms_p99 / bytes_sent / audio_frames_out / audio_bytes_sent\n");
+}
+
+// x264 的十档 preset。白名单挡的是拼写错误：拼错的档位在进程内只是
+// x264_param_default_preset 返回失败、在子进程只是 ffmpeg 起不来，两种都比在
+// 参数解析阶段直接报错难查（用户看到的会是"编码器打不开"而不是"参数写错了"）。
+constexpr std::string_view kX264Presets[] = {
+    "ultrafast", "superfast", "veryfast", "faster", "fast",
+    "medium",    "slow",      "slower",   "veryslow", "placebo"};
+
+// 为什么把 ultrafast 直接判成参数错误，而不是"警告一下继续跑"。
+// 本工具存在的意义是产出一条**有代表性的**上行流给 cued/probe 做链路验证；
+// ultrafast 产出的画面不是这条链路的画面，而是"没开去块滤波的 x264"的画面。
+// 实测（ffmpeg 6.1 + libx264 164）ultrafast 会同时关掉 deblock=0:0:0、cabac=0、
+// 8x8dct=0、aq=0、mbtree=0、analyse=0:0、subme=0；平坦渐变区因此整片 16×16 方块
+// 网格跳变，看起来就是"块状棋盘"。给更多码率也没用——方块内部的梯度会更准，
+// 方块边界照样跳变。要压 CPU 请改 cued 侧的 --preset（转码链有自己的降级语义），
+// 不要把采集端的画面质量当成 CPU 旋钮。
+bool check_preset(std::string_view preset, std::string& err) {
+  bool known = false;
+  for (const auto p : kX264Presets) {
+    if (p == preset) {
+      known = true;
+      break;
+    }
+  }
+  if (!known) {
+    err = "--preset 不是 x264 的档位：" + std::string(preset) +
+          "（可选 ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow/placebo）";
+    return false;
+  }
+  if (preset == "ultrafast") {
+    err = "--preset ultrafast 被拒绝：它关掉 deblock/cabac/aq/mbtree 与全部分区"
+          "（实测 deblock=0:0:0 cabac=0 aq=0 analyse=0:0 subme=0），去块滤波一关，"
+          "平坦渐变区就会露出 16×16 方块网格（块状棋盘）。可用下限是 veryfast；"
+          "要压 CPU 请调 cued 侧的 --preset。";
+    return false;
+  }
+  return true;
 }
 
 bool parse_options(int argc, char** argv, Options& o, std::string& err) {
@@ -233,7 +317,12 @@ bool parse_options(int argc, char** argv, Options& o, std::string& err) {
     } else if (a == "--preset") {
       auto v = next(i, "--preset");
       if (!v) return false;
+      if (!check_preset(*v, err)) return false;
       o.preset = std::string(*v);
+    } else if (a == "--threads") {
+      auto v = next(i, "--threads");
+      if (!v) return false;
+      o.threads = std::clamp(std::atoi(std::string(*v).c_str()), 0, 64);
     } else if (a == "--device") {
       auto v = next(i, "--device");
       if (!v) return false;
@@ -1555,6 +1644,14 @@ int run(const Options& o) {
            o.encode.c_str(), o.width, o.height, o.fps, o.bitrate_kbps, o.gop, o.preset.c_str(),
            cue::media::avc_level_name(level_idc).c_str());
 
+  // superfast 不拒绝（它的 deblock/cabac/aq 都还开着，实测 deblock=1:0:0 cabac=1 aq=1），
+  // 但 analyse=0x3:0x3 + me=dia + subme=1 + mbtree=0 仍然把码率效率压得很低：同码率下
+  // 比 veryfast 更容易在平坦区看到块效应。留一行，免得把它当成"和 veryfast 差不多"。
+  if (o.preset == "superfast") {
+    log_line("preset=superfast 低于建议下限 veryfast（分区/运动搜索/子像素都降级、mbtree 关），"
+             "同码率画质会明显差一档；只有这台机器跑不动 veryfast 时才用它");
+  }
+
   // 连接重试：demo-min 里 cued 比采集端早 0.3 s 起，但启动顺序不是契约。
   {
     const int64_t deadline = cue::now_us() + 5'000'000;
@@ -1574,7 +1671,7 @@ int run(const Options& o) {
   X264Encoder encoder;
   if (inproc) {
     std::string eerr;
-    if (!encoder.open(o.width, o.height, o.bitrate_kbps, o.fps, o.gop, o.preset, eerr, 1,
+    if (!encoder.open(o.width, o.height, o.bitrate_kbps, o.fps, o.gop, o.preset, eerr, o.threads,
                       level_idc)) {
       log_line("x264 打开失败：%s", eerr.c_str());
       return 1;

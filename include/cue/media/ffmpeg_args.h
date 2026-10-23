@@ -125,10 +125,16 @@ inline std::vector<std::string> build_ffmpeg_argv(const FfmpegArgsSpec& s) {
         a.push_back(avc_level_name(s.level_idc));
       }
       // aud=1：每个访问单元以 AUD(9) 开头，采集端据此分帧（AnnexBAuAssembler 的唯一判据）
-      // repeat_headers=1：每个 IDR 前重发 SPS/PPS，cued 重启/新连接后不必等下一次参数集
+      // repeat-headers=1：每个 IDR 前重发 SPS/PPS。**这是丢包后能否自愈的唯一依赖**：
+      //   接收端一旦错过参数集，就再也解不出任何一帧（实测：probe 每帧报
+      //   send_packet failed: -1094995529，画面永久冻住）。有了它，最坏也只需等到
+      //   下一个 IDR（由 -g 决定，默认 30 → 1 秒）就能恢复。
+      //   注意拼写：x264 只认 `repeat-headers`（短横线）。写成 `repeat_headers`
+      //   **不会报错、会被静默忽略**，看起来"已经开了"，实际生效的是 x264 默认值——
+      //   把这种关键能力建立在别人的默认值上，等于靠运气。
       // scenecut=0：GOP 严格按 -g 走，probe 侧的"关键帧间隔"才可预测
       a.push_back("-x264-params");
-      a.push_back("aud=1:repeat_headers=1:scenecut=0");
+      a.push_back("aud=1:repeat-headers=1:scenecut=0");
       a.push_back("-f");
       a.push_back("h264");
     } else {

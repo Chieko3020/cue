@@ -82,10 +82,22 @@ bool X264Encoder::open(int w, int h, int bitrate_kbps, int fps, int gop, std::st
   im.param.i_keyint_max = gop > 0 ? gop : 60;
   im.param.i_keyint_min = 1;
   im.param.b_annexb = 1;  // 输出 Annex-B，与上行协议一致
-  im.param.i_threads = threads > 0 ? threads : 1;  // 2 vCPU 默认 1：给解码与网络留核
+  // 0 = 让 x264 按核数自动决定。这里原来是写死的 1，注释理由是「2 vCPU 留核给
+  // 解码与网络」——但在 1080p 上实测单线程 encode p50 29.5 ms，帧预算 33 ms 只剩
+  // 10%，采集端直接掉到 28 fps；而整条链路总共只占 9% CPU，留核留在了一个不需要
+  // 的地方。低延迟不靠少开线程：tune=zerolatency 会按 slice 并行编，不引入帧级排队。
+  im.param.i_threads = threads > 0 ? threads : 0;
   im.param.b_vfr_input = 0;
   im.param.rc.i_lookahead = 0;
   im.param.i_bframe = 0;
+  // 下面两条把「丢包后能自愈」和「GOP 可预测」从"依赖 x264 默认值"变成契约。
+  // b_repeat_headers：每个 IDR 前重发 SPS/PPS。libx264 的默认值确实是 1，但接收端
+  //   一旦错过参数集就**永久**解不出画面（实测 probe 每帧 AVERROR_INVALIDDATA），
+  //   这种关键能力不该建立在第三方库的默认值上——库升级改默认值，故障是静默的。
+  // i_scenecut_threshold=0：不关的话关键帧由场景切换额外插入，-g 只是上限，
+  //   probe 侧按"关键帧间隔"做的对照（恢复时间、GOP 抖动）就不可复现。
+  im.param.b_repeat_headers = 1;
+  im.param.i_scenecut_threshold = 0;
   // VBV（1 s 缓冲）：ABR 不禁突发，与「低延迟 + 10 Mbps 令牌桶」的实时语义不符。
   // 开了 VBV 之后码率在 1 s 窗口内可控，下游令牌桶才有意义（review #33）。
   const int kbps = im.param.rc.i_bitrate;

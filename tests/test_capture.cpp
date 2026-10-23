@@ -479,7 +479,10 @@ void test_ffmpeg_args() {
     check(line.find("-g 60") != std::string::npos, "child encode: gop");
     check(line.find("-tune zerolatency") != std::string::npos, "child encode: zerolatency");
     check(line.find("aud=1") != std::string::npos, "child encode: aud=1");
-    check(line.find("repeat_headers=1") != std::string::npos, "child encode: repeat headers");
+    // 断言的是**短横线**写法：x264 只认 `repeat-headers`，写成下划线会被静默忽略，
+    // 而"每个 IDR 自带 SPS/PPS"是丢包后能自愈的关键依赖，不能靠默认值。
+    check(line.find("repeat-headers=1") != std::string::npos,
+          "child encode: repeat headers（短横线，x264 才认）");
     check(line.find("-level 3.0") != std::string::npos, "child encode: -level 3.0");
     check(line.find("-f h264") != std::string::npos, "child encode: h264 elementary stream");
   }
