@@ -30,21 +30,75 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <poll.h>
+#endif
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#if !defined(_WIN32)
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 extern "C" {
 #include <libavutil/frame.h>
 }
+
+// ---------------------------------------------------------------- 平台包装
+//
+// probe 只用两件 POSIX 设施：poll 与 close(fd)。Windows 的同义物是 WSAPoll 与
+// closesocket，且两者的结构体名/参数类型都不同，所以在这里各收一个薄包装，
+// 而不是在调用点撒 #ifdef（六处 poll + 四处 close，很容易漏一处）。
+#if defined(_WIN32)
+using probe_pollfd = WSAPOLLFD;
+// Windows 的 SOCKET 是 UINT_PTR（64 位），用 int 装会截断句柄。
+using probe_socket_t = SOCKET;
+constexpr int kProbeSendFlags = 0;  // MSG_NOSIGNAL 是 Linux 的；Windows 的 send 不产生 SIGPIPE
+constexpr probe_socket_t kProbeInvalidSocket = INVALID_SOCKET;
+// 用 select 而不是 WSAPoll：实测 WSAPoll 对 UDP 的 POLLIN 在本机不触发
+// （bind 成功、发包端用 PowerShell 的 UdpClient 对照能收到，但 probe 的 pkts 恒 0、
+// 且不报任何错）。select 是 winsock 上最老的接口，语义与 POSIX 一致。
+inline int probe_poll(probe_pollfd* fds, std::size_t n, int timeout_ms) {
+  fd_set rs;
+  FD_ZERO(&rs);
+  probe_socket_t maxfd = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if ((fds[i].events & POLLIN) != 0) {
+      FD_SET(fds[i].fd, &rs);
+      if (fds[i].fd > maxfd) maxfd = fds[i].fd;
+    }
+  }
+  timeval tv{};
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  const int r = ::select(static_cast<int>(maxfd + 1), &rs, nullptr, nullptr, &tv);
+  if (r > 0) {
+    for (std::size_t i = 0; i < n; ++i) {
+      fds[i].revents = FD_ISSET(fds[i].fd, &rs) ? POLLIN : 0;
+    }
+  }
+  return r;
+}
+inline void probe_close_socket(probe_socket_t fd) { ::closesocket(fd); }
+#else
+using probe_pollfd = struct pollfd;
+inline int probe_poll(probe_pollfd* fds, std::size_t n, int timeout_ms) {
+  return ::poll(fds, static_cast<nfds_t>(n), timeout_ms);
+}
+using probe_socket_t = int;
+constexpr int kProbeSendFlags = MSG_NOSIGNAL;
+constexpr probe_socket_t kProbeInvalidSocket = -1;
+inline void probe_close_socket(probe_socket_t fd) { ::close(fd); }
+#endif
 
 #include "cue/common/clock.h"
 #include "cue/media/h264_decoder.h"
@@ -413,7 +467,7 @@ class TcpReporters {
   }
   ~TcpReporters() {
     for (auto& s : sinks_) {
-      if (s.fd >= 0) ::close(s.fd);
+      if (s.fd != kProbeInvalidSocket) probe_close_socket(s.fd);
     }
   }
   TcpReporters(const TcpReporters&) = delete;
@@ -426,19 +480,20 @@ class TcpReporters {
     std::vector<std::string> fresh;
     for (auto& s : sinks_) {
       if (s.up) continue;
-      if (s.fd < 0) {
+      if (s.fd == kProbeInvalidSocket) {
         if (now_us < s.next_try_us) continue;
         if (!begin_connect(s, now_us)) continue;
         if (s.up) fresh.push_back(s.host + ":" + std::to_string(s.port));
         continue;
       }
       // 连接进行中：用 poll(0) 看它是否已经完成
-      pollfd pfd{s.fd, POLLOUT, 0};
-      const int pr = ::poll(&pfd, 1, 0);
+      probe_pollfd pfd{static_cast<decltype(probe_pollfd::fd)>(s.fd), POLLOUT, 0};
+      const int pr = probe_poll(&pfd, 1, 0);
       if (pr <= 0) continue;
       int soerr = 0;
       socklen_t len = sizeof(soerr);
-      if (::getsockopt(s.fd, SOL_SOCKET, SO_ERROR, &soerr, &len) != 0 || soerr != 0) {
+      if (::getsockopt(s.fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &len) != 0 ||
+          soerr != 0) {
         drop(s, now_us);
         continue;
       }
@@ -456,7 +511,7 @@ class TcpReporters {
         continue;
       }
       // MSG_NOSIGNAL：对端关闭时不能把整个 probe 用 SIGPIPE 打死
-      const ssize_t n = ::send(s.fd, line.data(), line.size(), MSG_NOSIGNAL);
+      const auto n = ::send(s.fd, line.data(), static_cast<int>(line.size()), kProbeSendFlags);
       if (n != static_cast<ssize_t>(line.size())) {
         ++s.dropped;
         drop(s, now_us);
@@ -481,7 +536,7 @@ class TcpReporters {
   struct Sink {
     std::string host;
     uint16_t port = 0;
-    int fd = -1;
+    probe_socket_t fd = kProbeInvalidSocket;
     bool up = false;
     int64_t next_try_us = 0;
     uint64_t sent = 0;
@@ -499,8 +554,16 @@ class TcpReporters {
       s.next_try_us = now_us + kRetryUs;  // 解析不了就按域名失败处理，节流重试
       return false;
     }
-    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
+#if defined(_WIN32)
+    const probe_socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd != INVALID_SOCKET) {
+      u_long nb = 1;
+      ::ioctlsocket(fd, FIONBIO, &nb);  // Windows 没有 SOCK_NONBLOCK，要单独设
+    }
+#else
+    const probe_socket_t fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#endif
+    if (fd == kProbeInvalidSocket) {
       s.next_try_us = now_us + kRetryUs;
       return false;
     }
@@ -511,21 +574,22 @@ class TcpReporters {
       return true;
     }
     if (errno != EINPROGRESS) {
-      ::close(fd);
+      probe_close_socket(fd);
       s.next_try_us = now_us + kRetryUs;
       return false;
     }
     // 给一点时间再判定：回环上通常立刻完成，跨机要等 SYN-ACK
     pollfd pfd{fd, POLLOUT, 0};
-    if (::poll(&pfd, 1, static_cast<int>(kConnectBudgetUs / 1000)) > 0) {
+    if (probe_poll(&pfd, 1, static_cast<int>(kConnectBudgetUs / 1000)) > 0) {
       int soerr = 0;
       socklen_t len = sizeof(soerr);
-      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) == 0 && soerr == 0) {
+      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &len) == 0 &&
+          soerr == 0) {
         s.fd = fd;
         s.up = true;
         return true;
       }
-      ::close(fd);
+      probe_close_socket(fd);
       s.next_try_us = now_us + kRetryUs;
       return false;
     }
@@ -534,7 +598,7 @@ class TcpReporters {
   }
 
   void drop(Sink& s, int64_t now_us) {
-    if (s.fd >= 0) ::close(s.fd);
+    if (s.fd != kProbeInvalidSocket) probe_close_socket(s.fd);
     s.fd = -1;
     s.up = false;
     s.next_try_us = now_us + kRetryUs;
@@ -725,6 +789,38 @@ int main(int argc, char** argv) {
   jb_cfg.basis = (jitter_basis == "done") ? cue::media::JitterBasis::AssemblyDone
                                           : cue::media::JitterBasis::FirstFragment;  // 0 = 不联动（只有 budget 生效）
 
+#if defined(_WIN32)
+  // Windows 分支**不用 Boost.Asio 的 socket**：Asio 在 Windows 上会把 socket 关联到
+  // IOCP，而 WSAPoll 是 select 语义，两者冲突时 poll 永远不触发。实测症状很隐蔽——
+  // bind 成功、发包端确实发了（用 PowerShell 的 UdpClient 对照能收到），但 probe 的
+  // pkts 恒 0、且不报任何错。所以这里直接用原生 winsock 句柄。
+  const probe_socket_t udp_fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (udp_fd == kProbeInvalidSocket) {
+    std::fprintf(stderr, "[probe] socket() 失败: %d\n", ::WSAGetLastError());
+    return 1;
+  }
+  sockaddr_in baddr{};
+  baddr.sin_family = AF_INET;
+  baddr.sin_port = htons(static_cast<u_short>(port));
+  if (::inet_pton(AF_INET, bind_host.c_str(), &baddr.sin_addr) != 1) {
+    std::fprintf(stderr, "[probe] --bind 地址非法: %s\n", bind_host.c_str());
+    return 2;
+  }
+  if (::bind(udp_fd, reinterpret_cast<sockaddr*>(&baddr), sizeof(baddr)) != 0) {
+    std::fprintf(stderr, "[probe] bind %s:%u failed: %d\n", bind_host.c_str(), port,
+                 ::WSAGetLastError());
+    return 1;
+  }
+  {
+    // 配 CUE_PROBE_NOPOLL 诊断用：没有 poll 时 recvfrom 靠这个超时返回
+    int rcvto = 200;
+    ::setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&rcvto),
+                 static_cast<int>(sizeof(rcvto)));
+    int rcvbuf = 4 * 1024 * 1024;
+    ::setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&rcvbuf),
+                 static_cast<int>(sizeof(rcvbuf)));
+  }
+#else
   net::io_context ioc;
   boost::system::error_code ec;
   udp::socket sock(ioc);
@@ -743,19 +839,20 @@ int main(int argc, char** argv) {
     return 1;
   }
   sock.set_option(udp::socket::receive_buffer_size(4 * 1024 * 1024), ec);
+  const probe_socket_t udp_fd = static_cast<probe_socket_t>(sock.native_handle());
+#endif
   // SO_TIMESTAMP：让内核在数据报上打到达时间戳，recv 段（到达 → 被读出）才有意义。
   // 没有它就只能测到 poll 之后的时间（恒 ≈0），那等于没测；取不到时间戳时宁可
   // 记 recv_ts_missing 并让该段无样本，也不写一个假的 0。
+#if !defined(_WIN32)
   {
     const int on = 1;
-    const int fd = sock.native_handle();
-    if (::setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on)) != 0) {
+    if (::setsockopt(udp_fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on)) != 0) {
       std::fprintf(stderr, "[probe] SO_TIMESTAMP 打开失败（recv 段将无样本）：%s\n",
                    std::strerror(errno));
     }
   }
-  const int udp_fd = sock.native_handle();
-
+#endif
   std::fprintf(stderr, "[probe] listening udp %s:%u\n", bind_host.c_str(), port);
 
   TcpReporters reporters(report_addrs);
@@ -893,6 +990,28 @@ int main(int argc, char** argv) {
   // 用两者的差把到达时刻换到单调时钟域（样本间隔微秒级，误差可忽略）。
   auto recv_timed = [&](uint8_t* buf, std::size_t cap, sockaddr_in& from,
                         int64_t& recv_us_out) -> ssize_t {
+#if defined(_WIN32)
+    // Windows 没有 SO_TIMESTAMP（内核打戳是 Linux/BSD 的设施），也没有 recvmsg 的
+    // 控制消息——拿不到「数据报到达内核的时刻」，recv 段就**如实给 -1（无样本）**，
+    // 而不是用"读出的时刻"冒充到达时刻（那会把 recv 段恒算成 0，等于伪造）。
+    // 地址长度必须传有效指针：Windows 的 recvfrom 对 nullptr 返回 WSAEFAULT(10014)，
+    // 而 POSIX 允许 nullptr。这个差异只在实机跑起来才暴露（编译期完全看不出来）。
+    int from_len = static_cast<int>(sizeof(from));
+    const int wn = ::recvfrom(udp_fd, reinterpret_cast<char*>(buf),
+                              static_cast<int>(cap), 0,
+                              reinterpret_cast<sockaddr*>(&from), &from_len);
+    // CUE_PROBE_TRACE=1 时打前几条：Windows 上 recvfrom 的失败码（如 WSAEFAULT 10014）
+    // 不会体现在任何指标里，只能靠它定位。
+    if (const char* tr = std::getenv("CUE_PROBE_TRACE"); tr != nullptr && *tr != '\0') {
+      static int n_tr = 0;
+      if (n_tr++ < 5) {
+        std::fprintf(stderr, "[trace] recvfrom n=%d err=%d sock=%lld\n", wn, ::WSAGetLastError(),
+                     static_cast<long long>(udp_fd));
+      }
+    }
+    recv_us_out = -1;
+    return static_cast<ssize_t>(wn);
+#else
     timespec rt0{};
     ::clock_gettime(CLOCK_REALTIME, &rt0);
     const int64_t mono0 = cue::now_us();
@@ -928,6 +1047,7 @@ int main(int argc, char** argv) {
     recv_us_out = mono1 - arrival_mono;
     if (recv_us_out < 0 || recv_us_out > 1'000'000) recv_us_out = -1;  // 时钟跳变当噪声丢掉
     return n;
+#endif
   };
 
   // 一帧解码：补参数集 → 喂解码器 → 记耗时与失败计数。
@@ -1105,7 +1225,8 @@ int main(int argc, char** argv) {
   // SPEC §7.1 的时钟对齐：向 cued 发下行回环请求（载荷 = 我方发戳）
   auto send_udp = [&](const std::vector<uint8_t>& pkt) {
     if (!have_peer) return false;
-    return ::sendto(udp_fd, pkt.data(), pkt.size(), 0, reinterpret_cast<const sockaddr*>(&peer),
+    return ::sendto(udp_fd, reinterpret_cast<const char*>(pkt.data()), static_cast<int>(pkt.size()), 0,
+                    reinterpret_cast<const sockaddr*>(&peer),
                     sizeof(peer)) == static_cast<ssize_t>(pkt.size());
   };
   auto send_stats_request = [&](int64_t now) {
@@ -1378,8 +1499,15 @@ int main(int argc, char** argv) {
       const int64_t wait_us = deadline - cue::now_us();
       poll_timeout_ms = static_cast<int>(std::clamp<int64_t>(wait_us / 1000, 0, 200));
     }
-    pollfd pfd{udp_fd, POLLIN, 0};
-    const int pr = ::poll(&pfd, 1, poll_timeout_ms);
+    probe_pollfd pfd{static_cast<decltype(probe_pollfd::fd)>(udp_fd), POLLIN, 0};
+    const int pr = probe_poll(&pfd, 1, poll_timeout_ms);
+    if (getenv("CUE_PROBE_TRACE") != nullptr) {
+      static int n_trace = 0;
+      if (n_trace++ < 5) {
+        std::fprintf(stderr, "[trace] poll pr=%d fd=%lld revents=0x%x\n", pr,
+                     static_cast<long long>(pfd.fd), static_cast<int>(pfd.revents));
+      }
+    }
     if (pr <= 0) continue;
     sockaddr_in from{};
     int64_t recv_us_sample = -1;
