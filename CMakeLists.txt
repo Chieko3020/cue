@@ -92,7 +92,22 @@ if(CUE_WERROR)
 endif()
 
 find_package(Threads REQUIRED)
-find_package(Boost 1.83 REQUIRED COMPONENTS system)
+# Boost.System 从 1.69 起是 header-only：官方教程不再提供编译库，msys2 的 boost 包里
+# 也没有 libboost_system*。但不少发行版（含 Ubuntu 的 libboost-system-dev）仍然带，
+# 而 find_package(... COMPONENTS system REQUIRED) 在缺库的环境会直接失败。
+# 所以：先按无组件找 Boost，再 QUIET 查 system 组件——有就链，没有就定义
+# BOOST_ERROR_CODE_HEADER_ONLY（两种方式功能等价）。这样 Linux 与 Windows/MinGW
+# 都能配置成功，且 Linux 上仍然走编译库（行为不变）。
+find_package(Boost 1.83 REQUIRED)
+find_package(Boost 1.83 QUIET COMPONENTS system)
+if(TARGET Boost::system)
+  set(CUE_BOOST_SYSTEM_LIB Boost::system)
+  message(STATUS "Boost ${Boost_VERSION}：使用编译版 Boost.System")
+else()
+  set(CUE_BOOST_SYSTEM_LIB "")
+  add_compile_definitions(BOOST_ERROR_CODE_HEADER_ONLY)
+  message(STATUS "Boost ${Boost_VERSION}：无 Boost.System 编译库，改用 header-only（BOOST_ERROR_CODE_HEADER_ONLY）")
+endif()
 find_package(nlohmann_json REQUIRED)
 find_package(PkgConfig REQUIRED)
 
@@ -165,7 +180,7 @@ target_include_directories(cue_proto INTERFACE ${CUE_PROTO_INCLUDE})
 # media/audio_decoder：上行音频（type=0x02）的 Opus 解码，PCM 只用来算指标、不下行。
 add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp
   src/media/jitter_buffer.cpp src/media/audio_decoder.cpp)
-target_link_libraries(cued PRIVATE cue_proto cue_control cue_headers_all Boost::system
+target_link_libraries(cued PRIVATE cue_proto cue_control cue_headers_all ${CUE_BOOST_SYSTEM_LIB}
   Threads::Threads PkgConfig::FFMPEG PkgConfig::OPUS)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 
@@ -192,7 +207,7 @@ target_link_libraries(cue_capture PRIVATE cue_headers_all)
 # 复用 media/encoder（X264Encoder）而不是再写一份 x264 封装——cued 的转码链与采集端
 # 对同一组 x264 参数必须得到同一个码流形状，两处各写一份迟早漂移。
 add_executable(cue-capture apps/cue-capture.cpp src/media/encoder.cpp)
-target_link_libraries(cue-capture PRIVATE cue_capture cue_headers_all Boost::system
+target_link_libraries(cue-capture PRIVATE cue_capture cue_headers_all ${CUE_BOOST_SYSTEM_LIB}
   Threads::Threads)
 target_compile_options(cue-capture PRIVATE -Wno-deprecated-declarations)
 
@@ -305,14 +320,14 @@ add_executable(cue-serve apps/cue-serve.cpp)
 # 一份、cue-eval --diff 再算一份，两边迟早会漂。cue_cli_eval 仍然不链（它带 RunConfig
 # 选项结构体，那是 CLI 的东西，serve 不需要）。
 target_link_libraries(cue-serve PRIVATE cue_agent cue_pipeline cue_eval cue_cli_serve cue_headers_all
-  Boost::system Threads::Threads)
+  ${CUE_BOOST_SYSTEM_LIB} Threads::Threads)
 
 # ---- M7 假域服务（AC-16）----
 # 只依赖 Beast + nlohmann：不链接 cue_pipeline（指标 JSON 字段是按 metrics_json 的键名
 # 手写的，这样它才是"外部服务"，而不是拿被测侧的实现给自己出题），也不依赖 cued/FFmpeg。
 add_executable(cue-mock-svc apps/cue-mock-svc.cpp)
 target_link_libraries(cue-mock-svc PRIVATE cue_proto nlohmann_json::nlohmann_json
-  Boost::system Threads::Threads)
+  ${CUE_BOOST_SYSTEM_LIB} Threads::Threads)
 
 # ---- 测试 ----
 enable_testing()
