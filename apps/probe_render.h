@@ -60,7 +60,10 @@ class Renderer {
   // 播放队列的累计账。只有把它放进指标行，"是链路丢了还是播放侧自己丢了/自己积压了"
   // 这个问题才有证据可查——只听声音只能判断"有咔咔"，判断不了责任在哪一侧。
   struct AudioStats {
-    uint64_t over_soft = 0;    // 队列越过软上限的次数（照常入队，只说明在积压）
+    uint64_t over_soft = 0;    // 队列越过软上限的次数
+  // 因时钟漂移/成簇到达而丢掉的 20 ms 包数。**这是听感变差最直接的嫌疑人**：
+  // 丢得越多，声音越断续；不暴露它就只能靠耳朵猜。
+  uint64_t dropped_drift = 0;
     uint64_t trimmed = 0;      // 越过硬上限、被迫清空的次数（听感上是一次跳变）
     uint64_t queued = 0;       // 成功入队的 PCM 段数
     uint64_t push_errors = 0;  // SDL_QueueAudio 失败次数（设备被拔/后端异常）

@@ -321,9 +321,18 @@ void Renderer::queue_audio(const int16_t* pcm, int samples) {
   // 要再涨回上限需要好几秒 —— 于是听感是"每几秒漏一帧 20 ms"，
   // 而不是"每隔一两分钟硬跳一次"。250 ms 的上限让延迟固定在可接受范围。
   //
-  // 只有真积压（>2000 ms，说明出了问题而不只是漂移）才清空，且那是最后手段。
-  constexpr double kUpperMs = 250.0;
-  constexpr double kPanicMs = 2000.0;
+  // 上限必须**高于源的一簇长度**，否则会周期性抽干。
+  //
+  // 实测线索：用户报告"音频几乎以每 0.4 秒规律性地卡一次"。0.4 s 这个固定周期不是
+  // 随机的——它正是音频**成簇到达**的间隔（DirectShow/虚拟声卡按缓冲块交付，
+  // 一次给约 0.4 秒的量）。而原来把上限设在 250 ms，比一簇还短：队列刚攒到 250 就被
+  // 丢包压下去，两簇之间的空档里设备立刻把队列抽干 ⇒ 每个簇周期响一次"咔"。
+  //
+  // 所以上限取 800 ms（两倍于一簇，留出余量），让队列始终装得下一簇还不至于抽干；
+  // 代价是音频延迟约 0.4~0.8 s——诊断用接收端完全可以接受，而周期性咔咔不能。
+  // 判断依据是可观测的：如果听感仍然每 0.4 s 一咔，说明簇更长，这个值还要往上提。
+  constexpr double kUpperMs = 800.0;
+  constexpr double kPanicMs = 3000.0;
   const double q = double(queued_ms());
   if (q > kPanicMs) {
     SDL_ClearQueuedAudio(impl_->adev);
@@ -371,6 +380,7 @@ Renderer::AudioStats Renderer::audio_stats() const {
   AudioStats out;
   if (impl_ == nullptr) return out;
   out.over_soft = impl_->audio_over_soft;
+  out.dropped_drift = impl_->audio_dropped_drift;
   out.trimmed = impl_->audio_trimmed;
   out.queued = impl_->audio_queued_pkts;
   out.push_errors = impl_->audio_push_errors;

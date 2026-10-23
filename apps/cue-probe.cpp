@@ -1761,6 +1761,9 @@ int main(int argc, char** argv) {
           // 队列账：软上限命中 = 在积压（还放行），硬上限命中 = 清过一次（听感会跳）。
           // 只有这两个数能把"播放侧自己丢的"和"链路丢的"分开。
           {"audio_queue_over_soft", rstats.over_soft},
+          // 因队列越上限而丢掉的 20 ms 包数：它是"声音断续"最直接的嫌疑人，
+          // 不算进来就只能靠耳朵判断。
+          {"audio_dropped_drift", rstats.dropped_drift},
           {"audio_queue_trimmed", rstats.trimmed},
           {"audio_queue_push_errors", rstats.push_errors},
           {"audio_queue_segments", rstats.queued},
