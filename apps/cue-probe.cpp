@@ -769,6 +769,9 @@ int main(int argc, char** argv) {
   // 虚拟声卡环境里系统默认常常就是被采集的那一路，会让 probe 播出的
   // 声音回流进链路，听起来像回声——必须能指定。
   std::string audio_out;
+  // 周期性截图（0 = 关）：把渲染结果存成 BMP，供远程检查画面质量。
+  long long snap_ms = 0;
+  std::string snap_prefix;
   bool list_audio = false;
   long long jitter_max_level = 2;
   // 接收端抖动缓冲的目标深度（帧）。默认 2 与 JitterBufferConfig 的历史默认一致，
@@ -814,6 +817,11 @@ int main(int argc, char** argv) {
       if (!parse_int(val, 0, 2000, jitter_budget_ms)) bad(a, val);
     } else if (a == "--audio-out") {
       audio_out = std::string(next());
+    } else if (a == "--snap-ms") {
+      const auto val = next();
+      if (!parse_int(val, 0, 600000, snap_ms)) bad(a, val);
+    } else if (a == "--snap-prefix") {
+      snap_prefix = std::string(next());
     } else if (a == "--list-audio") {
       list_audio = true;
     } else if (a == "--jitter-target-frames") {
@@ -859,7 +867,8 @@ int main(int argc, char** argv) {
           "          [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..3]\n"
-          "          [--audio-out NAME] [--list-audio] [--report-addrs host:port[,host:port]]\n"
+          "          [--audio-out NAME] [--list-audio] [--snap-ms N --snap-prefix PATH]\n"
+          "          [--report-addrs host:port[,host:port]]\n"
           "  --nack-interval-ms 只决定「多长时间尝试一次」；实际发送上限是 8 包/秒\n"
           "  （SPEC §7.2），间隔 <125 ms 会被夹到该上限。冷却/单包探测不需要额外开关。\n"
           "  feedback（type=0x06）每 200 ms 自动发一条，无需参数。\n");
@@ -1188,6 +1197,11 @@ int main(int argc, char** argv) {
     std::string rerr;
     if (renderer.open(rcfg, rerr)) {
       render_live = true;
+      // 必须在 open 成功**之后**启用：enable_snapshot 依赖 open 建好的 impl_，
+      // 放在前面会静默变成空操作（实测就是这样：参数都对、文件一个都没生成）。
+      if (snap_ms > 0 && !snap_prefix.empty()) {
+        renderer.enable_snapshot(static_cast<int>(snap_ms), snap_prefix);
+      }
     } else {
       std::fprintf(stderr, "[probe] --render 打开失败，降级为只算指标：%s\n", rerr.c_str());
       emit("probe.render_failed", json{{"error", rerr}, {"backend", cue::probe::Renderer::backend_name()}});

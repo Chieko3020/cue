@@ -70,6 +70,15 @@ class Renderer {
   };
   AudioStats audio_stats() const;
 
+  // 周期性把**渲染出来的画面**存成 BMP（0 = 关闭）。
+  //
+  // 为什么不在外面截桌面：桌面截屏受会话/窗口焦点/DPI 影响，从 SSH 起还要绕
+  // schtasks /it 进会话 1，实测在这台机器上任务会在跑但脚本不执行（连重定向日志
+  // 都不生成），排查成本远高于收益。而"把渲染结果存盘"只需要 SDL_RenderReadPixels，
+  // 抓到的就是实际显示的那一帧，并且窗口被挡住、最小化都不影响。
+  // 用 BMP 而不是 PNG：SDL 内置 SaveBMP，不引入 libpng 依赖；需要 PNG 时本地转一次即可。
+  void enable_snapshot(int every_ms, std::string prefix);
+
   // 处理退出事件；返回 false 表示用户关了窗口（调用方应退出主循环）。
   // 注意：渲染器**没打开**时这个函数恒返回 false（"没有窗口"与"窗口被关"在返回值上
   // 无法区分）。所以调用方必须先记住 open() 成功与否，再决定要不要拿它当退出信号——

@@ -48,6 +48,11 @@ struct Renderer::Impl {
   uint64_t audio_queued_pkts = 0;
   // 上一次整体纠正播放队列的时刻（毫秒）。见 queue_audio 里对限流的说明。
   Uint64 last_trim_ms = 0;
+  // 周期性截图（见 enable_snapshot）：间隔、前缀、已存张数、上次存盘时刻。
+  int snap_every_ms = 0;
+  std::string snap_prefix;
+  uint64_t snap_count = 0;
+  Uint64 snap_last_ms = 0;
   uint64_t audio_push_errors = 0;  // SDL_QueueAudio 失败（设备被拔/后端异常）
   // 每类失败只往 stderr 报一次：渲染路径的失败是每帧都发生的，不限流会把
   // "真正的第一句原因"冲掉，日志上看起来像刷屏噪声。
@@ -280,6 +285,32 @@ void Renderer::draw_yuv(const void* av_frame) {
     return;
   }
   SDL_RenderPresent(im.ren);
+
+  // 周期性把渲染结果存盘。放在 Present 之后读，读到的是**刚显示的那一帧**。
+  if (im.snap_every_ms > 0 && !im.snap_prefix.empty()) {
+    const Uint64 now_ms = SDL_GetTicks64();
+    if (im.snap_last_ms == 0 || now_ms - im.snap_last_ms >= static_cast<Uint64>(im.snap_every_ms)) {
+      im.snap_last_ms = now_ms;
+      // 读窗口而不是纹理：ReadPixels 拿到的是渲染目标的最终像素（含 LogicalSize 的
+      // 等比缩放与黑边），与用户眼睛看到的一致。
+      int w = 0;
+      int h = 0;
+      SDL_GetRendererOutputSize(im.ren, &w, &h);
+      if (w > 0 && h > 0) {
+        SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+        if (surf != nullptr) {
+          if (SDL_RenderReadPixels(im.ren, nullptr, SDL_PIXELFORMAT_ARGB8888, surf->pixels,
+                                   surf->pitch) == 0) {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s%05llu.bmp", im.snap_prefix.c_str(),
+                          static_cast<unsigned long long>(im.snap_count));
+            if (SDL_SaveBMP(surf, path) == 0) ++im.snap_count;
+          }
+          SDL_FreeSurface(surf);
+        }
+      }
+    }
+  }
 }
 
 void Renderer::queue_audio(const int16_t* pcm, int samples) {
@@ -387,6 +418,14 @@ Renderer::AudioStats Renderer::audio_stats() const {
   return out;
 }
 
+void Renderer::enable_snapshot(int every_ms, std::string prefix) {
+  if (impl_ == nullptr) return;
+  impl_->snap_every_ms = every_ms > 0 ? every_ms : 0;
+  impl_->snap_prefix = std::move(prefix);
+  impl_->snap_last_ms = 0;
+  impl_->snap_count = 0;
+}
+
 bool Renderer::pump_events() {
   if (impl_ == nullptr) return false;
   SDL_Event e;
@@ -420,7 +459,16 @@ void Renderer::queue_audio(const int16_t*, int) {}
 // "CI/服务器环境"这一支，最容易一直没人编到它。
 int Renderer::queued_ms() const { return -1; }
 void Renderer::reset_audio() {}
+void Renderer::enable_snapshot(int, std::string) {}
 Renderer::AudioStats Renderer::audio_stats() const { return AudioStats{}; }
+void Renderer::enable_snapshot(int every_ms, std::string prefix) {
+  if (impl_ == nullptr) return;
+  impl_->snap_every_ms = every_ms > 0 ? every_ms : 0;
+  impl_->snap_prefix = std::move(prefix);
+  impl_->snap_last_ms = 0;
+  impl_->snap_count = 0;
+}
+
 bool Renderer::pump_events() { return false; }
 
 }  // namespace cue::probe
