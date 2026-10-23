@@ -427,6 +427,12 @@ struct FrameStats {
   uint64_t decoded = 0;       // 解码出的帧数（fps 的分子）
   uint64_t decode_errors = 0;
   uint64_t decode_skips = 0;    // 非 H264（或未标注）跳过解码的帧
+  // 「喂进解码器了，但既没出帧、也没报错」的帧数。这一格以前没有任何计数器：
+  // H264Decoder::decode 在 avcodec_receive_frame 只回 EAGAIN 时返回 nullptr 且 err 为空
+  // （解码器把包吞进 DPB、暂时不产帧），旧代码走的是 `else if (!derr.empty())`，
+  // 于是这些帧**在账本上凭空消失**——frames 涨、decoded 不涨、errors 仍为 0，
+  // 看上去像"帧没到"，其实帧到了。frames 与 decoded 对不上时的第一嫌疑人就是它。
+  uint64_t decode_no_output = 0;
   uint64_t stalls = 0;
   uint64_t max_stall_us = 0;
   uint64_t recv_ts_missing = 0;  // 内核没给时间戳的次数（不伪造 0，只记账）
@@ -451,6 +457,80 @@ struct FrameStats {
     }
     if (pts_us > 0) last_pts_us = static_cast<int64_t>(pts_us);
     last_dec_end_us = dec_end_us;
+  }
+};
+
+// ---------------------------------------------------------------- 到达间隔分布
+// 为什么需要它：`fps` 是**平均值**，`stalls` 是按 PTS 轴算的卡顿数——两样都看不出「帧成簇
+// 到达」。一簇 0.4 s 的到达模式（0.4 s 完全静默，然后十几帧挤在同一瞬间）平均下来仍然是
+// 30 fps，PTS 轴上一个洞都没有（所以 jb_skipped 也是 0），但它恰恰是「每 0.4 s 顿一下」的
+// 直接原因：播放端每簇只被喂一次，簇内各帧的驻留时长天差地别。只有**间隔分布**能把它变成
+// 数据，而不是靠"音频那边也这样"的类比去推。
+//
+// 度量点选在「整帧组装完成」时刻，也就是 jb.push 收到的 arrival_us：
+// 抖动缓冲的时间轴就是它，指标必须和缓冲说同一件事。用首片到达会更接近网络层，但会把
+// 「大 IDR 在途更久」混进来（见 JitterBasis 的注释），反而更难解释。代价是 IDR 那一帧的
+// 间隔被抬高十几 ms——对「有没有 0.4 s 空档」这种量级的问题没有影响。
+struct ArrivalGapMeter {
+  // 桶上界（µs，含上界）：5 / 15 / 33 / 66 / 133 / 266 / 533 ms，最后一桶是更大的。
+  // 取值理由：33 ms 是 30 fps 的帧栅格，每档是它的约 1/2、1、2、4、8、16 倍。
+  // 一簇到达在直方图上的形状是「第 0 桶爆量 + 偶尔一个大桶」，连续到达则是「第 3 桶稳定」。
+  static constexpr std::size_t kBuckets = 8;
+  static constexpr int64_t kEdgesUs[kBuckets - 1] = {5'000,  15'000,  33'000,  66'000,
+                                                     133'000, 266'000, 533'000};
+  // 「空档」判据 > 50 ms：等于 33 ms 帧栅格的 1.5 倍，与卡顿判据（--stall-factor 1.5）同源，
+  // 两个指标因此可以互相印证，而不是各说各话。
+  static constexpr int64_t kGapAlertUs = 50'000;
+
+  std::array<uint64_t, kBuckets> histogram{};
+  uint64_t samples = 0;          // 本窗口的间隔样本数（到达事件数 − 1；帧级实例就是帧数 − 1）
+  uint64_t gaps = 0;             // 本窗口 > kGapAlertUs 的间隔个数
+  int64_t max_gap_us = 0;        // 本窗口最大空档
+  int64_t max_gap_us_total = 0;  // 进程内最大空档（窗口清零也不丢，抓偶发的最坏值）
+  int64_t last_us = 0;
+  bool have_last = false;
+
+  static std::size_t bucket_of(int64_t gap_us) {
+    for (std::size_t i = 0; i < kBuckets - 1; ++i) {
+      if (gap_us <= kEdgesUs[i]) return i;
+    }
+    return kBuckets - 1;
+  }
+
+  void observe(int64_t now_us) {
+    if (have_last) {
+      const int64_t gap = now_us - last_us;
+      // 负间隔（时钟源回跳）当噪声丢掉，不记样本：记成 0 会把「没有观测」伪装成
+      // 「观测到 0 ms」，那正好是"成簇"的读数，等于自己造假证据。
+      if (gap >= 0) {
+        ++samples;
+        ++histogram[bucket_of(gap)];
+        if (gap > kGapAlertUs) ++gaps;
+        if (gap > max_gap_us) max_gap_us = gap;
+        if (gap > max_gap_us_total) max_gap_us_total = gap;
+      }
+    }
+    last_us = now_us;
+    have_last = true;
+  }
+
+  // 指标行是「这一秒」的读数，不是累计值（与 fps / 四段分位同一口径）。
+  // max_gap_us_total 故意不在这里清零：单秒最大值会被窗口边界切掉半个空档，
+  // 而"全程最坏值"恰恰是报告里要引用的那个数。
+  void clear_window() {
+    histogram.fill(0);
+    samples = 0;
+    gaps = 0;
+    max_gap_us = 0;
+  }
+
+  // 换代（新会话 / 换对端）时丢掉的只是「上一帧是什么时候」这个基准：两次换代之间的静默
+  // 是进程在重连，不是链路的到达空档，留着它会在直方图里制造一个几秒宽的假空档——
+  // 而那个假空档恰好会被读成"成簇"的证据，正是本次要查的那件事。
+  // 全程最大值（max_gap_us_total）保留：它是进程级的最坏值，与哪一代会话无关。
+  void rebase() {
+    have_last = false;
+    clear_window();
   }
 };
 
@@ -761,8 +841,11 @@ int main(int argc, char** argv) {
   // （30 fps 下任何活着的 cued 间隔都 ≤33 ms），足以防串流，又不至于吞掉重测窗口。
   long long peer_timeout_ms = 500;
   // 抖动缓冲（FR-PROBE.4）：默认开、默认自适应。
-  // 档位阶梯是 2/4/8/16 帧；默认只允许升到 2 档（8 帧），因为 16 帧档在 30 fps 下
-  // 就是 500 ms 的驻留延迟——那个档位要显式 --jitter-max-level 3 才打开。
+  // 档位阶梯真实是 kDepthLadder = 1/2/4/8/16 帧（30 fps 下 0/33/100/233/500 ms 驻留）。
+  // 默认最高只到 2 档（4 帧 ≈ 100 ms）：16 帧档在实时链路上就是半秒延迟，必须显式
+  // --jitter-max-level 4 才打开。
+  // 注意阶梯**加长并不改善"帧没到齐"**（见 jitter_buffer.h 文件头的三种丢帧）：
+  // 它只对"帧都在、只是晚到/乱序"有用，对 PTS 轴上的洞一点办法都没有。
   bool jitter_enabled = true;
   long long jitter_budget_ms = 40;
   // 音频输出设备名（子串匹配）。空 = 系统默认。
@@ -774,10 +857,17 @@ int main(int argc, char** argv) {
   std::string snap_prefix;
   bool list_audio = false;
   long long jitter_max_level = 2;
-  // 接收端抖动缓冲的目标深度（帧）。默认 2 与 JitterBufferConfig 的历史默认一致，
-  // 但 cued 侧已经用 --jitter-target-frames 1（零驻留）时，两端假设必须对齐：
-  // 30 fps 下 2 帧 = 66 ms，会直接顶穿 case.expect.sla 里 60 ms 的端到端门限。
-  long long jitter_target_frames = 2;
+  // 抖动缓冲的深度（帧）。**语义在 2026-10 修正过一次**，理由值得记下来：
+  //   probe 的自适应是跟着 --jitter 一起开的（adaptive = enabled），而自适应时
+  //   JitterBuffer::target_frames() 只认 kDepthLadder[level]，cfg.target_frames 被**完全忽略**。
+  //   所以旧语义（"固定目标深度 2 帧"）在这里一直是空转：把 2 改成 4 实测毫无变化，
+  //   因为 0 档的目标深度恒为 1。那种"调了没用、看起来却像调了"的参数比没有更糟。
+  //   cued 侧不受影响：它不开自适应，target_frames 在那边仍然是字面深度。
+  // 新语义：0（默认）= 完全跟随自适应，从 0 档起步（与旧默认的实际行为一致，延迟不变）；
+  //         N > 0   = 自适应档位的**下限**，取阶梯上深度 <= N 的最深一档。
+  //         例如 2 → 1 档（2 帧），4 → 2 档，8 → 3 档。
+  // 这样 --jitter-max-level 与它一起构成"档位区间"，语义只有一个：档位决定深度。
+  long long jitter_target_frames = 0;
   std::string bind_host = "0.0.0.0";
   std::vector<TcpReporters::Addr> report_addrs;
 
@@ -826,10 +916,16 @@ int main(int argc, char** argv) {
       list_audio = true;
     } else if (a == "--jitter-target-frames") {
       const auto val = next();
-      if (!parse_int(val, 0, 8, jitter_target_frames)) bad(a, val);
+      // 上界跟着阶梯走：阶梯最深 16 帧，再大的下限没有对应的档位。
+      if (!parse_int(val, 0, 16, jitter_target_frames)) bad(a, val);
     } else if (a == "--jitter-max-level") {
       const auto val = next();
-      if (!parse_int(val, 0, 3, jitter_max_level)) bad(a, val);
+      // 0..4 对应 kDepthLadder 的五个档位。上界写成常量而不是字面 4：以后再加档位时
+      // 这里少改一处就少一个「参数合法但档位到不了」的坑。
+      if (!parse_int(val, 0, static_cast<long long>(cue::media::kDepthLadderSize) - 1,
+                     jitter_max_level)) {
+        bad(a, val);
+      }
     } else if (a == "--peer-timeout-ms") {
       const auto val = next();
       if (!parse_int(val, 50, 60000, peer_timeout_ms)) bad(a, val);
@@ -866,11 +962,15 @@ int main(int argc, char** argv) {
           "          [--nack-interval-ms 125] [--nack-wait-ms 120] [--jitter-basis first|done]\n"
           "          [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
-          "          [--jitter-max-level 0..3]\n"
+          "          [--jitter-max-level 0..4] [--jitter-target-frames 0..16]\n"
           "          [--audio-out NAME] [--list-audio] [--snap-ms N --snap-prefix PATH]\n"
           "          [--report-addrs host:port[,host:port]]\n"
           "  --nack-interval-ms 只决定「多长时间尝试一次」；实际发送上限是 8 包/秒\n"
           "  （SPEC §7.2），间隔 <125 ms 会被夹到该上限。冷却/单包探测不需要额外开关。\n"
+          "  --jitter-max-level 与 --jitter-target-frames 共同定义自适应档位区间：\n"
+          "  档位 0..4 = 驻留 1/2/4/8/16 帧（30 fps 下 0/33/100/233/500 ms）。\n"
+          "  --jitter-target-frames 是区间下限（0 = 不设限，从 0 档起步）。加长区间只对\n"
+          "  「帧晚到/乱序」有用，对「帧根本没到齐」（PTS 轴有洞）不会减少一个丢帧。\n"
           "  feedback（type=0x06）每 200 ms 自动发一条，无需参数。\n");
       return 0;
     } else {
@@ -887,14 +987,29 @@ int main(int argc, char** argv) {
       static_cast<int64_t>(stall_factor * static_cast<double>(frame_interval_us));
 
   // 抖动缓冲配置：容量上限比最高档位多留 2 帧余量（留余量是为了"超过目标深度"能被观察到，
-  // 而不是一超就挤掉——容量是硬上限，不是目标深度）。
+  // 而不是一超就挤掉——容量是硬上限，不是目标深度）。容量必须 >= 最深档位的深度，否则深处
+  // 档位自己就会制造丢帧（队列被空洞挡住时，超容量的帧由 evict_one 挤掉）。
   cue::media::JitterBufferConfig jb_cfg;
   jb_cfg.enabled = jitter_enabled;
   jb_cfg.adaptive = jitter_enabled;
-  jb_cfg.min_level = 0;
   jb_cfg.max_level = static_cast<std::size_t>(jitter_max_level);
+  if (jb_cfg.max_level >= cue::media::kDepthLadderSize) {
+    jb_cfg.max_level = cue::media::kDepthLadderSize - 1;  // 兜底：命令行已被 clamp 过
+  }
+  // --jitter-target-frames 现在表达「自适应的下限档位」，映射规则见该参数的注释。
+  // 逐档比较而不是查表：阶梯可以加长，这条映射不需要跟着改。
+  std::size_t floor_level = 0;
+  if (jitter_target_frames > 0) {
+    const auto want = static_cast<std::size_t>(jitter_target_frames);
+    while (floor_level + 1 < cue::media::kDepthLadderSize &&
+           cue::media::kDepthLadder[floor_level + 1] <= want) {
+      ++floor_level;
+    }
+  }
+  jb_cfg.min_level = std::min(floor_level, jb_cfg.max_level);
   // 显式设定而不是靠默认值：默认值改了不会有人知道，而 SLA 门限是按它算的。
-  jb_cfg.target_frames = static_cast<std::size_t>(jitter_target_frames);
+  // 自适应时它不生效（深度由档位决定），留这一行只为把两处口径写在同一个地方。
+  jb_cfg.target_frames = cue::media::kDepthLadder[jb_cfg.min_level];
   jb_cfg.max_frames = cue::media::kDepthLadder[jb_cfg.max_level] + 2;
   jb_cfg.nominal_interval_us = frame_interval_us;
   jb_cfg.budget_us = jitter_budget_ms * 1000;
@@ -1008,7 +1123,11 @@ int main(int argc, char** argv) {
             {"report_addrs", report_addrs.size()},
             {"jitter", jitter_enabled ? "on" : "off"},
             {"jitter_budget_ms", jitter_budget_ms},
-            {"jitter_max_level", jitter_max_level},
+            // 档位区间（不是"深度"）：min 来自 --jitter-target-frames 的映射，
+            // max 来自 --jitter-max-level。报告里要说明"驻留多少毫秒"必须看这两个，
+            // 而不是看 target_frames——自适应时它不生效。
+            {"jitter_level_min", jb_cfg.min_level},
+            {"jitter_max_level", jb_cfg.max_level},
             {"jitter_max_frames", jb_cfg.max_frames}});
 
   std::map<uint32_t, FrameAcc> pending;
@@ -1016,6 +1135,13 @@ int main(int argc, char** argv) {
   ClockAlign clk;
   DecodeState dec;
   FrameStats fs;
+  // 帧到达间隔分布（见 ArrivalGapMeter）：它是"成簇"唯一的直接证据。
+  // 单独一个对象而不是塞进 FrameStats：它的窗口语义（每秒清零 + 全程最大值保留）
+  // 与 FrameStats 里的分位环不一样，混在一起迟早会有人误清掉那个全程最大值。
+  ArrivalGapMeter arrival_gaps;
+  // 同一种度量的第二个采样点：数据报的内核到达时刻（纯到达侧，不受本进程掉链子的影响）。
+  // 两者的对比才是"成簇"的归因证据，只有一个序列的话两种原因长得一模一样。
+  ArrivalGapMeter datagram_gaps;
   // 与 NACK 联动（在 `pending` 声明之后接线）：抖动缓冲遇到 PTS 空洞时，如果那个缺失的
   // 帧正在被重传（`nack_queued`），就把等待预算放宽到 nack_wait_us。
   // 用 PTS 开区间查询而不是 frame_id：`FrameAcc` 本身就带 pts_us，且不依赖 frame_id 连续
@@ -1284,6 +1410,12 @@ int main(int argc, char** argv) {
                   {"last_error", derr}});
         dec.reset();
       }
+    } else {
+      // 第三个分支：decode 返回 nullptr 且**没有**错误信息 = 包被解码器吃了，只是这一拍
+      // 还不产帧（avcodec_receive_frame 回 EAGAIN）。旧实现没有这一支，于是这类帧
+      // 既不算 decoded 也不算 error，在账本上凭空消失——"frames 涨、decoded 不涨、
+      // errors 恒 0"正是它的指纹。它不是故障，但也绝不是"没收到"，必须单独记。
+      ++fs.decode_no_output;
     }
   };
 
@@ -1431,6 +1563,11 @@ int main(int argc, char** argv) {
     jf.first_arrival_us = fa.first_seen_us;
     jf.payload = assemble(fa);
     pending.erase(fid);
+    // 到达间隔必须在 push **之前**采样，而且用同一个 now_done：
+    //  · push 之后采样的前提是这一帧没被 late_dropped 掉，而迟到帧同样是"到达"，
+    //    漏掉它会把一次真实的到达从分布里抹掉，空档被人为拉长；
+    //  · now_done 就是 jb.push 的 arrival_us，指标与缓冲必须同一条时间轴（理由见 ArrivalGapMeter）。
+    arrival_gaps.observe(now_done);
     const cue::media::JitterBufferStats before_push = jb.stats();
     auto ready = jb.push(std::move(jf), now_done);
     note_refchain_break(before_push.skipped, before_push.late_dropped);
@@ -1647,6 +1784,15 @@ int main(int argc, char** argv) {
                   static_cast<unsigned long long>(jb.stats().switches),
                   static_cast<unsigned long long>(jb.stats().skipped),
                   static_cast<unsigned long long>(jb.stats().late_dropped));
+      // 到达侧另起一组：gap_max 与 fps 一起读才答得了"是不是成簇"——fps=30 且
+      // gap_max=400ms 就是成簇，两者都平稳才是真的连续到达（见 ArrivalGapMeter）。
+      // pkt_gap_max 是同一度量的纯到达侧版本（内核时间戳），两个一起看才分得清
+      // "网络成簇"与"我们自己读得慢"。
+      std::printf("arr gap_max=%.1fms >50ms=%llu gap_max_all=%.1fms pkt_gap_max=%.1fms ",
+                  double(arrival_gaps.max_gap_us) / 1000.0,
+                  static_cast<unsigned long long>(arrival_gaps.gaps),
+                  double(arrival_gaps.max_gap_us_total) / 1000.0,
+                  double(datagram_gaps.max_gap_us) / 1000.0);
       if (!clk.have) {
         std::printf("lat=unsynced(no clock offset yet, stats_req=%llu)\n",
                     static_cast<unsigned long long>(stats_reqs));
@@ -1670,6 +1816,13 @@ int main(int argc, char** argv) {
       // 不能写 0（cued 的抖动缓冲还没实现，接收端根本没有这一段可测）。
       const bool have_lat = clk.have && lat.size() > 0;
       auto pct_or_null = [&](double v) { return have_lat ? json(v) : json(nullptr); };
+      // 到达间隔直方图（桶边界见 ArrivalGapMeter::kEdgesUs）：JSON 数组按桶顺序，
+      // sums to arr_gap_samples。写成数组而不是九个扁平字段，是因为消费方要的是分布形状，
+      // 九个独立的键会让"画一张直方图"变成九次手工拼装。
+      json gap_hist = json::array();
+      for (std::size_t i = 0; i < ArrivalGapMeter::kBuckets; ++i) {
+        gap_hist.push_back(arrival_gaps.histogram[i]);
+      }
       json metric{
           // 这一秒跟的是哪一路会话（服务端分配的会话号）。多设备部署时探针的端口与
           // cued 的 device.registered.probe_port 一一对应，这里再写一次会话号，
@@ -1681,6 +1834,9 @@ int main(int argc, char** argv) {
           {"decoded", fs.decoded},
           {"decode_errors", fs.decode_errors},
           {"decode_skips", fs.decode_skips},
+          // 喂进解码器、既没出帧也没报错的帧数（见 FrameStats::decode_no_output）。
+          // 没有它，「frames − decoded」这部分差额无账可查，只能靠猜。
+          {"decode_no_output", fs.decode_no_output},
           {"stalls", fs.stalls},
           {"max_stall_us", fs.max_stall_us},
           {"stall_threshold_us", stall_threshold_us},
@@ -1732,6 +1888,31 @@ int main(int argc, char** argv) {
           {"jb_target_frames", jb.stats().target_frames},
           {"jb_skipped", jb.stats().skipped},
           {"jb_late", jb.stats().late_dropped},
+          // 入队/放行两个累计计数：把"帧去哪了"变成可以对账的等式。
+          //   jb_pushed − jb_late − jb_depth == jb_released（被容量挤掉的帧走 skipped 那条账）
+          //   jb_released == decoded + decode_errors + decode_skips + decode_no_output
+          // 两条等式不成立就是有分支没记账——这比任何单点读数都更能暴露口径漏洞。
+          {"jb_pushed", jb.stats().pushed},
+          {"jb_released", jb.stats().released},
+          // 到达间隔分布（回答"帧是不是成簇到达"）：fps 是均值，看不出来；这一组能。
+          // arr_gap_max_ms 与 fps 一起读：fps≈30 而 gap_max≈400 ms = 成簇；
+          // 两者都平稳 = 真的连续到达。arr_gap_hist 的桶边界见 ArrivalGapMeter::kEdgesUs，
+          // 各桶之和 = arr_gap_samples（本窗口），所以"空档 >50 ms 的次数/秒"=
+          // arr_gaps_over_50ms ÷ (本窗口时长)。
+          {"arr_gap_max_ms", double(arrival_gaps.max_gap_us) / 1000.0},
+          {"arr_gap_max_ms_total", double(arrival_gaps.max_gap_us_total) / 1000.0},
+          {"arr_gaps_over_50ms", arrival_gaps.gaps},
+          {"arr_gap_samples", arrival_gaps.samples},
+          {"arr_gap_hist", gap_hist},
+          // 同一套读数的**纯到达侧**版本（内核时间戳，不受本进程解码/渲染卡顿影响）。
+          // 判读规则：
+          //   两条都成簇 → 数据本来就是成簇来的，抖动缓冲只能吸收、吸收不了就丢；
+          //   只有 arr_* 成簇 → 读循环自己做出来的（消费不过来），加深缓冲等于固化延迟。
+          // 没有内核时间戳时（pkt_arr_gap_samples=0，Windows）这一组没有意义，看 recv_ts_missing。
+          {"pkt_arr_gap_max_ms", double(datagram_gaps.max_gap_us) / 1000.0},
+          {"pkt_arr_gap_max_ms_total", double(datagram_gaps.max_gap_us_total) / 1000.0},
+          {"pkt_arr_gaps_over_50ms", datagram_gaps.gaps},
+          {"pkt_arr_gap_samples", datagram_gaps.samples},
           {"decode_us", seg_or_null(fs.decode_us)},
           {"decode_ms_p50", fs.decode_us.size() ? json(double(fs.decode_us.percentile(0.50)) / 1000.0)
                                                 : json(nullptr)},
@@ -1799,6 +1980,10 @@ int main(int argc, char** argv) {
       fs.recv_us.clear();
       fs.reassembly_us.clear();
       fs.buffer_us.clear();
+      // 到达间隔直方图/计数同样按窗口清零（全程最大空档 max_gap_us_total 不清，
+      // 它就是要跨窗口活下来的那个"最坏值"）。
+      arrival_gaps.clear_window();
+      datagram_gaps.clear_window();
       frames_prev = frames;
       decoded_prev = fs.decoded;
       t_last_report = now_tick;
@@ -1827,10 +2012,24 @@ int main(int argc, char** argv) {
     const ssize_t n = recv_timed(buf.data(), buf.size(), from, recv_us_sample);
     if (n < static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) continue;
     ++packets;
-    if (recv_us_sample >= 0) {
-      fs.recv_us.push(recv_us_sample, cue::now_us());
-    } else {
-      ++fs.recv_ts_missing;
+    {
+      const int64_t now_recv = cue::now_us();
+      if (recv_us_sample >= 0) {
+        fs.recv_us.push(recv_us_sample, now_recv);
+        // 纯网络侧（或纯内核侧）的到达时刻 = 被读出时刻 − 在内核缓冲里待的时间。
+        // 它与帧级 arr_gap_*（读循环时间轴）**必须分开记**：
+        //   · 两条序列都成簇  → 数据本来就是成簇送来的（发送端/采集端的问题）；
+        //   · 只有帧级成簇    → 我们自己消费不过来（解码/渲染卡住读循环，包在 socket
+        //                       缓冲里积成堆），换更深的抖动缓冲只会把这个自伤固化成延迟。
+        // 误差量级是 now_recv 与 recv_timed 内那次 clock_gettime 之差（微秒级），
+        // 对"有没有 0.4 s 空档"这种量级无影响。
+        datagram_gaps.observe(now_recv - recv_us_sample);
+      } else {
+        // 没有内核时间戳（Windows / SO_TIMESTAMP 不可用）就不填这个序列：
+        // 用"被读出时刻"冒充到达时刻会让它退化成读循环节奏，正是要区分的那个量，
+        // 等于自己制造伪证据。缺样本这件事由 recv_ts_missing 如实记账。
+        ++fs.recv_ts_missing;
+      }
     }
 
     auto h = cue::proto::decode_datagram({buf.data(), static_cast<std::size_t>(n)});
@@ -1892,6 +2091,10 @@ int main(int argc, char** argv) {
       // 端到端分位环：里面的样本是用**上一代**的 offset 算出来的。offset 在换对端后
       // 会重估，同一个环里混两种时钟基的样本，p50/p99 就变成了两个分布的平均数。
       lat.clear();
+      // 到达间隔的基准同理：换代之间的静默（重启常常几秒）不是链路的到达空档，
+      // 不 rebase 的话直方图里会出现一个几秒的假空档，而它会被读成"成簇"的证据。
+      arrival_gaps.rebase();
+      datagram_gaps.rebase();
       // 单包探测的目标帧号属于上一代（新会话的 frame_id 从 0 重新开始），不清会让
       // "新流里恰好同号的一帧"被当成探测成功，把 NACK 从探测模式里提前放出来。
       nack_probe_pending = false;

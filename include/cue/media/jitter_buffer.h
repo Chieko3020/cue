@@ -28,6 +28,22 @@
 //   skipped      —— 放行时发现的 PTS 空洞数。缺失帧、被容量挤掉的帧最终都表现为空洞。
 //   late_dropped —— 入队时就已经过期的帧（PTS <= 最近已放行的 PTS）。这种帧无法按序输出，
 //                   只能丢；它不制造空洞（它自己的位置早就过去了），所以不进 skipped。
+//
+// 「到达空档」≠「丢帧」——这一条是 2026-10 排查 OBS 虚拟摄像头那 8~11% 跳帧时定下的口径，
+// 也是读这套代码最容易搞错的地方：
+//   一次 0.4 s 的到达空档（帧成簇到达，簇与簇之间没有任何包）在本实现里造成的
+//   late_dropped = 0、skipped = 0。原因是空档期间队列只会被**推空**，永远不会跨过一个
+//   还没到的帧：迟到判据是「PTS <= 上次已放行的 PTS」，而放行只能发生在有帧可放的时候，
+//   空档里没有任何 PTS 被推过。簇到达之后，每个新帧的 PTS 都大于 last_released_，
+//   依次入队、依次放行，一帧不少（只是每簇的头一帧会白等一个 budget，见 release_ready）。
+//   真正会丢帧的只有三种：
+//     ① 发送端 PTS 轴本身有洞（采集端丢帧/编码器丢帧）→ 表现为 skipped；
+//     ② 同一 PTS 的重复帧、或 PTS 倒退的帧 → 表现为 late_dropped；
+//     ③ 队首正被空洞挡住（在等 budget）时涌入的新帧超过 max_frames → evict_one 挤掉，
+//        之后再以 skipped 的形式结账（它留下的是空洞）。
+//   由此推论（面试里值得讲的一条）：**把档位阶梯加长不会让 skipped 变小**。缺失的帧不可能
+//   靠"多等"补回来；加长阶梯只是把 ① 的处置从 budget 拉长到更深档位的 hold，代价是延迟。
+//   加长阶梯唯一真正解决的是「帧都在、只是来得晚/顺序乱」那一类（抖动 > 1.5 个帧间隔）。
 #pragma once
 
 #include <cstddef>
@@ -74,7 +90,10 @@ struct JitterBufferConfig {
   // 队列容量硬上限（帧）。超过就挤掉最旧的一帧，不允许无界增长。
   std::size_t max_frames = 8;
 
-  // 固定目标深度（帧，非自适应时用）。2 帧 = 1 个帧间隔的驻留，是乱序纠正的最小代价。
+  // 固定目标深度（帧，**非自适应时**用）。自适应（adaptive=true）时它被完全忽略：
+  // 目标深度恒等于 kDepthLadder[level]。所以"把 target_frames 从 2 提到 4 来加深缓冲"
+  // 在自适应链路上是空转（2026-10 实测：提上去毫无变化，因为 0 档的目标深度恒为 1）。
+  // probe 侧因此把它改成了「自适应档位的下限」，见 apps/cue-probe.cpp 的 --jitter-target-frames。
   std::size_t target_frames = 2;
 
   // 单帧最长等待（µs）：前端被 PTS 空洞挡住时，最多等这么久就放弃缺失帧继续走。
@@ -100,9 +119,11 @@ struct JitterBufferConfig {
   int64_t nack_wait_us = 120'000;
 
   // 深度自适应（探针侧用）：按「丢包率 + 到达抖动」在档位阶梯上上下移动。
+  // 语义提醒：adaptive=true 时 target_frames 完全失效，真正决定驻留的是
+  // kDepthLadder[level]；min_level 既是起始档，也是想降也降不破的下限。
   bool adaptive = false;
   std::size_t min_level = 0;
-  std::size_t max_level = 0;
+  std::size_t max_level = 0;  // 构造函数会把它夹到 kDepthLadderSize-1，调用方不必自己夹
   // 评估窗口：每 window_frames 个入队帧结算一次。
   std::size_t window_frames = 60;
   // 升档门限：窗口丢包率 >= loss_up，或到达抖动 >= jitter_up_frames 个帧间隔。
@@ -123,8 +144,11 @@ struct JitterBufferConfig {
 // 等预算——干净网络下这就是"立即放行"，额外延迟为 0。
 // 早期版本从 2 帧起步，实测在 30 fps 干净链路上把端到端从 0.4 ms 抬到 41.6 ms
 // （p99 65.8 ms），等于给实时流白送一帧延迟。乱序纠正靠的是 budget 窗口，不是恒定驻留。
-// 30 fps 下四档驻留约 0 / 33 / 100 / 233 ms；探针默认最高 2 档，3 档要显式开。
-inline constexpr std::size_t kDepthLadder[] = {1, 2, 4, 8};
+// 30 fps 下五档驻留约 0 / 33 / 100 / 233 / 500 ms；探针默认最高 2 档（4 帧 ≈ 100 ms），
+// 8 帧/16 帧档要显式 --jitter-max-level 3/4 才打开。
+// 16 帧档（533 ms）是第一个长过"一簇 0.4 s"的档位，但它只在「帧都在、只是晚到」时有用；
+// 对"帧根本没发出来"（PTS 轴有洞）它只会让播放更晚，一帧也补不回来（见文件头的三种丢帧）。
+inline constexpr std::size_t kDepthLadder[] = {1, 2, 4, 8, 16};
 inline constexpr std::size_t kDepthLadderSize = sizeof(kDepthLadder) / sizeof(kDepthLadder[0]);
 
 struct JitterBufferStats {

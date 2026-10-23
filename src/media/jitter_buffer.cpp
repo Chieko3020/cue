@@ -15,14 +15,17 @@ int64_t clamp_interval(int64_t v) {
   return v;
 }
 
-// 覆盖当前抖动所需的最低档位。分界按 kDepthLadder = {1,2,4,8} 帧取：
-// 0 档（1 帧驻留）能吃下半帧以内的抖动，1 档（2 帧）吃 1.5 帧以内，依此类推。
-// 分界取半个档位而不是整数档位，是为了让"刚好在边界"的抖动不至于把档位顶上去。
+// 覆盖当前抖动所需的最低档位。分界取「阶梯深度 − 0.5」，于是 0 档（1 帧驻留）能吃下
+// 半帧以内的抖动，1 档（2 帧）吃 1.5 帧以内，依此类推。分界取半档而不是整档，是为了让
+// "刚好在边界"的抖动不至于把档位顶上去。
+// 用阶梯本身推导而不是写死 0.5/1.5/3.5/7.5：加长 kDepthLadder 时不必再改这里，否则
+// 「阶梯加了 16 帧档、want_level 却永远返回 ≤3」这种漏改会让最深的档位永远用不上
+// （而它看起来像是"没触发"，不是"没接线"）。
 std::size_t want_level(double jitter_frames) {
-  if (jitter_frames < 0.5) return 0;
-  if (jitter_frames < 1.5) return 1;
-  if (jitter_frames < 3.5) return 2;
-  return 3;
+  for (std::size_t i = 0; i < kDepthLadderSize; ++i) {
+    if (jitter_frames < static_cast<double>(kDepthLadder[i]) - 0.5) return i;
+  }
+  return kDepthLadderSize - 1;
 }
 
 }  // namespace
@@ -94,6 +97,9 @@ void JitterBuffer::evict_one() {
   // 优先挤掉最旧的一帧：直播链路里旧帧的价值随时间单调下降，留着它只会垫高延迟。
   // 但关键帧不挤——它是解码重启点，丢了它后面整个 GOP 的 P 帧全废。
   // 前端是 IDR 时退而挤掉它后面最旧的非关键帧（那一帧的位置会在放行时算成 skipped）。
+  // 这是"到达成簇"唯一能造成丢帧的路径：稳态下队首一到目标深度就放行，队列长不起来；
+  // 只有当队首被空洞挡住（在等 budget/nack_wait）时，簇里多出来的帧才会有机会把
+  // max_frames 顶穿。容量因此必须 >= 最深档位，否则深处的档位自己就会制造丢帧。
   std::size_t victim = 0;
   if (q_.front().frame.keyframe) {
     for (std::size_t i = 1; i < q_.size(); ++i) {
@@ -117,6 +123,9 @@ std::vector<JitterFrame> JitterBuffer::release_ready(int64_t now_us) {
     if (gap) {
       // 前端前面有空洞：只有预算能放弃那个缺失帧。这正是乱序帧回到正确位置的机会窗口，
       // 提前放行等于自己把窗口关掉。
+      // 一簇 0.4 s 的到达空档只会在这里停留一次 budget：簇的头一帧到场时 wait 从 0 起算，
+      // 等满 budget 后整簇按 PTS 顺序一次性放完（后面的帧之间没有空洞，走下面那一支）。
+      // 所以"成簇"体现为**延迟**（每簇白等一个 budget + 放行时的突发），不是丢帧。
       // 关键帧例外——IDR 不依赖缺失的前序帧，白等一个预算只会拉高延迟。
       int64_t need = front.keyframe ? hold : std::max(hold, cfg_.budget_us);
       // 与 NACK 联动：缺失的那一段正在被重传时，把预算放宽到一次往返的量级。
@@ -160,6 +169,15 @@ void JitterBuffer::maybe_adapt() {
 
   const std::size_t level = stats_.level;
   if (loss >= cfg_.loss_up || jitter_frames >= cfg_.jitter_up_frames) {
+    // 升档判据有两条，语义完全不同，别混着读：
+    //   jitter_frames —— 到达抖动（只算「晚到」，见 observe_arrival）。这是缓冲真能吸收的量，
+    //                    升档 = 用延迟换顺序，代价换得到东西。
+    //   loss（window_skipped_）—— PTS 空洞，也就是「帧根本没到齐」。升档对它一点用都没有：
+    //                    缺失的帧不会因为等得更久就出现，只是把放弃它之前白等的时间从 budget
+    //                    拉长到更深档位的 hold。所以在真正丢包的链路上，档位会一路顶到
+    //                    max_level、延迟涨满，而 skipped 依然按原速率增长——这条路径是
+    //                    "延迟换不到任何质量"，排查时看到「档位一直最高 + skipped 稳定增长」
+    //                    就该去查发送端，而不是继续调缓冲。
     clean_windows_ = 0;
     if (level < cfg_.max_level) {
       stats_.level = level + 1;
@@ -208,6 +226,10 @@ std::vector<JitterFrame> JitterBuffer::push(JitterFrame frame, int64_t now_us) {
   if (have_last_released_ && frame.pts_us <= last_released_pts_) {
     // 它的位置已经过去了（比最近放行的帧还旧，或同 PTS 的重复帧）：按序输出已经不可能，
     // 硬塞进来只会让解码顺序倒挂，所以丢掉并计数。
+    // 注意：这一支**不会**被"到达空档"触发。空档期间没有帧可放行，last_released_pts_ 不会
+    // 前进；空档结束后到达的帧 PTS 必然大于它（否则就不是空档，而是乱序）。走到这里说明
+    // 发送端的 PTS 轴自己重复或倒退了——OBS 虚拟摄像头重复发同一帧就是最典型的一例，
+    // 那不是网络成簇，也不是缓冲深度不够，加长阶梯对此一帧都救不回来。
     ++stats_.late_dropped;
     maybe_adapt();
     return {};
