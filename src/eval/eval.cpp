@@ -1553,13 +1553,25 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     o.error_kind = "no_retest_sample";
     return o;
   }
-  // 取最后一条有 cued 采样的点（与旧实现同口径：m 是"重测窗口里最新的一次读数"）
+  // 重测窗口的读数：**fps 取最后 3 条的中位数**（报告口径一直这么写），
+  // 其余字段取最新一条。
+  //
+  // 只取"最后一条 samples>0 的点"是不够的：samples>0 并不保证 fps>0。
+  // cued 刚重启的那一瞬间，采样是有的，但窗口里还没有帧 → fps 记 0，
+  // 于是 fps_min=25 判失败，而同一 case 的日志里"复测 fps"（三条件中位）是 28.7。
+  // 实测 netdelay-400ms 三次 repeat 里就有一次踩到这个窗口，
+  // 表现为 report.final_fps=0.0 但 eval.log 三次都是 sla=1 —— 两个口径不一致。
   Metrics m;
-  for (auto it = post.rbegin(); it != post.rend(); ++it) {
+  std::vector<double> recent_fps;
+  for (auto it = post.rbegin(); it != post.rend() && recent_fps.size() < 3; ++it) {
     if (it->m.samples > 0) {
-      m = it->m;
-      break;
+      if (m.samples == 0) m = it->m;  // 最新一条作为其余字段的基准
+      recent_fps.push_back(it->m.fps);
     }
+  }
+  if (!recent_fps.empty()) {
+    std::sort(recent_fps.begin(), recent_fps.end());
+    m.fps = recent_fps[recent_fps.size() / 2];
   }
   m.probe = summarize_probe_window(post);
 

@@ -278,7 +278,12 @@ struct RunConfig {
   //   3 s 的 settle 正好把重测的三个样本全压在 level 2 窗口里，于是
   //   buffer p50 = 99 ms、端到端 p50 = 107 ms，而 cued 侧早就 30 fps、dropped=0。
   // 6 s 覆盖"突发 → 升档 → 回落"的完整过程；代价是每个 case 多 3 s（54 个约 +162 s）。
-  int sla_settle_ms = 6000;
+  // 6 s 之后再延到 10 s：fps 判据改用「最后 3 条的中位数」（与报告口径一致）后，
+  // 暴露出 cued 重启后的 fps 爬升期——6 s 时最近 3 条里仍有 2 条是 0，
+  // 中位数被拉成 0，fps_min=25 判失败（54 次里 16 次）。
+  // 之前用「最后单点」时恰好落在爬升之后，于是虚高成 98.1%。
+  // 等 cued 真正稳定再取中位，是唯一诚实的做法（不能靠"挑有利样本"过）。
+  int sla_settle_ms = 10000;
   // SIGINT/SIGTERM：非空时每个 case 边界与等待循环检查，置位后尽快停管线退出
   const std::atomic<bool>* cancel = nullptr;
 };
