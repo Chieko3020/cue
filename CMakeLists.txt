@@ -98,6 +98,14 @@ find_package(Threads REQUIRED)
 # 所以：先按无组件找 Boost，再 QUIET 查 system 组件——有就链，没有就定义
 # BOOST_ERROR_CODE_HEADER_ONLY（两种方式功能等价）。这样 Linux 与 Windows/MinGW
 # 都能配置成功，且 Linux 上仍然走编译库（行为不变）。
+# Windows/MinGW：Boost.Asio 的 winsock 后端需要显式链 ws2_32（MSVC 由 pragma 自动带，
+# MinGW 不会）。放在 find_package(Boost) 之前用 link_libraries 全局生效——
+# cued / cue-probe / cue-serve / cue-capture 都走 Beast，逐个 target 加容易漏。
+if(WIN32)
+  add_compile_definitions(_WIN32_WINNT=0x0A00)  # Win10+，winsock 的 inet_pton 等需要
+  link_libraries(ws2_32)
+endif()
+
 find_package(Boost 1.83 REQUIRED)
 find_package(Boost 1.83 QUIET COMPONENTS system)
 if(TARGET Boost::system)

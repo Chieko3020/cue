@@ -13,6 +13,16 @@
 // （`--encode ffmpeg`，输出 Annex-B 裸流，由 AnnexBAuAssembler 按 AUD 分帧）。
 // 默认 inproc 的理由：encode_ms 只有进程内编码才有真实值；子进程编码时这一项如实写 null。
 // 音频固定进程内：PCM → swr_convert（libswresample）→ 48 kHz mono → libopus 20 ms 帧。
+#if defined(_WIN32)
+// Windows：winsock2 必须先于 windows.h（否则 winsock1 的头先被拉进来，socket 类型冲突）。
+// ws2_32 由 CMake 的 target_link_libraries 负责。
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <io.h>
+#include <fcntl.h>
+#include <process.h>
+#include <signal.h>
+#else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -23,6 +33,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -915,7 +926,7 @@ void audio_loop(AudioContext ctx) {
     send_frames();
   }
   if (!mono.empty()) {
-    log_line("音频尾部不足一帧（%zu 样本）未发送", mono.size());
+    log_line("音频尾部不足一帧（%llu 样本）未发送", static_cast<unsigned long long>(mono.size()));
   }
 }
 
@@ -930,7 +941,8 @@ void sender_loop(FrameQueue& q, WsSender& ws, Stats& st, uint32_t stream_id,
       // 超过 1024 分片上限的帧对端会拒（wire.h 的 FragCountTooLarge）：发送端先丢并计数，
       // 不让"被对端拒"混进网络丢包的证据里。
       st.oversized.fetch_add(1, std::memory_order_relaxed);
-      log_line("帧 %u 超过协议分片上限（%zu 字节），已丢弃", f.frame_id, f.data.size());
+      log_line("帧 %u 超过协议分片上限（%llu 字节），已丢弃", f.frame_id,
+               static_cast<unsigned long long>(f.data.size()));
       continue;
     }
     cue::proto::UpstreamMedia m;
@@ -1285,7 +1297,8 @@ int capture_inproc(ChildProcess& video_src, X264Encoder& enc, const Options& o,
       break;
     }
     if (st == IoStatus::Eof) {
-      if (got > 0) log_line("视频源 EOF（尾帧不完整：%zu/%zu 字节，丢弃）", got, raw_size);
+      if (got > 0) log_line("视频源 EOF（尾帧不完整：%lld/%lld 字节，丢弃）", static_cast<long long>(got),
+               static_cast<long long>(raw_size));
       child_encode_done = true;
       break;
     }
@@ -1494,7 +1507,8 @@ int dump_wire_examples(const std::string& path) {
   }
   std::fwrite(out.data(), 1, out.size(), f);
   std::fclose(f);
-  log_line("协议样例已写入 %s（%zu 个 case）", path.c_str(), cases.size());
+  log_line("协议样例已写入 %s（%llu 个 case）", path.c_str(),
+           static_cast<unsigned long long>(cases.size()));
   return 0;
 }
 
@@ -1764,9 +1778,17 @@ int run(const Options& o) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::signal(SIGINT, on_signal);
-  std::signal(SIGTERM, on_signal);
-  std::signal(SIGPIPE, SIG_IGN);
+#if defined(_WIN32)
+  // Windows 没有 SIGPIPE（写已关闭的 socket 由异步错误而不是信号体现），
+  // 也没有 SIGTERM；Ctrl-C 用 CRT 的 signal 处理就够了（SetConsoleCtrlHandler 更完整，
+  // 但这里只需要「能优雅停」）。
+  // 用全局 ::signal 而不是 std::signal：MinGW 的 <signal.h> 只把符号放进全局命名空间。
+  ::signal(SIGINT, on_signal);
+#else
+  ::signal(SIGINT, on_signal);
+  ::signal(SIGTERM, on_signal);
+  ::signal(SIGPIPE, SIG_IGN);
+#endif
 
   Options o;
   std::string err;
