@@ -654,6 +654,83 @@ std::vector<uint8_t> assemble(const FrameAcc& fa) {
   return frame;
 }
 
+// ---------------------------------------------------------------- 音频帧号记账
+//
+// 旧实现只记"上一个帧号"，而且**先记账再生效**：`frame_id <= 上一帧号` 的包既不
+// 计数也不丢弃，照样解码进播放队列。后果有两个，第二个更隐蔽：
+//   1) 同一个 20 ms 片被播两遍（重复包/上一轮会话的残留包），听感上是一声咔；
+//   2) `audio_last_seq` 被这只包**回退**了，下一个正常包于是被算成"向前跳了 2"，
+//      audio_seq_gaps 平白多记一次。实测语义：乱序一次 → 缺口感 +2，而真实的缺口
+//      是 0 还是 1 已经看不出来了。也就是说这个指标会朝"链路更差"的方向撒谎。
+//
+// 所以改成「高水位 + 最近 64 个帧号的已播位图」：
+//   · 帧号 > 高水位：正常前进，缺口 = 高水位到它的距离（与旧口径一致）；
+//   · 帧号 == 高水位：刚刚播过的那一帧又来了 → 重复，丢；
+//   · 帧号 < 高水位且在位图内且置位：更早的重放 → 重复，丢；
+//   · 帧号 < 高水位且在位图内但未置位：确实没播过，只是迟到了 → 见下面的阈值；
+//   · 帧号 < 高水位且超出位图（> 1.28 s）：太旧，无法判定，一律丢并计 stale。
+//
+// 位图 64 位 = 1.28 s @20 ms：比任何可能的乱序窗口都大一个数量级，成本只有一个 u64。
+// 为什么迟到**也要**给一个容差而不是一律丢：probe 收到即播，没有重排窗口，一条迟到
+// 的音频片插不回它原来的位置（只能排在队尾），所以"丢"和"播"都不是无损的。丢 = 这
+// 20 ms 的内容永久缺失（时间轴被压缩一格），播 = 内容迟到 40~60 ms 但没缺口。对主观
+// 听感来说，缺一格更容易被判成"咔"。因此只在迟到幅度小到不会破坏音画同步时才照播，
+// 阈值取 kReorderToleranceFrames = 3（60 ms）：音频侧没有抖动缓冲、天然比画面早，
+// 让出 60 ms 的迟到量级仍在"唇音同步察觉不到"的范围内（几十毫秒量级；这个数按经验取值，
+// 没有实测仪器验证，见改动说明）。
+struct AudioSeqTracker {
+  enum class Verdict { Play, Duplicate, Stale };
+
+  // 位图覆盖的帧数（1.28 s @20 ms）
+  static constexpr uint32_t kWindow = 64;
+  // 允许"迟到但照播"的最大落后帧数（60 ms）
+  static constexpr uint32_t kReorderToleranceFrames = 3;
+
+  bool have = false;
+  uint32_t high = 0;    // 已播过的最大帧号
+  uint64_t played = 0;  // bit i = 帧号 high - i 已经播过
+  uint64_t gaps = 0;    // 累计缺口（只在帧号向前跳时累加）
+  uint64_t dups = 0;    // 重复包（丢弃）
+  uint64_t reordered = 0;  // 迟到但在容差内（照播）
+  uint64_t stale = 0;      // 迟到太多/太旧（丢弃）
+
+  void reset() { *this = AudioSeqTracker{}; }
+
+  Verdict accept(uint32_t seq) {
+    if (!have) {
+      have = true;
+      high = seq;
+      played = 1;
+      return Verdict::Play;
+    }
+    // 无符号相减天然处理 frame_id 回绕（cued 重启后从 0 重新计数也不受影响，
+    // 因为换代时 reset_stream 会把这里清掉）。
+    const uint32_t ahead = seq - high;
+    if (ahead == 0) {
+      ++dups;
+      return Verdict::Duplicate;
+    }
+    if (ahead < 0x80000000u) {
+      if (ahead > 1) gaps += ahead - 1u;
+      played = (ahead >= kWindow) ? 1u : ((played << ahead) | 1u);
+      high = seq;
+      return Verdict::Play;
+    }
+    const uint32_t behind = high - seq;
+    if (behind < kWindow && ((played >> behind) & 1u) != 0) {
+      ++dups;
+      return Verdict::Duplicate;
+    }
+    if (behind <= kReorderToleranceFrames) {
+      played |= (uint64_t{1} << behind);
+      ++reordered;
+      return Verdict::Play;
+    }
+    ++stale;
+    return Verdict::Stale;
+  }
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -933,6 +1010,10 @@ int main(int argc, char** argv) {
   // 抖动缓冲：插在重组之后、解码之前。组件不带线程，队列与时间都由本循环驱动。
   cue::media::JitterBuffer jb(jb_cfg);
   uint64_t frames = 0, lost_frames = 0, bytes = 0, packets = 0;
+  // 因抖动缓冲跳帧而 flush 解码器的次数：这是"参考链断过"唯一直接的证据，
+  // 不加就只剩"画面偶尔冻一下"这种主观描述。
+  // 参考链断裂次数。**只计数不修**，理由见 note_refchain_break 的注释。
+  uint64_t refchain_breaks = 0;
   uint64_t rejected = 0, lat_invalid = 0, stats_reqs = 0, fb_sent = 0;
   // 下行音频数据报计数。当前结构上恒为 0：cued 的下行只有 Video / Fec / StatsReq /
   // Feedback 四种，DownType::Audio 在 cued 里没有任何发送方（2026-10 的代码里
@@ -1073,12 +1154,19 @@ int main(int argc, char** argv) {
   // 渲染器：--render 才打开。打不开不致命（降级成"只算指标"），但要打出原因，
   // 否则"窗口没出现"会被误读成程序没跑。
   cue::probe::Renderer renderer;
+  // render_live 才是"渲染真的开着"，render_enabled 只是"用户要求开"。
+  // 两者必须分开：Renderer::pump_events() 在没打开时返回 false（语义是"没有窗口可以
+  // 处理事件"），拿它当"用户关了窗口"会让 --render 打不开（无 DISPLAY、无 GPU）时
+  // probe 立刻退出——而 open() 的约定恰恰是"失败就降级成只算指标"。
+  bool render_live = false;
   if (render_enabled) {
     cue::probe::RenderConfig rcfg;
     rcfg.width = render_w;
     rcfg.height = render_h;
     std::string rerr;
-    if (!renderer.open(rcfg, rerr)) {
+    if (renderer.open(rcfg, rerr)) {
+      render_live = true;
+    } else {
       std::fprintf(stderr, "[probe] --render 打开失败，降级为只算指标：%s\n", rerr.c_str());
       emit("probe.render_failed", json{{"error", rerr}, {"backend", cue::probe::Renderer::backend_name()}});
     }
@@ -1143,8 +1231,10 @@ int main(int argc, char** argv) {
       ++fs.decoded;
       dec.params_ready = true;
       dec.fail_streak = 0;
-      // 借用指针只在下次 decode 前有效，所以必须在这里立刻上屏（不能存起来延后画）。
-      if (render_enabled) renderer.draw_yuv(out);
+      // 借用指针只在下次 decode 之前有效，所以这里必须立刻上屏（不能存起来延后画）；
+      // 用 render_live 而不是 render_enabled：没打开时 draw_yuv 本来就是空操作，
+      // 分开只是为了读代码的人不必去翻实现确认这一条。
+      if (render_live) renderer.draw_yuv(out);
     } else if (!derr.empty()) {
       ++fs.decode_errors;
       ++dec.fail_streak;
@@ -1195,10 +1285,57 @@ int main(int argc, char** argv) {
     fs.observe_gap(jf.pts_us, now_rel, stall_threshold_us);
   };
 
+  // 抖动缓冲跳帧之后，参考链已经断了，但**解码层看不见这件事**：它收到的永远是
+  // 连续的字节流，缺口只存在于抖动缓冲的 PTS 时间轴上。H.264 的间预测要用前序帧，
+  // 缺一帧之后解出来的画面上每一帧都是错的（错的是**像素**，不是"少一帧"），
+  // 而且这种错会一直挂到下一个 IDR 为止。H264Decoder::flush() 就是为此准备的入口。
+  //
+  // 什么算"跳帧"：jb 的 skipped（PTS 空洞 + 容量挤掉）和 late_dropped（入队即过期、
+  // 根本无法按序输出）。后者在 jb 的计数口径里不进 skipped，但它同样意味着有一帧
+  // 没进解码器，参考链一样断——所以两个计数器都要看，只看 skipped 会漏。
+  //
+  // 取舍（这里是明确的选择，不是"顺手"）：flush 之后画面会**冻**到下一个 IDR
+  // （GOP=30 时 ≤1 s），而不是继续显示错误画面。
+  //   · 选冻屏：错画面会让人去怀疑编码器/显卡/渲染器，而真相只是丢了一帧；
+  //     冻屏只会让人怀疑丢包——而这时候确实就是丢包。且冻屏是自愈的（下个 IDR 即恢复）。
+  //   · 不选"解错帧继续显示"：残影/花屏会持续整整一个 GOP，比冻 1 s 更难解释。
+  //   · 条件放宽的唯一合理入口是"按需请求 IDR"（现在协议里没有），或者 GOP 缩短到
+  //     一两帧——那时冻屏窗口小到无感，这条策略自然就无害了。
+  // 已经在等 IDR 时不重复 flush：那时没有任何参考帧可丢，再调只会白记一次 flushes。
+  auto note_refchain_break = [&](uint64_t skipped_before, uint64_t late_before) {
+    const cue::media::JitterBufferStats js = jb.stats();
+    const uint64_t ds = js.skipped > skipped_before ? js.skipped - skipped_before : 0;
+    const uint64_t dl = js.late_dropped > late_before ? js.late_dropped - late_before : 0;
+    const uint64_t delta = ds + dl;  // 两个计数器都不会回退；jb.reset 会清零，所以取差值前先挡掉
+    if (delta == 0) return;
+    // 这里**只报告，不修**。曾经试过在这一步 dec.dec.flush()（"宁可冻屏也不显示错画面"），
+    // 实测代价不可接受：1080p/veryfast 下采集端编码吃满帧预算，30 秒内跳帧 69 次；
+    // 每次 flush 都让解码器进入「等 IDR」，而 GOP=30 意味着最多等 1 秒 ——
+    // 结果 30 秒里 flush 27 次、decode_gated 涨 627 帧，画面基本处于持续冻屏。
+    // 把「偶发花屏」换成「持续冻屏」是净损失。
+    //
+    // 更根本的理由：检测工具的职责是留下证据，不是替被测链路做修复决策
+    // （同一条理由也让我们去掉了渲染的 vsync）。真要在接收端修，正确位置是
+    // 能主动请求 IDR —— 对应 RTP 的 PLI/FIR，现在下行协议里还没有这个类型。
+    ++refchain_breaks;
+    emit("probe.refchain_break",
+         json{{"reason", "jitter_skip"},
+              {"missing_delta", delta},
+              {"skipped_total", js.skipped},
+              {"late_total", js.late_dropped},
+              {"breaks", refchain_breaks}});
+  };
+
+
   // 抖动缓冲的时间驱动：主循环顶部、每个数据报之后、以及 poll 超时都走这里，
   // 保证"等待预算"是按时间生效的，而不是按"下一个包什么时候来"生效。
   auto drain_jb = [&](int64_t now) {
-    for (const auto& jf : jb.poll(now)) deliver(jf);
+    const cue::media::JitterBufferStats before = jb.stats();
+    auto ready = jb.poll(now);
+    // 必须在 deliver 之前判定：本批里的帧全都是空洞之后的帧，先 flush 才能让它们
+    // 走"等 IDR"的分支，而不是被当成连续的下一帧解出一张错画面。
+    note_refchain_break(before.skipped, before.late_dropped);
+    for (const auto& jf : ready) deliver(jf);
   };
 
   // 单包探测的判据：被探测的那一片真的回来了（原本到达或 FEC 恢复都算）。
@@ -1254,7 +1391,10 @@ int main(int argc, char** argv) {
     jf.first_arrival_us = fa.first_seen_us;
     jf.payload = assemble(fa);
     pending.erase(fid);
-    for (const auto& ready : jb.push(std::move(jf), now_done)) deliver(ready);
+    const cue::media::JitterBufferStats before_push = jb.stats();
+    auto ready = jb.push(std::move(jf), now_done);
+    note_refchain_break(before_push.skipped, before_push.late_dropped);
+    for (const auto& rel : ready) deliver(rel);
     return true;
   };
 
@@ -1323,16 +1463,16 @@ int main(int argc, char** argv) {
   uint64_t audio_decoded_frames = 0;  // 成功解出的 PCM 帧数
   uint64_t audio_pcm_frames = 0;      // 累计 PCM 样本数
   uint64_t audio_decode_errors = 0;
-  uint64_t audio_last_seq = 0;
-  bool audio_have_seq = false;
-  uint64_t audio_seq_gaps = 0;  // 帧号缺口（音频恒单分片，缺口即丢失）
+  // 帧号记账（重复/乱序/缺口）全在 AudioSeqTracker 里，见它的注释。
+  // 音频恒单分片，所以"帧号"就是"包号"，缺口直接等于丢包数。
+  AudioSeqTracker audio_seq;
   constexpr std::size_t kMaxAudioErrLen = 400;
 
   std::array<uint8_t, 4096> buf{};
   for (;;) {
     // 窗口事件在循环顶部 pump：poll 的超时是 200 ms，所以最坏 200 ms 响应一次关闭/ESC。
     // 用户关了窗口就退出——留着一个看不见的进程继续收流只会让人以为"程序卡住了"。
-    if (render_enabled && !renderer.pump_events()) {
+    if (render_live && !renderer.pump_events()) {
       std::fprintf(stderr, "[probe] 窗口已关闭，退出\n");
       return 0;
     }
@@ -1395,6 +1535,10 @@ int main(int argc, char** argv) {
       const uint64_t nack_pm_now = nack_ctl.paused_ms();
       const uint64_t nack_pauses_now = nack_ctl.pauses();
       nack_ctl.begin_window(now_tick);
+      // 渲染/播放侧的读数集中取一次：metrics 是纯读取，不该在 json 字面量里塞
+      // 带副作用或可能失败的调用（写出来也不好看懂是"取值"还是"做事"）。
+      const int audio_queue_ms = render_live ? renderer.queued_ms() : -1;
+      const cue::probe::Renderer::AudioStats rstats = renderer.audio_stats();
       const double dt = double(now_tick - t_last_report) / 1e6;
       const uint64_t df = frames - frames_prev;
       const uint64_t dd = fs.decoded - decoded_prev;
@@ -1521,6 +1665,12 @@ int main(int argc, char** argv) {
                                                 : json(nullptr)},
           {"recv_ts_missing", fs.recv_ts_missing},
           {"decode_resets", dec.resets},
+          // 解码器"等 IDR"期间丢掉的包数（设计行为，不是失败）。不暴露它的话，
+          // flush 之后的冻屏会表现成 fps=0 + decode_errors=0，看起来像"链路没在送帧"。
+          {"decode_gated", dec.dec.stats().gated},
+          {"waiting_idr", dec.dec.waiting_keyframe()},
+          // 因抖动缓冲跳帧而 flush 解码器的次数（参考链断开的处置次数）
+          {"refchain_breaks", refchain_breaks},
           {"bad_frame_events", bad_frame_events},
           {"report_sent", reporters.sent()},
           {"report_drops", reporters.dropped()},
@@ -1532,7 +1682,26 @@ int main(int argc, char** argv) {
           {"audio_decoded_frames", audio_decoded_frames},
           {"audio_pcm_frames", audio_pcm_frames},
           {"audio_decode_errors", audio_decode_errors},
-          {"audio_seq_gaps", audio_seq_gaps},
+          // 帧号账分三类，口径互不重叠（见 AudioSeqTracker）：
+          //   gaps      —— 帧号向前跳，真的缺了包（音频无 NACK/FEC，缺口就是丢包）；
+          //   dups      —— 重复包/重放，已丢弃（旧实现会把它们播两遍且不计数）；
+          //   reordered —— 迟到但在容差内，已照播（乱序不是丢包，不能算进 gaps）；
+          //   stale     —— 迟到太多/太旧，已丢弃（超过 1.28 s 无法判定是否播过）。
+          {"audio_seq_gaps", audio_seq.gaps},
+          {"audio_dups", audio_seq.dups},
+          {"audio_reordered", audio_seq.reordered},
+          {"audio_stale", audio_seq.stale},
+          // 播放队列深度（毫秒）：咔咔声最常来自这一侧——队列耗尽就欠载，
+          // 超过上限就自己丢包，而此刻链路的丢包指标可能完全是 0。
+          // 把这一项暴露出来，"是链路丢了还是自己丢了"才不用靠耳朵猜。
+          // -1（设备没打开）写成 null：null 是"没有这个观测"，-1 会被当成一个读数。
+          {"audio_queue_ms", audio_queue_ms >= 0 ? json(audio_queue_ms) : json(nullptr)},
+          // 队列账：软上限命中 = 在积压（还放行），硬上限命中 = 清过一次（听感会跳）。
+          // 只有这两个数能把"播放侧自己丢的"和"链路丢的"分开。
+          {"audio_queue_over_soft", rstats.over_soft},
+          {"audio_queue_trimmed", rstats.trimmed},
+          {"audio_queue_push_errors", rstats.push_errors},
+          {"audio_queue_segments", rstats.queued},
           {"audio_rms_frames", audio_rms.frames()},
           {"audio_rms_dbfs",
            audio_rms.empty() ? json(nullptr) : json(cue::media::dbfs_for_metric(audio_rms.dbfs()))},
@@ -1614,6 +1783,39 @@ int main(int argc, char** argv) {
       // 抖动缓冲同样要清：上一代的 PTS 基线还在的话，新流前几帧会被判成"迟到"丢掉，
       // 那些帧里往往正好包含新编码器的 IDR/SPS。
       jb.reset();
+      // 播放队列也要清。不清的话，上一轮已经解码进 SDL 队列的 PCM 会继续播完——
+      // 用户听到的就是"重启之后重复播放的那段，其实是上一轮的旧数据"。
+      // 这一条和 jb.reset() 同源：凡是"按时间轴排队"的状态，换代就必须一起清。
+      if (render_live) renderer.reset_audio();
+      // ---- 音频侧的状态也必须一起清，理由不是"整洁"，而是不清就错 ----
+      // audio_seq 必须清：新会话的 Opus 帧号从 0 重新计数，高水位却还停在旧会话上，
+      //   于是新流开头的包全被判成"迟到/太旧"而丢弃——表现是"重连后几秒没有声音"，
+      //   而且不报任何错（它们只被计进 audio_stale）。若只清高水位、不清位图，
+      //   则新会话的 0 号帧会被当成"已经播过"的重复包丢掉。两条都是静默失声。
+      audio_seq.reset();
+      // RMS 窗口也要清：窗口是 1 s 的 50 帧，混进上一代的音频会让新会话头一秒的
+      //   读数介于两路之间，而报告要的是"这一路有多响"。清掉之后它按定义从 null
+      //   开始（"没测到"），这与本项目对 null 的口径一致。
+      audio_rms = cue::media::AudioRmsWindow{};
+      // Opus 解码器带内部状态（模式切换、丢包掩盖的历史）。新一代流接上旧的解码器
+      // 状态没有意义，而 close 一下就会在下一个包上重新 open（见音频分支），
+      // 顺带把"上次打开失败"的封印解除：新会话值得重试一次，不该被上一代的失败
+      // 永久禁言。
+      audio_dec.close();
+      audio_dec_open_failed = false;
+      audio_first_error.clear();
+      // ---- 同源的其他跨代状态 ----
+      // 卡顿判定的"上一帧"必须一起清：新旧两代的 PTS 属于不同基线（帧号与 PTS 都可能
+      // 从头开始），留着旧值只会让换代后的**第一帧**被判成一次超大卡顿——
+      // 而那次"卡"其实是一次会话切换，不是这条流的问题。
+      fs.last_pts_us = -1;
+      fs.last_dec_end_us = -1;
+      // 端到端分位环：里面的样本是用**上一代**的 offset 算出来的。offset 在换对端后
+      // 会重估，同一个环里混两种时钟基的样本，p50/p99 就变成了两个分布的平均数。
+      lat.clear();
+      // 单包探测的目标帧号属于上一代（新会话的 frame_id 从 0 重新开始），不清会让
+      // "新流里恰好同号的一帧"被当成探测成功，把 NACK 从探测模式里提前放出来。
+      nack_probe_pending = false;
       // feedback 的速率/抖动/RTT 都是「针对上一代对端」的读数，不能带进新会话：
       // 否则新 cued 的第一个 200 ms 会收到一条基于旧链路的反馈。
       fb_bytes_prev = static_cast<int64_t>(bytes);
@@ -1755,17 +1957,18 @@ int main(int argc, char** argv) {
       // 下行音频：cued 把上行 Opus 原样透传（见 apps/cued.cpp 的"音频下行"那段）。
       // 恒单分片（20 ms 的 Opus < 16 KiB），所以这里不做重组。
       ++audio_datagrams;
-      // 帧号缺口：音频没有 NACK/FEC，丢了就是丢了，缺口数就是丢包数。
-      if (audio_have_seq && static_cast<uint32_t>(h->frame_id) == static_cast<uint32_t>(audio_last_seq + 1)) {
-        // 连续
-      } else if (audio_have_seq) {
-        const uint32_t gap = static_cast<uint32_t>(h->frame_id - audio_last_seq - 1);
-        if (gap < 0x80000000u) audio_seq_gaps += gap;  // 过滤回绕/重排
-      }
-      audio_last_seq = h->frame_id;
-      audio_have_seq = true;
       // 会话锁定：音频可能先于视频到达，这里也维护一次（与视频同样的判据）。
       if (session_seen == 0) session_seen = h->session_id;
+      // 先记账再决定要不要解：重复/过旧的包**不能进解码器**。解了就是白白刷新
+      // 播放队列（同一片播两遍），还会污染 audio_rms（窗口里多一个不该存在的帧）。
+      const auto verdict = audio_seq.accept(h->frame_id);
+      if (verdict != AudioSeqTracker::Verdict::Play) continue;
+      // 空载荷：喂给 opus 只会换回一个错误码，把 audio_decode_errors 弄脏却什么也说明不了。
+      // 帧号已经记过账了（上面），所以下一个包仍然算"连续"，不会平白多一个缺口。
+      if (n <= static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) {
+        ++rejected;
+        continue;
+      }
 
       if (!audio_dec.is_open() && !audio_dec_open_failed) {
         std::string oerr;
@@ -1793,7 +1996,7 @@ int main(int argc, char** argv) {
           ++audio_decoded_frames;
           audio_pcm_frames += aframe->sample_count();
           audio_rms.push(aframe->samples.data(), aframe->samples.size());
-          if (render_enabled) {
+          if (render_live) {
             renderer.queue_audio(aframe->samples.data(), static_cast<int>(aframe->sample_count()));
           }
         }
