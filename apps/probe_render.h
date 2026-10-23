@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace cue::probe {
 
@@ -20,6 +21,13 @@ struct RenderConfig {
   int height = 0;
   int audio_rate = 48000;
   int audio_channels = 1;
+  // 播放输出设备名（子串匹配，忽略大小写）。空 = 用系统默认设备。
+  //
+  // 为什么一定要能指定：诊断为的是"听清楚链路送来的声音"，而默认输出设备在
+  // 虚拟声卡环境里往往是**被采集的那一路**（例如 VoiceMeeter 的 Input VAIO）。
+  // 那样 probe 的输出会立刻被采集端再收一遍，形成回环/回音，
+  // 听感上会让人误判成"链路有回声"。
+  std::string audio_out;
 };
 
 // 只有声明；实现在 probe_render.cpp（SDL2 不可用时是空实现）。
@@ -65,6 +73,10 @@ class Renderer {
   // 否则 --render 在无 DISPLAY/无 GPU 的环境打不开一次，probe 就会立刻退出，
   // 而 open() 的约定明明是"失败就降级成只算指标"。
   bool pump_events();
+
+  // 列出可用的**播放**设备名（用于让用户挑 --audio-out 的字符串）。
+  // 没有 SDL2 时返回空表。
+  static std::vector<std::string> audio_outputs();
 
   // 这个构建是否带 SDL2 支持。
   static bool available();

@@ -11,6 +11,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -40,7 +41,9 @@ struct Renderer::Impl {
   // 用途正是"我就要这么大的窗口"（RenderConfig 里 0 才表示"用第一帧的"）。
   bool window_auto = true;
   // 播放队列的观测量：不暴露这几个数，就只能靠"听起来有没有咔咔"来猜。
-  uint64_t audio_over_soft = 0;  // 超过软上限（仍然放行，只记账）
+  uint64_t audio_over_soft = 0;
+  // 因时钟漂移而丢掉的 20 ms 包数（见 queue_audio 的说明）。
+  uint64_t audio_dropped_drift = 0;  // 超过软上限（仍然放行，只记账）
   uint64_t audio_trimmed = 0;    // 超过硬上限被迫丢弃旧数据
   uint64_t audio_queued_pkts = 0;
   // 上一次整体纠正播放队列的时刻（毫秒）。见 queue_audio 里对限流的说明。
@@ -72,6 +75,17 @@ struct Renderer::Impl {
 
 Renderer::Renderer() = default;
 Renderer::~Renderer() { delete impl_; }
+
+std::vector<std::string> Renderer::audio_outputs() {
+  std::vector<std::string> out;
+  if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) return out;
+  const int n = SDL_GetNumAudioDevices(0);
+  for (int i = 0; i < n; ++i) {
+    const char* nm = SDL_GetAudioDeviceName(i, 0);
+    if (nm != nullptr) out.emplace_back(nm);
+  }
+  return out;
+}
 
 bool Renderer::available() { return true; }
 const char* Renderer::backend_name() { return "sdl2"; }
@@ -117,7 +131,34 @@ bool Renderer::open(const RenderConfig& cfg, std::string& err) {
   want.samples = 960;  // 20 ms @48k，与 Opus 帧对齐
   want.callback = nullptr;  // 用 SDL_QueueAudio，不要回调
   SDL_AudioSpec have{};
-  im->adev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+  // 选输出设备：cfg.audio_out 为空才用系统默认。
+  //
+  // 为什么不做"永远用默认"：在虚拟声卡环境里默认输出设备常常就是**被采集的那一路**
+  // （VoiceMeeter 的 Input VAIO 之类），于是 probe 播出来的声音立刻又被采集端收进去，
+  // 形成回环/回音——听起来像链路有回声，实际是本地自己的环。必须能显式指定。
+  std::string chosen;
+  const char* open_name = nullptr;
+  if (!cfg.audio_out.empty()) {
+    const int n = SDL_GetNumAudioDevices(0);  // 0 = 播放设备
+    std::string want_lower = cfg.audio_out;
+    for (auto& c : want_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    int hit = -1;
+    for (int i = 0; i < n; ++i) {
+      const char* nm = SDL_GetAudioDeviceName(i, 0);
+      if (nm == nullptr) continue;
+      std::string low(nm);
+      for (auto& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (low.find(want_lower) != std::string::npos) { hit = i; break; }
+    }
+    if (hit < 0) {
+      std::fprintf(stderr, "[probe] 找不到输出设备 \"%s\"，退回系统默认。可用设备见 --list-audio\n",
+                   cfg.audio_out.c_str());
+    } else {
+      open_name = SDL_GetAudioDeviceName(hit, 0);
+      chosen = open_name ? open_name : "";
+    }
+  }
+  im->adev = SDL_OpenAudioDevice(open_name, 0, &want, &have, 0);
   if (im->adev != 0) {
     // have 必须**真的**等于 want，不能只是"没报错"。
     //
@@ -142,6 +183,9 @@ bool Renderer::open(const RenderConfig& cfg, std::string& err) {
     } else {
       im->audio_hz = static_cast<int>(have.freq);
       im->audio_ch = static_cast<int>(have.channels);
+      std::fprintf(stderr, "[probe] 音频输出设备：%s%s（%d Hz / %d ch / s16）\n",
+                   chosen.empty() ? "(系统默认)" : chosen.c_str(),
+                   chosen.empty() ? "" : " ", im->audio_hz, im->audio_ch);
       SDL_PauseAudioDevice(im->adev, 0);
     }
   } else {
@@ -261,32 +305,35 @@ void Renderer::queue_audio(const int16_t* pcm, int samples) {
   //    那种情况宁可跳一次也不该让延迟无限涨）。
   //  SDL 没有"丢掉队首 N 字节"的接口（只有 Query/Clear），所以清空是唯一可用的
   //  修剪原语；这也是把硬上限做成"清空"而不是"截断"的原因。
-  // 播放侧队列的目标深度与纠正策略。
+  // 播放侧队列的纠正策略（第四版；前三版都被实测否掉，写清免得走回去）。
   //
-  // 实测过两版都不行：
-  //  · 只在超过 1000 ms 时清空 —— 队列稳定停在 520~760 ms（音画差半秒以上）却永不触发；
-  //  · 用 SDL_DequeueAudio 丢队首 —— Windows 后端实测返回 0，**什么都没删**，
-  //    而计数照样 +1，于是"每次都在修剪、深度却一动不动"（这是最容易骗过自己的一种修法）。
-  // 所以只能用 SDL_ClearQueuedAudio 做**一次性整体纠正**，并限流：
-  // 正常链路清一次就回到低延迟（产销速率相等，清完不会自己涨回去），
-  // 2 秒内不重复清，避免"每次偏差都跳一下"变成新的咔咔来源。
+  // v1 超过 200 ms 丢弃**新**包 → 稳定在阈值上，几乎每个包都丢 → 持续咔咔。
+  // v2 超过 250 ms 用 SDL_DequeueAudio 丢队首 → Windows 后端返回 0，什么都没删，
+  //    计数却 +1（"每次都在修剪、深度一动不动"）。
+  // v3 超过 250 ms 用 SDL_ClearQueuedAudio 清到 80 ms → 实测 295 次清空，
+  //    每次丢掉约 380 ms 真实音频；而且**对正在播放的设备清空会让它彻底哑掉**，
+  //    用户听到的"一段时间后完全没声音"就是它。
   //
-  // 为什么这个偏差一开始就有：启动瞬间采集端与中继会灌一段突发，队列被顶到几百毫秒；
-  // 之后生产速率 == 消费速率，它就**永远**停在那儿。所以启动后必须主动纠正一次。
-  constexpr double kTrimAboveMs = 250.0;
-  constexpr double kSoftMs = 300.0;
+  // 现在这一版基于实测的成因：音频到达速率是 1.002 秒/秒（几乎正好实时），
+  // 而声卡的消费速率与源有约 0.5% 的时钟漂移 ⇒ 队列会以 ~6 ms/s 缓慢上涨。
+  // 真实播放器用自适应重采样解决；这里没有重采样器，就用**最小代价的丢包**：
+  // 每越过上限只丢**当前这一个 20 ms 包**，丢完深度立刻回落 20 ms，
+  // 要再涨回上限需要好几秒 —— 于是听感是"每几秒漏一帧 20 ms"，
+  // 而不是"每隔一两分钟硬跳一次"。250 ms 的上限让延迟固定在可接受范围。
+  //
+  // 只有真积压（>2000 ms，说明出了问题而不只是漂移）才清空，且那是最后手段。
+  constexpr double kUpperMs = 250.0;
+  constexpr double kPanicMs = 2000.0;
   const double q = double(queued_ms());
-  if (q > kTrimAboveMs) {
-    const Uint64 now_ms = SDL_GetTicks64();
-    if (now_ms - impl_->last_trim_ms > 2000) {
-      SDL_ClearQueuedAudio(impl_->adev);
-      impl_->last_trim_ms = now_ms;
-      ++impl_->audio_trimmed;
-    } else {
-      ++impl_->audio_over_soft;  // 限流期内仍然记录：说明它在反复越线
-    }
-  } else if (q > kSoftMs) {
+  if (q > kPanicMs) {
+    SDL_ClearQueuedAudio(impl_->adev);
+    ++impl_->audio_trimmed;
+    impl_->last_trim_ms = SDL_GetTicks64();
+  } else if (q > kUpperMs) {
+    // 时钟漂移的代价：丢这一个包（20 ms 静音），换取整体不越积越深。
     ++impl_->audio_over_soft;
+    ++impl_->audio_dropped_drift;
+    return;
   }
   // samples 是"样本数"（不是帧数）：单声道的 s16 一个样本 2 字节，与 queued_ms()
   // 的换算口径必须一致（那里除以 2 字节/样本/声道）。

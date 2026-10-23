@@ -765,6 +765,11 @@ int main(int argc, char** argv) {
   // 就是 500 ms 的驻留延迟——那个档位要显式 --jitter-max-level 3 才打开。
   bool jitter_enabled = true;
   long long jitter_budget_ms = 40;
+  // 音频输出设备名（子串匹配）。空 = 系统默认。
+  // 虚拟声卡环境里系统默认常常就是被采集的那一路，会让 probe 播出的
+  // 声音回流进链路，听起来像回声——必须能指定。
+  std::string audio_out;
+  bool list_audio = false;
   long long jitter_max_level = 2;
   // 接收端抖动缓冲的目标深度（帧）。默认 2 与 JitterBufferConfig 的历史默认一致，
   // 但 cued 侧已经用 --jitter-target-frames 1（零驻留）时，两端假设必须对齐：
@@ -807,6 +812,10 @@ int main(int argc, char** argv) {
     } else if (a == "--jitter-budget-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 2000, jitter_budget_ms)) bad(a, val);
+    } else if (a == "--audio-out") {
+      audio_out = std::string(next());
+    } else if (a == "--list-audio") {
+      list_audio = true;
     } else if (a == "--jitter-target-frames") {
       const auto val = next();
       if (!parse_int(val, 0, 8, jitter_target_frames)) bad(a, val);
@@ -850,7 +859,7 @@ int main(int argc, char** argv) {
           "          [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..3]\n"
-          "          [--report-addrs host:port[,host:port]]\n"
+          "          [--audio-out NAME] [--list-audio] [--report-addrs host:port[,host:port]]\n"
           "  --nack-interval-ms 只决定「多长时间尝试一次」；实际发送上限是 8 包/秒\n"
           "  （SPEC §7.2），间隔 <125 ms 会被夹到该上限。冷却/单包探测不需要额外开关。\n"
           "  feedback（type=0x06）每 200 ms 自动发一条，无需参数。\n");
@@ -880,6 +889,13 @@ int main(int argc, char** argv) {
   jb_cfg.max_frames = cue::media::kDepthLadder[jb_cfg.max_level] + 2;
   jb_cfg.nominal_interval_us = frame_interval_us;
   jb_cfg.budget_us = jitter_budget_ms * 1000;
+  if (list_audio) {
+    // 打印可用播放设备，方便挑 --audio-out 的字符串（虚拟声卡的名字很难手打对）
+    for (const auto& nm : cue::probe::Renderer::audio_outputs()) {
+      std::printf("%s\n", nm.c_str());
+    }
+    return 0;
+  }
   jb_cfg.nack_wait_us = nack_wait_ms * 1000;  // 0 = 不联动（只有 budget 生效）
   jb_cfg.basis = (jitter_basis == "done") ? cue::media::JitterBasis::AssemblyDone
                                           : cue::media::JitterBasis::FirstFragment;  // 0 = 不联动（只有 budget 生效）
@@ -1167,6 +1183,7 @@ int main(int argc, char** argv) {
   if (render_enabled) {
     cue::probe::RenderConfig rcfg;
     rcfg.width = render_w;
+    rcfg.audio_out = audio_out;
     rcfg.height = render_h;
     std::string rerr;
     if (renderer.open(rcfg, rerr)) {
