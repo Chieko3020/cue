@@ -1170,6 +1170,8 @@ int main(int argc, char** argv) {
   uint64_t kf_req_sent = 0;
   uint64_t kf_req_suppressed = 0;
   bool kf_needed = false;  // 参考链断了、还没发出请求（主循环消费）
+  // 上次请求时的 decode_errors 水位：只有它增长（真的解不出图）才值得要 IDR。
+  uint64_t kf_err_baseline = 0;
   uint64_t rejected = 0, lat_invalid = 0, stats_reqs = 0, fb_sent = 0;
   // 下行音频数据报计数。当前结构上恒为 0：cued 的下行只有 Video / Fec / StatsReq /
   // Feedback 四种，DownType::Audio 在 cued 里没有任何发送方（2026-10 的代码里
@@ -1486,10 +1488,20 @@ int main(int argc, char** argv) {
     // （同一条理由也让我们去掉了渲染的 vsync）。真要在接收端修，正确位置是
     // 能主动请求 IDR —— 对应 RTP 的 PLI/FIR，现在下行协议里还没有这个类型。
     ++refchain_breaks;
-    // 断了就该主动要一个 IDR：否则只能等发送端的 GOP 到期（默认 1 秒），这段时间
-    // 画面持续错参考。这里只置位，真正发送放在主循环（那里才有 now 与发送助手，
-    // 也只有一处限流状态）——顺序依赖靠"置位 + 轮询"解掉，比前向声明干净。
-    kf_needed = true;
+    // 关键帧请求**只在真有丢包时**发起，不能只看"抖了一下"。
+    //
+    // 实测代价：OBS 源下 jb_skipped 每秒涨 2~4 帧，若据此请求 IDR，20 秒里就发出
+    // 27 次（1.35 次/秒）。而 IDR 体积是 P 帧的 10~20 倍，等于持续往链路上插码率尖峰：
+    // 撞上 VBV 之后后续 P 帧拿不到码率，正好在"视角大幅转动"这种最需要码率的时刻
+    // 变成色块。与此同时包到达侧是干净的（pkt_arr_gap_max_ms = 0、jb_late = 0），
+    // 说明这些 skipped 根本不是丢包造成的——为不存在的丢包付 IDR 的代价，是净亏。
+    //
+    // 判据改成"有真实损伤证据"：帧号空洞（late_dropped）或解码报错增长了才要。
+    // 单纯 skipped（发送端 PTS 轴上的洞、采集端出帧不匀）不应该触发请求。
+    if (dl > 0 || fs.decode_errors > kf_err_baseline) {
+      kf_err_baseline = fs.decode_errors;
+      kf_needed = true;
+    }
     emit("probe.refchain_break",
          json{{"reason", "jitter_skip"},
               {"missing_delta", delta},
@@ -1588,12 +1600,13 @@ int main(int argc, char** argv) {
   // 而解码器**看不出**这件事（它只收到一串连续的 Annex-B 字节，没有缺口标记）——
   // 所以"要不要请求"必须由这一层判断，这也正是它放在 probe 而不是解码器里的原因。
   //
-  // 冷却 300 ms：丢包常常成串，每跳一帧就发一次只会把 cued 的上游请求刷满。
+  // 冷却 1500 ms：IDR 是 P 帧的 10~20 倍大，请求太密本身就是码率尖峰的来源
+  // （实测 300 ms 冷却时达到 1.35 次/秒，反而放大了色块）。
   // 300 ms 比 cued→采集端那个 500 ms 冷却短一档，让"连续两次独立故障"仍然能各要一次。
   int64_t last_kf_req_us = 0;
   auto request_keyframe = [&](int64_t now, const char* reason) {
     if (!have_peer) return;
-    if (kf_req_sent > 0 && now - last_kf_req_us < 300'000) {
+    if (kf_req_sent > 0 && now - last_kf_req_us < 1'500'000) {
       ++kf_req_suppressed;
       return;
     }
