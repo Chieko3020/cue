@@ -86,6 +86,10 @@ const avgBytes = frames.reduce((s, f) => s + f.au.length, 0) / frames.length;
 
 // ---- WS + 时钟同步（与 test-client 一致：8 次 ping 取最小 RTT 的 offset）----
 let sawSummary = false;
+// onerror/onclose 要报 frames_sent，但它们可能在发送循环给这个变量赋值之前就触发。
+// 缺这行声明时，错误处理自己抛 ReferenceError，把真正的断连原因盖掉
+// （实测只看到 "sentFrames is not defined"，看不到 cued 到底是拒绝还是半路挂掉）。
+let sentFrames = 0;
 const ws = new WebSocket(url);
 ws.binaryType = 'arraybuffer';
 
