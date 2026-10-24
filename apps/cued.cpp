@@ -2425,6 +2425,24 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[cued] udp socket failed\n");
     return 1;
   }
+  // 自动对端（--probe-host 0.0.0.0）时，把下行 socket 绑到**已知端口** probe_port。
+  //
+  // 为什么必须这么做：这个 socket 平时只是个发送方，内核会给它一个临时端口
+  // （实测 57099）。而 NAT 注册要求 probe 能主动往服务器发 HELLO —— 它只能发到
+  // 一个**事先知道的**端口。临时端口没人知道，HELLO 就打空，穿透永远建立不起来。
+  // 绑到 probe_port 之后：HELLO 打到这个 socket，cued 从同一个 socket 回包，
+  // 源地址与 NAT 映射完全对应（这也正是 STUN 的做法：固定端口交换地址）。
+  if (probe_host == "0.0.0.0") {
+    sockaddr_in self_addr{};
+    self_addr.sin_family = AF_INET;
+    self_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    self_addr.sin_port = htons(probe_port);
+    if (::bind(usock, reinterpret_cast<const sockaddr*>(&self_addr), sizeof(self_addr)) != 0) {
+      std::fprintf(stderr, "[cued] 绑定下行 UDP 端口 %u 失败：%s\n",
+                   static_cast<unsigned>(probe_port), std::strerror(errno));
+      return 1;
+    }
+  }
   // 注入不再是对象状态：每条判定都从参数快照里的 (seed, pct) 现算（见 inject_drop），
   // 所以控制面改注入值立刻生效，不需要重启进程。上行注入用同一 seed 的派生值：
   // 两条链路的丢弃序列互不相关，但同一 (seed, pct) 仍然完全可复现。
