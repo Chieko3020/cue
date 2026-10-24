@@ -1890,7 +1890,24 @@ int main(int argc, char** argv) {
       nack_ctl.begin_window(now_tick);
       // 渲染/播放侧的读数集中取一次：metrics 是纯读取，不该在 json 字面量里塞
       // 带副作用或可能失败的调用（写出来也不好看懂是"取值"还是"做事"）。
-      const int audio_queue_ms = render_live ? renderer.queued_ms() : -1;
+      const int audio_queue_ms_now = render_live ? renderer.queued_ms() : -1;
+      // 1 Hz 的**瞬时**排队深度对音频没有意义：20 ms 一个包，采样点极大比例落在
+      // 两包之间的空档上，读数长期是 0 —— 实测就是这样（中位 0、而 audio_starved 为 0、
+      // dropped_drift 却有 64，三者互相矛盾）。保留瞬时值（aq_now）供排查，
+      // 另给窗口分位（aq/edge 两个字段），判断"有没有余量"只看后者。
+      static std::deque<int> aq_hist;
+      if (audio_queue_ms_now >= 0) {
+        aq_hist.push_back(audio_queue_ms_now);
+        if (aq_hist.size() > 60) aq_hist.pop_front();  // 约 60 秒窗口
+      }
+      std::vector<int> aq_sorted(aq_hist.begin(), aq_hist.end());
+      std::sort(aq_sorted.begin(), aq_sorted.end());
+      auto aq_pct = [&](double p) -> int {
+        if (aq_sorted.empty()) return -1;
+        std::size_t i = static_cast<std::size_t>(p * double(aq_sorted.size() - 1));
+        return aq_sorted[std::min(i, aq_sorted.size() - 1)];
+      };
+      const int audio_queue_ms = audio_queue_ms_now;
       const cue::probe::Renderer::AudioStats rstats = renderer.audio_stats();
       const double dt = double(now_tick - t_last_report) / 1e6;
       const uint64_t df = frames - frames_prev;
@@ -2095,6 +2112,9 @@ int main(int argc, char** argv) {
           // 把这一项暴露出来，"是链路丢了还是自己丢了"才不用靠耳朵猜。
           // -1（设备没打开）写成 null：null 是"没有这个观测"，-1 会被当成一个读数。
           {"audio_queue_ms", audio_queue_ms >= 0 ? json(audio_queue_ms) : json(nullptr)},
+          // 窗口分位（近 60 s）。判断播放侧余量看这两个，别看上面的瞬时值。
+          {"audio_queue_ms_p50", aq_pct(0.50) >= 0 ? json(aq_pct(0.50)) : json(nullptr)},
+          {"audio_queue_ms_p95", aq_pct(0.95) >= 0 ? json(aq_pct(0.95)) : json(nullptr)},
           // 音画同步的实际补偿量。没有这几个数，"补了多少、还差多少"只能靠耳朵判断。
           {"av_audio_ms", json(av_audio_ewma_ms)},
           {"av_video_ms", av_have_video_lat ? json(av_video_ewma_ms) : json(nullptr)},
