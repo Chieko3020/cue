@@ -921,6 +921,8 @@ struct Stats {
   std::atomic<uint64_t> oversized{0};
   std::atomic<uint64_t> audio_frames_sent{0};
   std::atomic<uint64_t> audio_bytes_sent{0};
+  // 音频定拍：因为落后太多而重锚的次数（见 audio_loop 里的说明）。
+  std::atomic<uint64_t> audio_pace_resets{0};
   std::atomic<uint64_t> audio_encode_errors{0};
 
   void add_encode_us(int64_t us) {
@@ -979,6 +981,8 @@ void audio_loop(AudioContext ctx) {
   uint32_t frame_id = 0;
   int64_t pts_base = 0;
   int64_t n_packets = 0;
+  // 音频定拍的下一个发送时刻（见 send_frames 里的说明）。0 = 还没锚定。
+  int64_t pace_next_us = 0;
   std::string err;
 
   auto send_frames = [&]() {
@@ -1000,6 +1004,38 @@ void audio_loop(AudioContext ctx) {
       m.frame_id = frame_id++;
       m.pts_us = static_cast<uint64_t>(pts);
       m.keyframe = true;  // 每个 Opus 包都是独立可解帧（浏览器侧同样置位）
+      // ---- 音频定拍（本函数最重要的几行）----
+      //
+      // 为什么必须在这里等：音频来自 ffmpeg 子进程读设备，而 DirectShow / 虚拟声卡是
+      // **按缓冲块交付**的——实测一簇约 0.4 秒。原来"读到就发"，于是上行、下行、
+      // 接收端播放队列全都跟着 0.4 秒一簇地脉动：接收端的播放队列深度在 0~500 ms 之间
+      // 锯齿摆动（实测中位 240、极差 500），而**同一簇内最早与最晚样本的播放延迟本身
+      // 就差 0.4 秒**——任何固定的音画补偿延迟都不可能全程同步。
+      // 按 20 ms 一包匀速吐出去之后，接收端队列深度会稳定在几十毫秒，延迟成为常量，
+      // 音画同步才是一个可解的固定值。
+      //
+      // pts 本来就是 t0 + n*20ms（不受调度抖动影响），这里补上"**发送时刻**也等距"。
+      // 落后超过 200 ms 就重锚：宁可丢一段节奏，也不要永久处于追赶状态
+      // （永久追赶意味着越积越多，最后连 pts 都和实际时间脱节）。
+      {
+        if (pace_next_us == 0) pace_next_us = ctx.sender->now_us();
+        const int64_t due = pace_next_us;
+        pace_next_us += 20000;
+        for (;;) {
+          const int64_t now = ctx.sender->now_us();
+          if (now >= due) {
+            if (now - due > 200'000) {
+              // 落后太多（例如线程被调度走了、或设备一次给了很长的块）：重锚到当前时刻。
+              pace_next_us = now;
+              ctx.stats->audio_pace_resets.fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+          }
+          if (g_stop != 0) return;
+          const int64_t remain = due - now;
+          std::this_thread::sleep_for(std::chrono::microseconds(remain > 2000 ? 2000 : remain));
+        }
+      }
       const auto packets = cue::proto::pack_upstream(*pkt, m);
       bool ok = true;
       for (const auto& p : packets) {
@@ -1138,6 +1174,9 @@ void emit_metrics(const StatsOutput& out, uint64_t& prev_captured, uint64_t& pre
          {"bytes_sent", out.sender->bytes_sent()},
          {"audio_frames_out", out.stats->audio_frames_sent.load(std::memory_order_relaxed)},
          {"audio_bytes_sent", out.stats->audio_bytes_sent.load(std::memory_order_relaxed)},
+         // 音频定拍重锚次数：非 0 说明这一秒里发送节奏被打断过（设备交付块过大
+         // 或线程被调度走），是"音画同步又开始漂"的早期信号。
+         {"audio_pace_resets", out.stats->audio_pace_resets.load(std::memory_order_relaxed)},
          {"audio_encode_errors", out.stats->audio_encode_errors.load(std::memory_order_relaxed)},
          {"backend", out.backend},
          {"encode", out.encode_mode},
