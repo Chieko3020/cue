@@ -68,6 +68,13 @@ using udp = net::ip::udp;
 using json = nlohmann::json;
 
 namespace {
+// ---- NAT 注册的对端状态（文件作用域：会话 lambda 与 nack 线程都要读写）----
+// 公网部署时 cued 要往 NAT 后面的客户端发 UDP。客户端先发 HELLO 打开映射，
+// 这里记住**观察到的源地址**，下行就用它。
+std::mutex g_peer_mu;
+sockaddr_in g_learned_peer{};
+std::atomic<bool> g_peer_ready{false};
+
 
 // 事件里的 t 是 unix 微秒（SSE/报告按墙钟展示）；延迟测量仍然只准用 cue::now_us()
 // 的单调时钟（common/clock.h）。两者不可混用，这里只用于「事件发生时刻」。
@@ -1139,11 +1146,22 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   double applied_queue_fps = std::numeric_limits<double>::quiet_NaN();
   constexpr std::size_t kSendQueueMax = 8192;  // 兜底：队列不能无限涨（约 4.5 min @30fps）
 
+  // 下行目标：自动模式下优先用 NAT 注册学到的地址（含 NAT 分配的外部端口），
+  // 否则用命令行给的 --probe-host/--probe-port。
+  auto current_target = [&]() -> sockaddr_in {
+    if (g_peer_ready.load(std::memory_order_acquire)) {
+      std::lock_guard<std::mutex> lk(g_peer_mu);
+      return g_learned_peer;
+    }
+    return probe_addr;
+  };
+
   // sendto 的返回值与 errno 不能丢：ENOBUFS/EMSGSIZE 会被算成「已发送」（review #16）
   auto send_dgram = [&](const std::vector<uint8_t>& d) -> bool {
+    const sockaddr_in dst = current_target();
     const ssize_t sn = ::sendto(usock, d.data(), d.size(), 0,
-                                reinterpret_cast<const sockaddr*>(&probe_addr),
-                                sizeof(probe_addr));
+                                reinterpret_cast<const sockaddr*>(&dst),
+                                sizeof(dst));
     if (sn < 0) {
       ++c.send_errors;
       err_log.log(cue::now_us(), std::string("sendto 失败: ") + std::strerror(errno));
@@ -2515,6 +2533,16 @@ int main(int argc, char** argv) {
   // 为什么必须有端口校验：多设备时每路下行发往**自己的**探针端口（README 的
   // "下行 UDP 归到哪"）。只按 session_id 路由的话，任意本机进程都能伪造一条 NACK 让
   // cued 重传另一路的包（反射放大，review #20）。所以「会话号 + 来源端口」两条都对上才处理。
+  // ---- NAT 注册（公网部署必需）----
+  // 公网上 cued 要往"客户端"发 UDP，而客户端在 NAT 后面：只有它先发包出去，
+  // 运营商的 NAT 才会为它建立映射，外界才能回包。所以约定一个 HELLO：
+  // probe 周期性发 8 字节 "CUEHELLO"，cued 记住**观察到的源地址**并把它当作下行目标。
+  // 这正是 WebRTC/STUN 的心智模型（先出后进），只是省掉了完整的 ICE。
+  //
+  // 为什么 HELLO 可以接受任意源：它只写一个地址、不触发任何重传或放大行为，
+  // 构不成反射放大器（NACK 仍然受 session_id + 源地址校验约束）。
+  // 只有在 --probe-host 0.0.0.0（"自动"）时才启用，固定地址时行为完全不变。
+  const bool auto_peer = (probe_host == "0.0.0.0");
   std::atomic<bool> stop_nack{false};
   std::atomic<uint64_t> nack_resends{0};
   const sockaddr_in probe_host_addr = make_probe_addr(probe_host, probe_port);
@@ -2534,14 +2562,30 @@ int main(int argc, char** argv) {
       socklen_t fl = sizeof(from);
       const ssize_t n = ::recvfrom(usock, nbuf.data(), nbuf.size(), MSG_DONTWAIT,
                                    reinterpret_cast<sockaddr*>(&from), &fl);
-      if (n < static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) continue;
-      // 源地址只认 --probe-host：任意源都能触发重传就是一个反射放大器（review #20）
-      if (from.sin_addr.s_addr != probe_host_addr.sin_addr.s_addr) continue;
+      if (n < static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) {
+        // 短包可能是 NAT 注册的 HELLO（8 字节），单独处理后丢弃。
+        if (auto_peer && n >= 8 && std::memcmp(nbuf.data(), "CUEHELLO", 8) == 0) {
+          {
+            std::lock_guard<std::mutex> lk(g_peer_mu);
+            g_learned_peer = from;
+          }
+          if (!g_peer_ready.exchange(true, std::memory_order_acq_rel)) {
+            char ip[INET_ADDRSTRLEN]{};
+            ::inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+            emit_event("probe.registered",
+                       json{{"peer", ip}, {"port", ntohs(from.sin_port)}});
+          }
+        }
+        continue;
+      }
+      // 自动模式下不校验源地址/端口：NAT 会把外部端口换成另一个值，按原端口校验
+      // 必然把合法的 feedback/NACK 全丢掉。会话号仍然是对的。
+      if (!auto_peer && from.sin_addr.s_addr != probe_host_addr.sin_addr.s_addr) continue;
       auto nh = cue::proto::decode_datagram({nbuf.data(), static_cast<size_t>(n)});
       if (!nh) continue;
       const uint32_t sid = nh->session_id;
       const uint16_t want_port = registry.probe_port_of(sid);
-      if (want_port == 0 || from.sin_port != htons(want_port)) continue;
+      if (!auto_peer && (want_port == 0 || from.sin_port != htons(want_port))) continue;
       const std::span<const uint8_t> body{nbuf.data() + cue::proto::kDatagramHeaderSize,
                                          static_cast<std::size_t>(n) -
                                              cue::proto::kDatagramHeaderSize};

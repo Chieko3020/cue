@@ -873,6 +873,10 @@ int main(int argc, char** argv) {
   long long jitter_target_frames = 0;
   std::string bind_host = "0.0.0.0";
   std::vector<TcpReporters::Addr> report_addrs;
+  // NAT 注册目标：周期性发 8 字节 "CUEHELLO"，让服务器学到我们经过 NAT 的外部地址。
+  // 公网部署必需——客户端在 NAT 后面，不先发出去，服务器就没法把 UDP 回给我们。
+  std::string hello_host;
+  uint16_t hello_port = 0;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
@@ -901,6 +905,14 @@ int main(int argc, char** argv) {
     } else if (a == "--report-addrs") {
       const auto val = next();
       if (!parse_report_addrs(val, report_addrs)) bad(a, val);
+    } else if (a == "--hello-to") {
+      const auto val = next();
+      const std::size_t colon = val.rfind(':');
+      if (colon == std::string_view::npos) bad(a, val);
+      hello_host = std::string(val.substr(0, colon));
+      long long hp = 0;
+      if (!parse_int(val.substr(colon + 1), 1, 65535, hp)) bad(a, val);
+      hello_port = static_cast<uint16_t>(hp);
     } else if (a == "--jitter") {
       const auto val = next();
       if (val != "on" && val != "off") bad(a, val);
@@ -1776,6 +1788,26 @@ int main(int argc, char** argv) {
   constexpr std::size_t kMaxAudioErrLen = 400;
 
   std::array<uint8_t, 4096> buf{};
+
+  // ---- NAT 注册（见 --hello-to）----
+  // hello_fd 与收下行用**同一个 socket**；-1 = 没配置，功能关闭。
+  // 必须复用同一个 socket：换一个端口发出，NAT 会把映射建立在另一个外部端口上，
+  // 服务器按那个地址回包时我们这边收不到（映射与 socket 是一对一的）。
+  int hello_fd = -1;
+  sockaddr_in hello_addr{};
+  int64_t last_hello_us = 0;
+  if (!hello_host.empty() && hello_port != 0) {
+    hello_addr.sin_family = AF_INET;
+    hello_addr.sin_port = htons(hello_port);
+    if (::inet_pton(AF_INET, hello_host.c_str(), &hello_addr.sin_addr) == 1) {
+      hello_fd = udp_fd;
+      std::fprintf(stderr, "[probe] NAT 注册：每 500 ms 向 %s:%u 发 HELLO\n", hello_host.c_str(),
+                   static_cast<unsigned>(hello_port));
+    } else {
+      std::fprintf(stderr, "[probe] --hello-to 解析失败：%s\n", hello_host.c_str());
+    }
+  }
+
   for (;;) {
     // 窗口事件在循环顶部 pump：poll 的超时是 200 ms，所以最坏 200 ms 响应一次关闭/ESC。
     // 用户关了窗口就退出——留着一个看不见的进程继续收流只会让人以为"程序卡住了"。
@@ -2109,6 +2141,18 @@ int main(int argc, char** argv) {
     if (const int64_t deadline = jb.next_deadline_us(); deadline > 0) {
       const int64_t wait_us = deadline - cue::now_us();
       poll_timeout_ms = static_cast<int>(std::clamp<int64_t>(wait_us / 1000, 0, 200));
+    }
+    // NAT 注册心跳：每 500 ms 从**同一个 socket** 发一次 HELLO。
+    // 必须用收下行的这个 socket 发，NAT 才会为它建立映射，服务器回包才能进来
+    // （换个 socket 发出，映射落在另一个外部端口上，等于白做）。
+    if (hello_fd >= 0) {
+      const int64_t now_us = cue::now_us();
+      if (now_us - last_hello_us >= 500'000) {
+        last_hello_us = now_us;
+        static const char kHello[8] = {'C', 'U', 'E', 'H', 'E', 'L', 'L', 'O'};
+        ::sendto(hello_fd, kHello, sizeof(kHello), 0,
+                 reinterpret_cast<const sockaddr*>(&hello_addr), sizeof(hello_addr));
+      }
     }
     probe_pollfd pfd{static_cast<decltype(probe_pollfd::fd)>(udp_fd), POLLIN, 0};
     const int pr = probe_poll(&pfd, 1, poll_timeout_ms);
