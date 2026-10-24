@@ -49,6 +49,12 @@ struct Renderer::Impl {
   // 上一次整体纠正播放队列的时刻（毫秒）。见 queue_audio 里对限流的说明。
   Uint64 last_trim_ms = 0;
   // 周期性截图（见 enable_snapshot）：间隔、前缀、已存张数、上次存盘时刻。
+  int prebuffer_ms = 0;
+  // 预缓冲状态：还没攒够时保持暂停（started=false）；was_empty 用于边沿计数。
+  bool started = false;
+  bool was_empty = false;
+  // 队列被抽干的边沿次数（设备饿着的直接证据）。
+  uint64_t starved = 0;
   int snap_every_ms = 0;
   std::string snap_prefix;
   uint64_t snap_count = 0;
@@ -163,6 +169,7 @@ bool Renderer::open(const RenderConfig& cfg, std::string& err) {
       chosen = open_name ? open_name : "";
     }
   }
+  im->prebuffer_ms = cfg.audio_prebuffer_ms > 0 ? cfg.audio_prebuffer_ms : 0;
   im->adev = SDL_OpenAudioDevice(open_name, 0, &want, &have, 0);
   if (im->adev != 0) {
     // have 必须**真的**等于 want，不能只是"没报错"。
@@ -191,7 +198,16 @@ bool Renderer::open(const RenderConfig& cfg, std::string& err) {
       std::fprintf(stderr, "[probe] 音频输出设备：%s%s（%d Hz / %d ch / s16）\n",
                    chosen.empty() ? "(系统默认)" : chosen.c_str(),
                    chosen.empty() ? "" : " ", im->audio_hz, im->audio_ch);
-      SDL_PauseAudioDevice(im->adev, 0);
+      // 预缓冲：先攒够 audio_prebuffer_ms 再开播。0 就直接播（旧行为）。
+      if (cfg.audio_prebuffer_ms > 0) {
+        im->started = false;
+        SDL_PauseAudioDevice(im->adev, 1);
+        std::fprintf(stderr, "[probe] 音频预缓冲 %d ms（攒够再开始播放）\n",
+                     cfg.audio_prebuffer_ms);
+      } else {
+        im->started = true;
+        SDL_PauseAudioDevice(im->adev, 0);
+      }
     }
   } else {
     std::fprintf(stderr, "[probe] 音频设备打不开（只渲染视频）：%s\n", SDL_GetError());
@@ -399,6 +415,22 @@ void Renderer::queue_audio(const int16_t* pcm, int samples) {
     return;
   }
   ++impl_->audio_queued_pkts;
+
+  // 预缓冲：攒够目标再开播。用"软件暂停"而不是延后入队——数据必须先进 SDL 队列，
+  // 否则等于把缓冲放在我们自己手里、还得自己喂，反而多一层调度。
+  if (!impl_->started) {
+    if (queued_ms() >= impl_->prebuffer_ms && impl_->prebuffer_ms > 0) {
+      impl_->started = true;
+      SDL_PauseAudioDevice(impl_->adev, 0);
+    }
+  }
+
+  // 抽干统计：已开始播放却出现"队列为空"，说明设备在我们给不出数据时饿着了，
+  // 听感就是断音。这是"音频卡顿"唯一可靠的计数器（别用 rms，静音和断流分不开）。
+  const int q_now = queued_ms();
+  const bool empty = (q_now <= 0);
+  if (impl_->started && empty && !impl_->was_empty) ++impl_->starved;
+  impl_->was_empty = empty;
 }
 
 int Renderer::queued_ms() const {
@@ -424,6 +456,7 @@ Renderer::AudioStats Renderer::audio_stats() const {
   if (impl_ == nullptr) return out;
   out.over_soft = impl_->audio_over_soft;
   out.dropped_drift = impl_->audio_dropped_drift;
+  out.starved = impl_->starved;
   out.trimmed = impl_->audio_trimmed;
   out.queued = impl_->audio_queued_pkts;
   out.push_errors = impl_->audio_push_errors;

@@ -857,6 +857,8 @@ int main(int argc, char** argv) {
   // 视频呈现延迟（毫秒）。负数 = 自动跟随音频播放队列深度（两者相等才音画同步）。
   // 0 = 不延迟（旧行为）。
   long long av_delay_ms = 0;
+  // 播放前预缓冲（毫秒）：公网有到达抖动，攒一小段再开播可避免设备饿着。
+  long long audio_prebuffer_ms = 0;
   std::string snap_prefix;
   bool list_audio = false;
   long long jitter_max_level = 2;
@@ -922,6 +924,9 @@ int main(int argc, char** argv) {
       if (!parse_int(val, 0, 2000, jitter_budget_ms)) bad(a, val);
     } else if (a == "--audio-out") {
       audio_out = std::string(next());
+    } else if (a == "--audio-prebuffer-ms") {
+      const auto val = next();
+      if (!parse_int(val, 0, 2000, audio_prebuffer_ms)) bad(a, val);
     } else if (a == "--av-delay-ms") {
       const auto val = next();
       if (!parse_int(val, -1, 5000, av_delay_ms)) bad(a, val);
@@ -981,7 +986,7 @@ int main(int argc, char** argv) {
           "          [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..4] [--jitter-target-frames 0..16]\n"
-          "          [--audio-out NAME] [--av-delay-ms N] [--list-audio]\n"
+          "          [--audio-out NAME] [--av-delay-ms N] [--audio-prebuffer-ms N] [--list-audio]\n"
           "          [--snap-ms N --snap-prefix PATH]\n"
           "          [--report-addrs host:port[,host:port]]\n"
           "  --nack-interval-ms 只决定「多长时间尝试一次」；实际发送上限是 8 包/秒\n"
@@ -1340,6 +1345,7 @@ int main(int argc, char** argv) {
     cue::probe::RenderConfig rcfg;
     rcfg.width = render_w;
     rcfg.audio_out = audio_out;
+    rcfg.audio_prebuffer_ms = static_cast<int>(audio_prebuffer_ms);
     rcfg.height = render_h;
     std::string rerr;
     if (renderer.open(rcfg, rerr)) {
@@ -2104,6 +2110,8 @@ int main(int argc, char** argv) {
           // 因队列越上限而丢掉的 20 ms 包数：它是"声音断续"最直接的嫌疑人，
           // 不算进来就只能靠耳朵判断。
           {"audio_dropped_drift", rstats.dropped_drift},
+          // 设备被饿着的次数：音频卡顿的直接证据（比听感更可靠）。
+          {"audio_starved", rstats.starved},
           {"audio_queue_trimmed", rstats.trimmed},
           {"audio_queue_push_errors", rstats.push_errors},
           {"audio_queue_segments", rstats.queued},
