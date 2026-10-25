@@ -902,6 +902,32 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
   Capture err;
   err.fd = err_pipe[0];
 
+  // 终止子进程组的阶梯：SIGTERM → 宽限 → SIGKILL。
+  //
+  // 为什么不直接 SIGKILL（原来的做法）：沙箱里跑的是用户的 shell 命令，
+  // 它可能正在写 runs/<id>/ 下的产物。直接 SIGKILL 会让"超时"变成"留下半个文件"，
+  // 而宽限窗口给了它清理（删临时文件、刷缓冲）的机会。这与控制面停 cued 用的是
+  // 同一套阶梯（见 process_control.cpp 的 SIGTERM→宽限→SIGKILL），行为一致。
+  //
+  // 宽限期取 50 ms 而不是文档直觉上的"一两百毫秒"：AC-8 要求取消后**200 ms 内**返回，
+  // 宽限期是这段时间里最容易被吃掉的一块。50 ms 已足够普通工具删临时文件、刷缓冲，
+  // 同时给后续收尸与返回留出余量（实测 200 ms 宽限会让取消耗时越过 AC-8 的 200 ms 断言）。
+  // 进程组（-pid）与进程本身都要发：shell 可能不转发信号，子进程会漏网。
+  auto terminate_with_grace = [](pid_t target) {
+    ::kill(-target, SIGTERM);
+    ::kill(target, SIGTERM);
+    constexpr int kGraceMs = 50;
+    for (int i = 0; i < kGraceMs / 5; ++i) {
+      // 用 kill(pid, 0) 探测存活，**不能用 waitpid**：waitpid 会把子进程的状态收走，
+      // 后面正常的收尸路径就拿不到 status（exit_code 变成垃圾值）。
+      // ESRCH 才表示真的没了；EPERM 表示还在（只是没权限发给它）。
+      if (::kill(target, 0) != 0 && errno == ESRCH) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ::kill(-target, SIGKILL);
+    ::kill(target, SIGKILL);
+  };
+
   const int timeout_ms = std::max(1, limits.timeout_ms);
   const int64_t deadline_us = start_us + static_cast<int64_t>(timeout_ms) * 1000;
   bool killed = false;
@@ -909,14 +935,14 @@ Result run(const std::string& cmd, const std::vector<std::string>& args, const L
   for (;;) {
     if (cancel != nullptr && cancel->load()) {
       r.cancelled = true;
-      ::kill(-pid, SIGKILL);
+      terminate_with_grace(pid);
       killed = true;
       break;
     }
     const int64_t now = now_us();
     if (now >= deadline_us) {
       r.timed_out = true;
-      ::kill(-pid, SIGKILL);
+      terminate_with_grace(pid);
       killed = true;
       break;
     }
