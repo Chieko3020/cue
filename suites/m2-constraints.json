@@ -1,7 +1,7 @@
 {
   "suite": "m2-constraints",
   "version": 1,
-  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。两者都只能人工复现（AVC level 由浏览器侧 configure 决定，FEC 幽灵帧不在 8 类根因枚举内），因此标 manual_only：real 模式跳过、不计入成功率分母。suite 字段必须全部被引擎认识——未知字段一律报错，避免『写错字段 → SLA 恒真 → 假绿灯』。evidence_candidates 只能引用 query_metrics 真实输出、且在该故障场景里语义成立的字段（N-02）：曾经引用的 frames_no_data / frames_completed 在整个仓库里都不存在，证据层因此永远 0%。fec-ghost-frame 的候选里 e2e_fec_ghost_discarded 是**常态计数**（FEC 校验包总在整帧数据之后到达：实测零丢包 8 s/241 帧 → 250 次，约每完成帧 1 次），它出现在候选里只是因为它确实可引用，**不能**拿来证明幽灵帧；幽灵帧的证据落在 e2e_fec_recovered（丢包相关：0% = 0、5% = 45~52）与 e2e_frag_ghost_discarded（异常指示：0% = 0、5% = 2~3）上。",
+  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。两者都只能人工复现（AVC level 由浏览器侧 configure 决定，FEC 幽灵帧不在 8 类根因枚举内），因此标 manual_only：real 模式跳过、不计入成功率分母。suite 字段必须全部被引擎认识——未知字段一律报错，避免『写错字段 → SLA 恒真 → 假绿灯』。evidence_candidates 只能引用 query_metrics 真实输出、且**在该场景下取值能支持结论**的字段（N-02 / N-02c）：曾经引用的 frames_no_data / frames_completed 在整个仓库里都不存在，证据层因此永远 0%。avc-level-mismatch 的 encode_width/height 之所以能当尺寸证据，是因为该 case 显式设了 1920x1080 转码（下面 pipeline 块的真实配置值）；transcode=off 时它们恒为 0（0 = 沿用解码尺寸 follow，不是 1080p）——那时用 0 推『coded area 2088960 超 level 3.0 上限』就是伪证：字段真实、取值却不支持结论（N-02b 真管线实测过这个坑）。fec-ghost-frame 的候选里 e2e_fec_ghost_discarded 是**常态计数**（FEC 校验包总在整帧数据之后到达：实测零丢包 8 s/241 帧 → 250 次，约每完成帧 1 次），它出现在候选里只是因为它确实可引用，**不能**拿来证明幽灵帧；幽灵帧的证据落在 e2e_fec_recovered（丢包相关：0% = 0、5% = 45~52）与 e2e_frag_ghost_discarded（异常指示：0% = 0、5% = 2~3）上。",
   "cases": [
     {
       "id": "avc-level-mismatch",
@@ -11,9 +11,14 @@
         "kind": "none"
       },
       "pipeline": {
-        "transcode": false
+        "transcode": true,
+        "width": 1920,
+        "height": 1080,
+        "bitrate_kbps": 6000,
+        "gop": 60,
+        "preset": "veryfast"
       },
-      "prompt": "上行 VideoEncoder.configure() 直接抛错：coded area 2088960 exceeds maximum 414720 (AVC level 3.0)。定位原因并修复，使 1080p 能正常编码。",
+      "prompt": "下行按 1080p（1920x1080）转码。上行 VideoEncoder.configure() 直接抛错：coded area 2088960 exceeds maximum 414720 (AVC level 3.0)。定位原因并修复，使 1080p 能正常编码。",
       "expect": {
         "root_cause": "resolution_too_high",
         "evidence_candidates": [
