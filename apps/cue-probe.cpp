@@ -761,6 +761,17 @@ std::vector<uint8_t> assemble(const FrameAcc& fa) {
 struct AudioSeqTracker {
   enum class Verdict { Play, Duplicate, Stale };
 
+  // accept() 的结果。**缺口的唯一来源**就是这里的 missing：
+  // PLC（丢包隐藏）与 in-band FEC 恢复都只允许在 missing > 0 时发生——重复、迟到、
+  // 过旧这三种判决下 missing 恒为 0，因此它们不会产生任何隐藏帧（N-01 的硬约束：
+  // "只在确知丢包时才补"，见 audio_decoder.h 对 EmptyPacket / conceal() 的说明）。
+  struct Accept {
+    Verdict verdict = Verdict::Play;
+    // 本次 accept 新暴露的缺口数（帧号向前跳 ahead 时 = ahead - 1，否则 0）。
+    // 用返回值而不是成员字段传，是为了让调用点不可能读到上一次调用的陈旧值。
+    uint32_t missing = 0;
+  };
+
   // 位图覆盖的帧数（1.28 s @20 ms）
   static constexpr uint32_t kWindow = 64;
   // 允许"迟到但照播"的最大落后帧数（60 ms）
@@ -776,38 +787,43 @@ struct AudioSeqTracker {
 
   void reset() { *this = AudioSeqTracker{}; }
 
-  Verdict accept(uint32_t seq) {
+  Accept accept(uint32_t seq) {
     if (!have) {
       have = true;
       high = seq;
       played = 1;
-      return Verdict::Play;
+      return Accept{Verdict::Play, 0};
     }
     // 无符号相减天然处理 frame_id 回绕（cued 重启后从 0 重新计数也不受影响，
     // 因为换代时 reset_stream 会把这里清掉）。
     const uint32_t ahead = seq - high;
     if (ahead == 0) {
       ++dups;
-      return Verdict::Duplicate;
+      return Accept{Verdict::Duplicate, 0};
     }
     if (ahead < 0x80000000u) {
-      if (ahead > 1) gaps += ahead - 1u;
+      uint32_t missing = 0;
+      if (ahead > 1) {
+        missing = ahead - 1u;
+        gaps += missing;
+      }
       played = (ahead >= kWindow) ? 1u : ((played << ahead) | 1u);
       high = seq;
-      return Verdict::Play;
+      return Accept{Verdict::Play, missing};
     }
     const uint32_t behind = high - seq;
     if (behind < kWindow && ((played >> behind) & 1u) != 0) {
       ++dups;
-      return Verdict::Duplicate;
+      return Accept{Verdict::Duplicate, 0};
     }
     if (behind <= kReorderToleranceFrames) {
       played |= (uint64_t{1} << behind);
       ++reordered;
-      return Verdict::Play;
+      // 迟到但在容差内：网络乱序，不是丢包。这里**不能**返回缺口，否则会凭空补 PLC。
+      return Accept{Verdict::Play, 0};
     }
     ++stale;
-    return Verdict::Stale;
+    return Accept{Verdict::Stale, 0};
   }
 };
 
@@ -879,6 +895,11 @@ int main(int argc, char** argv) {
   // 公网部署必需——客户端在 NAT 后面，不先发出去，服务器就没法把 UDP 回给我们。
   std::string hello_host;
   uint16_t hello_port = 0;
+  // N-01：音频下行的 in-band FEC 恢复与 PLC。默认都开（弱网默认要能用），
+  // 留 off 是为了能 A/B 量化"到底补回来多少帧"——scripts/n01-fec-ab.sh 的基线
+  // 就是两个都关（那时全部缺口都只能计入 audio_unconcealed_frames）。
+  bool audio_fec_enabled = true;
+  bool audio_plc_enabled = true;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
@@ -927,6 +948,16 @@ int main(int argc, char** argv) {
     } else if (a == "--audio-prebuffer-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 2000, audio_prebuffer_ms)) bad(a, val);
+    } else if (a == "--audio-fec") {
+      // 只影响**恢复**路径（用后一包的 LBRR 救前一帧），不影响正常解码。
+      const auto val = next();
+      if (val != "on" && val != "off") bad(a, val);
+      audio_fec_enabled = (val == "on");
+    } else if (a == "--audio-plc") {
+      // 只影响**缺口**（帧号前进跳出的洞）的隐藏帧生成，与空包/坏包无关。
+      const auto val = next();
+      if (val != "on" && val != "off") bad(a, val);
+      audio_plc_enabled = (val == "on");
     } else if (a == "--av-delay-ms") {
       const auto val = next();
       if (!parse_int(val, -1, 5000, av_delay_ms)) bad(a, val);
@@ -987,10 +1018,14 @@ int main(int argc, char** argv) {
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..4] [--jitter-target-frames 0..16]\n"
           "          [--audio-out NAME] [--av-delay-ms N] [--audio-prebuffer-ms N] [--list-audio]\n"
+          "          [--audio-fec on|off] [--audio-plc on|off]\n"
           "          [--snap-ms N --snap-prefix PATH]\n"
           "          [--report-addrs host:port[,host:port]]\n"
           "  --nack-interval-ms 只决定「多长时间尝试一次」；实际发送上限是 8 包/秒\n"
           "  （SPEC §7.2），间隔 <125 ms 会被夹到该上限。冷却/单包探测不需要额外开关。\n"
+          "  --audio-fec / --audio-plc 默认都开，只作用于**帧号缺口**（确知丢包）：\n"
+          "  FEC 用后一包里冗余恢复前一帧，PLC 外推其余缺口（每次缺口最多 3 帧 = 60 ms）。\n"
+          "  两个都关时全部缺口只计入 audio_unconcealed_frames（A/B 的基线）。\n"
           "  --jitter-max-level 与 --jitter-target-frames 共同定义自适应档位区间：\n"
           "  档位 0..4 = 驻留 1/2/4/8/16 帧（30 fps 下 0/33/100/233/500 ms）。\n"
           "  --jitter-target-frames 是区间下限（0 = 不设限，从 0 档起步）。加长区间只对\n"
@@ -1197,11 +1232,10 @@ int main(int argc, char** argv) {
   // 上次请求时的 decode_errors 水位：只有它增长（真的解不出图）才值得要 IDR。
   uint64_t kf_err_baseline = 0;
   uint64_t rejected = 0, lat_invalid = 0, stats_reqs = 0, fb_sent = 0;
-  // 下行音频数据报计数。当前结构上恒为 0：cued 的下行只有 Video / Fec / StatsReq /
-  // Feedback 四种，DownType::Audio 在 cued 里没有任何发送方（2026-10 的代码里
-  // `grep DownType::Audio apps/cued.cpp` 无匹配）。留着这个计数不是为了"以后可能加"，
-  // 而是让"下行到底有没有音频"变成可观测事实：真收到了就会涨，指标里的 audio_note
-  // 也随之改口，不会继续输出一句过时的说明。
+  // 下行音频数据报计数。cued 把上行 Opus 原样透传成 DownType::Audio（见 apps/cued.cpp
+  // 的"音频下行"段），所以这个数会跟着音频流上涨；它同时也是 N-01 缺口率的分母
+  // （audio_seq_gaps / audio_datagrams）。早期版本这里恒为 0（当时没有发送方），
+  // 留着的初衷不变：让"下行到底有没有音频"成为可观测事实，而不是靠一句说明。
   uint64_t audio_datagrams = 0;
   // FEC 账（FR-PIPE.9）：恢复的片数、有 FEC 覆盖的组数、结算时仍缺 ≥2 片的组与片数。
   // groups_rx 与 recovered/unrecoverable 一起构成「恢复率」的可执行分母：
@@ -1788,6 +1822,27 @@ int main(int argc, char** argv) {
   uint64_t audio_decoded_frames = 0;  // 成功解出的 PCM 帧数
   uint64_t audio_pcm_frames = 0;      // 累计 PCM 样本数
   uint64_t audio_decode_errors = 0;
+  // N-01 的账（三个新计数，口径互不重叠，且都不混进 audio_decoded_frames）：
+  //   audio_fec_recovered    —— 用后一包的 in-band FEC 冗余恢复出的帧（**真实内容**，
+  //                             来自上一帧的 LBRR，不是外推；但它的来源不是"本包解码"，
+  //                             所以不计入 decoded，单独计这一格）；
+  //   audio_plc_frames       —— 确知缺口后用 PLC 外推出的帧（伪造内容，只用来填播放队列）；
+  //   audio_unconcealed_frames —— 既没有被 FEC 恢复、也没有被 PLC 覆盖的缺口（**诚实暴露**）。
+  // 对账等式（对每个"应播"的包：它自己 + 它暴露的缺口）：
+  //   audio_decoded_frames + audio_fec_recovered + audio_plc_frames +
+  //   audio_unconcealed_frames == 收到的可解音频包数 + audio_seq.gaps
+  // 前提是包本身可解；解不出来的包走 audio_decode_errors（另一本账），不进这条等式。
+  uint64_t audio_fec_recovered = 0;
+  uint64_t audio_plc_frames = 0;
+  uint64_t audio_unconcealed_frames = 0;
+  // 一次缺口里最多补几帧 PLC：3 帧 = 60 ms。取值的两个约束：
+  //   · 上限来自"补音要像丢包后的自然延续"：libopus 的 PLC 是外推，越长越像机械音，
+  //     60 ms 以内（3 个 20 ms 帧）还在可接受范围，再长宁可留洞（计入 unconcealed）；
+  //   · 也防止一次大缺口（例如 cued 重启/长时间断流）把播放队列一次灌满——那会把
+  //     "补洞"变成"制造几百毫秒延迟"，比留洞更糟。
+  // 这个数与 AudioSeqTracker::kReorderToleranceFrames（3 帧）同量级不是巧合：
+  // 60 ms 是音频侧"听得出/听不出"的经验分界。
+  constexpr uint32_t kMaxPlcFrames = 3;
   // 帧号记账（重复/乱序/缺口）全在 AudioSeqTracker 里，见它的注释。
   // 音频恒单分片，所以"帧号"就是"包号"，缺口直接等于丢包数。
   AudioSeqTracker audio_seq;
@@ -2107,6 +2162,18 @@ int main(int argc, char** argv) {
           {"audio_dups", audio_seq.dups},
           {"audio_reordered", audio_seq.reordered},
           {"audio_stale", audio_seq.stale},
+          // N-01 弱网三件套的账（见 kMaxPlcFrames 上方的对账等式）：
+          //   audio_fec_recovered —— 用后一包的 LBRR 恢复出的**真实**上一帧；
+          //   audio_plc_frames    —— 缺口处外推的隐藏帧（伪造，只填播放队列）；
+          //   audio_unconcealed_frames —— 既没 FEC 也没 PLC 覆盖的缺口（诚实暴露）。
+          // 读法：decoded 不因 FEC/PLC 而变化；unconcealed 归零才算"缺口被盖住了"。
+          {"audio_fec_recovered", audio_fec_recovered},
+          {"audio_plc_frames", audio_plc_frames},
+          {"audio_unconcealed_frames", audio_unconcealed_frames},
+          // 开关的**实际值**：否则"开了 FEC 但没恢复一帧"与"FEC 根本没开"在指标上
+          // 长得一模一样（"参数写了不等于生效"这条旧坑）。
+          {"audio_fec_enabled", audio_fec_enabled},
+          {"audio_plc_enabled", audio_plc_enabled},
           // 播放队列深度（毫秒）：咔咔声最常来自这一侧——队列耗尽就欠载，
           // 超过上限就自己丢包，而此刻链路的丢包指标可能完全是 0。
           // 把这一项暴露出来，"是链路丢了还是自己丢了"才不用靠耳朵猜。
@@ -2428,14 +2495,18 @@ int main(int argc, char** argv) {
       if (session_seen == 0) session_seen = h->session_id;
       // 先记账再决定要不要解：重复/过旧的包**不能进解码器**。解了就是白白刷新
       // 播放队列（同一片播两遍），还会污染 audio_rms（窗口里多一个不该存在的帧）。
-      const auto verdict = audio_seq.accept(h->frame_id);
-      if (verdict != AudioSeqTracker::Verdict::Play) continue;
-      // 空载荷：喂给 opus 只会换回一个错误码，把 audio_decode_errors 弄脏却什么也说明不了。
-      // 帧号已经记过账了（上面），所以下一个包仍然算"连续"，不会平白多一个缺口。
-      if (n <= static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)) {
-        ++rejected;
-        continue;
-      }
+      // accept() 同时给出本次暴露的缺口数——**它是 PLC/FEC 唯一的触发来源**：
+      // 重复（Duplicate）、迟到（reordered 照播）、过旧（Stale）三种情况下 missing 恒 0，
+      // 所以它们不会产生任何隐藏帧。
+      const auto ac = audio_seq.accept(h->frame_id);
+      if (ac.verdict != AudioSeqTracker::Verdict::Play) continue;
+      uint32_t still_missing = ac.missing;
+
+      const std::span<const uint8_t> payload{
+          buf.data() + cue::proto::kDatagramHeaderSize,
+          n > static_cast<ssize_t>(cue::proto::kDatagramHeaderSize)
+              ? static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize
+              : std::size_t{0}};
 
       if (!audio_dec.is_open() && !audio_dec_open_failed) {
         std::string oerr;
@@ -2446,12 +2517,98 @@ int main(int argc, char** argv) {
           }
         }
       }
-      if (audio_dec.is_open()) {
+      if (!audio_dec.is_open()) {
+        // 解码器都打不开：缺口既不能 FEC 也不能 PLC。如实计入未覆盖，不粉饰。
+        // 不加 rejected：那是协议边界拒绝的计数，解码器起不来与包本身无关。
+        audio_unconcealed_frames += still_missing;
+        continue;
+      }
+
+      // ---- N-01：缺口处理（PLC / 恢复用 FEC）----
+      //
+      // 顺序不能换，两条独立的理由都指向同一个顺序：
+      //  1) libopus 的 in-band FEC 语义是「后一包里的冗余恢复**前一包**」，所以它能救的
+      //     只是缺口里**紧邻当前包的那一帧**；更早的缺口只能 PLC。
+      //  2) libopus 的 PLC（opus_decode(NULL,0)）会把解码器状态**推进一帧**。所以必须
+      //     先补"较早的缺口"，解码器才会停在丢包前一帧的位置上，随后对当前包做 FEC
+      //     解码时状态正好对得上；最后 Normal 解码当前包，时间轴一格不差。
+      //     反过来（先 FEC 再 PLC）会让状态越过当前包，Normal 解出来的就不是当前这一帧。
+      // 播放顺序与解码顺序一致：PLC 帧（较早）→ FEC 恢复帧（最后一格）→ 当前帧。
+      const bool fec_try = audio_fec_enabled && !payload.empty() && still_missing > 0;
+      if (audio_plc_enabled) {
+        // 留最后一格给 FEC（若 FEC 没开/没数据，这一格会退回去由 PLC 或未覆盖承担）
+        const uint32_t reserved = fec_try ? 1u : 0u;
+        const uint32_t budget = still_missing > reserved ? still_missing - reserved : 0u;
+        const uint32_t take = std::min<uint32_t>(budget, kMaxPlcFrames);
+        for (uint32_t i = 0; i < take; ++i) {
+          std::string cerr;
+          auto concealed = audio_dec.conceal(cerr);
+          if (!concealed) {
+            if (audio_first_error.empty()) {
+              audio_first_error =
+                  (std::string("plc: ") +
+                   cue::media::audio_decode_error_name(concealed.error()) + ": " + cerr)
+                      .substr(0, kMaxAudioErrLen);
+            }
+            break;
+          }
+          --still_missing;
+          ++audio_plc_frames;
+          // PLC 是**外推**出来的音频：只用来填播放队列，不进 audio_rms（否则合成能量会被
+          // 当成链路音量），更不进 audio_decoded_frames / audio_pcm_frames。
+          if (render_live) {
+            renderer.queue_audio(concealed->samples.data(),
+                                 static_cast<int>(concealed->sample_count()));
+          }
+        }
+      }
+      if (fec_try) {
+        std::string ferr;
+        auto recovered = audio_dec.decode(payload, ferr, cue::media::DecodeMode::FecRecover);
+        if (recovered) {
+          --still_missing;
+          ++audio_fec_recovered;
+          // FEC 恢复的是**真实内容**（上一帧的 LBRR 冗余，不是外推），所以它进 RMS 窗口；
+          // 但它不是"本包解出来的"，因此不计入 audio_decoded_frames / audio_pcm_frames，
+          // 而是单独计 audio_fec_recovered——两本账都能对上，也不会让 decoded 虚高。
+          audio_rms.push(recovered->samples.data(), recovered->samples.size());
+          if (render_live) {
+            renderer.queue_audio(recovered->samples.data(),
+                                 static_cast<int>(recovered->sample_count()));
+          }
+        } else if (recovered.error() == cue::media::AudioDecodeError::FecUnavailable) {
+          // 包里没有 LBRR（编码端没开 FEC / DTX 帧 / 极安静的帧）：这不是错误，
+          // 也不能计成 audio_decode_errors。这一格退回给 PLC 或计入未覆盖。
+          if (audio_plc_enabled) {
+            std::string cerr;
+            auto concealed = audio_dec.conceal(cerr);
+            if (concealed) {
+              --still_missing;
+              ++audio_plc_frames;
+              if (render_live) {
+                renderer.queue_audio(concealed->samples.data(),
+                                     static_cast<int>(concealed->sample_count()));
+              }
+            }
+          }
+        }
+        // 其它错误（InvalidPacket/DecodeFailed）不在这里计 audio_decode_errors：同一个包
+        // 紧接着还要走 Normal 解码，那条路径才是错误的权威计数点，否则一个坏包计两次。
+      }
+      // 到这里还没补上的缺口就是"没掩盖"的：如实计数（FEC/PLC 都关时它等于全部缺口）。
+      audio_unconcealed_frames += still_missing;
+
+      // 空载荷：喂给 opus 只会换回一个错误码，把 audio_decode_errors 弄脏却什么也说明不了。
+      // 帧号已经记过账了（上面），所以下一个包仍然算"连续"，不会平白多一个缺口；
+      // 当前这一帧的丢失会在下一包到达时作为缺口出现，因此这里不额外把它计进缺口。
+      if (payload.empty()) {
+        ++rejected;
+        continue;
+      }
+
+      {
         std::string derr;
-        auto aframe =
-            audio_dec.decode({buf.data() + cue::proto::kDatagramHeaderSize,
-                              static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize},
-                             derr);
+        auto aframe = audio_dec.decode(payload, derr);
         if (!aframe) {
           ++audio_decode_errors;
           if (audio_first_error.empty()) {

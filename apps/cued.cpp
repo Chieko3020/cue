@@ -413,6 +413,10 @@ struct Counters {
   uint64_t audio_frames_out = 0;
   // 多分片音频不做重组，单独计数：少计会让「音频到底有没有在流」看不出来
   uint64_t audio_multi_frag = 0;
+  // 出向注入（N-01）丢掉的音频下行包数。与 audio_frames_out 分开：
+  // 前者是"被故障注入吃掉的"，后者是"真正发出去的"——把两者混在一起，
+  // 就分不清"链路丢包"和"本机注入"（视频侧 injected 也是同一口径）。
+  uint64_t audio_injected_drops = 0;
   int64_t audio_last_pts_us = 0;
   uint64_t audio_decoded_frames = 0;
   uint64_t audio_pcm_frames = 0;  // 累计解出的 PCM 样本数（mono，等于每声道样本数）
@@ -737,6 +741,7 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
          {"kf_req_suppressed", c.kf_req_suppressed},
          {"audio_frames_in", c.audio_frames_in},
          {"audio_frames_out", c.audio_frames_out},
+         {"audio_injected_drops", c.audio_injected_drops},
          {"audio_bytes_in", c.audio_bytes_in},
          {"audio_multi_frag", c.audio_multi_frag},
          {"audio_last_pts_us", c.audio_last_pts_us},
@@ -816,7 +821,8 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
         << " dec_drop=" << u64("decode_drops") << " rej=" << u64("rejected")
         << " dly=" << u64("delayed_pkts") << "/" << num("delayed_max_us") / 1000.0 << "ms"
         << " aud=" << u64("audio_frames_in") << " apcm=" << u64("audio_pcm_frames")
-        << " aerr=" << u64("audio_decode_errors");
+        << " aerr=" << u64("audio_decode_errors")
+        << " ainj=" << u64("audio_injected_drops");
   {
     const json arms = null_or("audio_rms_dbfs");
     // 没有解出帧时不打这一项：打 -inf / 0 都会被读成"有读数"。
@@ -878,6 +884,8 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
          {"aimd_bitrate_kbps", g_aimd_bitrate_kbps.load(std::memory_order_relaxed)},
          {"ingress_late", u64("ingress_late")},
          {"audio_frames_in", u64("audio_frames_in")},
+         {"audio_frames_out", u64("audio_frames_out")},
+         {"audio_injected_drops", u64("audio_injected_drops")},
          {"audio_bytes_in", u64("audio_bytes_in")},
          {"audio_multi_frag", u64("audio_multi_frag")},
          {"audio_last_pts_us", u64("audio_last_pts_us")},
@@ -1638,6 +1646,8 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   // 下行音频包的独立帧号（与视频的 frame_id 分开）：probe 侧按会话号 + 帧号判丢包，
   // 音频恒单分片，所以这个号就是"第几个音频包"，缺口即丢失。
   uint32_t audio_frame_seq = 0;
+  // 音频出向注入播的包序号（N-01）：与视频的 pkt_seq 分开，见音频分支里的注释。
+  uint64_t audio_drop_seq = 0;
   // 下行转发上来的关键帧请求：按"计数变了"消费，冷却复用上游那套 500 ms 窗口。
   uint64_t kf_reqs_seen = 0;
   int64_t last_down_kf_us = 0;
@@ -1869,8 +1879,8 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
       //     的能力上报里，不在每帧路径上）。
       // 所以这里从 payload 起始处直接解，不跳任何字节。
       //
-      // 解出的 PCM 只用来算指标，不写下行：DownType::Audio 至今没有任何发送方，
-      // probe 也没有音频出口（见 apps/cue-probe.cpp 的说明）。
+      // 解出的 PCM 只用来算指标（RMS/耗时），下行转发的是**原始字节**，不是解码结果
+      // （见下面的"音频下行"段：DownType::Audio 在 N-01 之前就已经有发送方）。
       // 20 ms 的 Opus 帧只有几十~几百字节，远低于 16 KiB 分片上限，浏览器与 cue-capture
       // 都恒单分片；多分片的包不重组（没有发送端会这么做，重组只会把异常掩盖成正常），
       // 单独计数（audio_multi_frag），让「音频在流但口径不完整」可见。
@@ -1935,7 +1945,21 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
           std::vector<uint8_t> apkt(ahdr.begin(), ahdr.end());
           const uint8_t* ap = p + cue::proto::kMediaHeaderSize;
           apkt.insert(apkt.end(), ap, ap + h->payload_len);
-          if (send_dgram(apkt)) ++c.audio_frames_out;
+          // ---- 音频也参与出向注入（N-01）----
+          // 旧实现只把 --inject-drop 打在视频分片上，音频直发：于是"下行注入 5% 丢包"
+          // 在音频侧根本没有发生，FEC/PLC 的验收无从谈起。
+          // 序列独立：seed 派生 ^0xA5A5A5A5（与视频的 pkt_seq、上行的 in_seq 都不共用
+          // 序号空间）。两条流因此互不相关，但同一 (seed, pct) 仍然逐包可复现。
+          // 每包现取一次快照（50 包/秒，开销可忽略）——控制面改注入立刻生效。
+          // audio_frames_out 的语义是「真正发出去的音频包数」：被注入吃掉的不计，
+          // 与 audio_frames_in 的差就只反映"发不出去"（send_dgram 失败）。
+          const auto asnap = params.snapshot();
+          if (should_drop_pkt(asnap.params.inject_seed ^ 0xA5A5A5A5ULL,
+                              permille_from_pct(asnap.params.inject_drop), audio_drop_seq++)) {
+            ++c.audio_injected_drops;
+          } else if (send_dgram(apkt)) {
+            ++c.audio_frames_out;
+          }
         }
       } else {
         ++c.audio_multi_frag;

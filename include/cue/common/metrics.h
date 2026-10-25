@@ -75,6 +75,15 @@ struct ProbeMetrics {
   uint64_t jb_depth = 0;
   uint64_t jb_skipped = 0;
   uint64_t jb_late = 0;
+  // 音频弱网恢复（N-01）：probe 下行音频的 FEC/PLC 账。三个都是**进程累计**，
+  // 且口径互不重叠（见 apps/cue-probe.cpp 里 kMaxPlcFrames 上方的对账等式）：
+  //   fec_recovered   = 用后一包的 in-band FEC 冗余恢复出的真实上一帧；
+  //   plc_frames      = 帧号缺口处由 PLC 外推的隐藏帧（伪造，只用来填播放队列）；
+  //   unconcealed     = 既没 FEC 也没 PLC 覆盖的缺口（诚实暴露）。
+  // 旧录制里没有这三个字段：解析时缺省为 0（不是"解析失败"），见 probe_metrics_from_json。
+  uint64_t audio_fec_recovered = 0;
+  uint64_t audio_plc_frames = 0;
+  uint64_t audio_unconcealed_frames = 0;
   // 不可用原因（进程没起 / 起不来 / 起来了但一条指标都没上报）。空 = 没有异常。
   // 评测侧据此报 probe_unavailable，而不是退回 cued 指标假装有端到端数据。
   std::string unavailable_reason;
@@ -109,6 +118,9 @@ inline nlohmann::json probe_metrics_to_json(const ProbeMetrics& p) {
       {"jb_depth", p.jb_depth},
       {"jb_skipped", p.jb_skipped},
       {"jb_late", p.jb_late},
+      {"audio_fec_recovered", p.audio_fec_recovered},
+      {"audio_plc_frames", p.audio_plc_frames},
+      {"audio_unconcealed_frames", p.audio_unconcealed_frames},
       {"lat_p50_ms", pct(p.lat_p50_ms)},
       {"lat_p95_ms", pct(p.lat_p95_ms)},
       {"lat_p99_ms", pct(p.lat_p99_ms)},
@@ -221,7 +233,14 @@ inline bool probe_metrics_from_json(const nlohmann::json& j, ProbeMetrics& out,
       !cnt("samples", out.samples) || !cnt("jb_level", out.jb_level) ||
       !cnt("jb_switches", out.jb_switches) || !cnt("jb_target_frames", out.jb_target_frames) ||
       !cnt("jb_depth", out.jb_depth) || !cnt("jb_skipped", out.jb_skipped) ||
-      !cnt("jb_late", out.jb_late) || !seg("recv_us", out.recv) ||
+      !cnt("jb_late", out.jb_late) ||
+      // N-01：这三个字段是后加的，旧 cassette 里没有。cnt() 的口径就是「缺了 → 0 且合法」，
+      // 所以它们天然向后兼容（不像别处 fail-closed 那样缺字段就报错）；如果哪天这里要
+      // 改成必填，旧录制会整体解析失败——那才是真回归。
+      !cnt("audio_fec_recovered", out.audio_fec_recovered) ||
+      !cnt("audio_plc_frames", out.audio_plc_frames) ||
+      !cnt("audio_unconcealed_frames", out.audio_unconcealed_frames) ||
+      !seg("recv_us", out.recv) ||
       !seg("reassembly_us", out.reassembly) || !seg("buffer_us", out.buffer) ||
       !seg("decode_us", out.decode)) {
     return false;

@@ -100,6 +100,12 @@ void add_probe_metrics(json& j, const ProbeMetrics& p) {
   j["e2e_jb_depth"] = p.jb_depth;
   j["e2e_jb_skipped"] = p.jb_skipped;
   j["e2e_jb_late"] = p.jb_late;
+  // N-01：音频下行的恢复账。三者口径互不重叠（见 include/cue/common/metrics.h）：
+  // fec 是"用后一包冗余恢复的真实上一帧"，plc 是"缺口处外推的隐藏帧"，
+  // unconcealed 是"没补上的缺口"。agent 判"音频修好了没有"要看后两个不涨。
+  j["e2e_audio_fec_recovered"] = p.audio_fec_recovered;
+  j["e2e_audio_plc_frames"] = p.audio_plc_frames;
+  j["e2e_audio_unconcealed_frames"] = p.audio_unconcealed_frames;
   if (!p.buffer_reason.empty()) j["e2e_buffer_reason"] = p.buffer_reason;
 }
 

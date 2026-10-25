@@ -83,6 +83,10 @@ const char* const kAdditiveCounters[] = {
     "send_errors",     "encode_errors",   "encode_delays",   "decode_drops",
     "queue_dropped",   "delayed_pkts",    "fec_groups",      "ingress_late",
     "audio_frames_in", "audio_bytes_in",  "audio_multi_frag", "bytes_in",
+    // 音频下行：真正发出去的包数、被出向注入吃掉的包数（N-01）。两个都要在聚合白名单里
+    // ——聚合只认这份名单，漏一个的后果是 METRICS 顶层恒 0，而 probe 侧明明收到了音频
+    // （实测踩到：audio_frames_out 从来没进过 METRICS，于是"注入了多少音频包"看起来永远是 0）。
+    "audio_frames_out", "audio_injected_drops",
     // 音频解码：成功帧数（audio_decoded 的判据）、累计 PCM 样本数、失败帧数。
     // 多路求和天然成立——"整条管线解出了多少样本"就是各路之和。
     "audio_decoded_frames", "audio_pcm_frames", "audio_decode_errors",

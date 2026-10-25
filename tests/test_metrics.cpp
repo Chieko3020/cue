@@ -16,6 +16,7 @@
 
 #include "console/metrics_report.h"
 #include "cue/common/log.h"
+#include "cue/common/metrics.h"
 
 namespace {
 
@@ -317,6 +318,51 @@ int main() {
       std::error_code ec;
       fs::remove(logpath, ec);
     }
+  }
+
+  // ---------------------------------------------------------------- probe 快照解析（N-01 字段）
+  //
+  // 三个音频恢复计数是后加的。两类输入都必须能解析：
+  //   1) 旧录制（没有这三个字段）：缺省为 0，**不能**报解析失败——否则回放旧 cassette
+  //      会整体挂掉，等于用"新增观测"破坏了历史数据；
+  //   2) 新 probe.metric（带这三个字段）：原样读出。
+  // 这是"可缺省"与别处 fail-closed 的区别，也正是这条用例存在的意义。
+  {
+    using cue::pipeline::ProbeMetrics;
+    using cue::pipeline::probe_metrics_from_json;
+    std::string err;
+
+    const json old_snapshot = json{{"fps", 30.0},       {"frames", 100},
+                                   {"decoded", 99},     {"decode_errors", 0},
+                                   {"decode_skips", 0}, {"stalls", 0},
+                                   {"max_stall_us", 0.0}, {"samples", 12}};
+    ProbeMetrics old;
+    const bool ok_old = probe_metrics_from_json(old_snapshot, old, err);
+    check(ok_old, "probe 旧快照（无 audio_fec_recovered 等字段）仍能解析");
+    check(old.audio_fec_recovered == 0 && old.audio_plc_frames == 0 &&
+              old.audio_unconcealed_frames == 0,
+          "probe 旧快照缺字段 → 三个计数缺省为 0");
+
+    const json new_snapshot = json{{"fps", 30.0},       {"frames", 100},
+                                   {"decoded", 95},     {"decode_errors", 0},
+                                   {"decode_skips", 0}, {"stalls", 0},
+                                   {"max_stall_us", 0.0}, {"samples", 12},
+                                   {"audio_fec_recovered", 4},
+                                   {"audio_plc_frames", 2},
+                                   {"audio_unconcealed_frames", 1}};
+    ProbeMetrics cur;
+    const bool ok_new = probe_metrics_from_json(new_snapshot, cur, err);
+    check(ok_new, "probe 新快照（带 N-01 字段）能解析");
+    check(cur.audio_fec_recovered == 4 && cur.audio_plc_frames == 2 &&
+              cur.audio_unconcealed_frames == 1,
+          "probe 新快照三个计数按原值读出");
+
+    // 类型错了仍然要报错（fail-closed 的那一半语义不能因为"可缺省"而丢掉）
+    const json bad_type = json{{"fps", 30.0}, {"frames", 100}, {"decoded", 1},
+                               {"audio_plc_frames", "2"}};
+    ProbeMetrics bad;
+    check(!probe_metrics_from_json(bad_type, bad, err),
+          "probe 快照里 audio_plc_frames 是字符串 → 解析失败（不静默当 0）");
   }
 
   if (failures == 0) {

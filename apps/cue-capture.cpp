@@ -203,6 +203,11 @@ struct Options {
   int audio_rate = 44100;         // 源 PCM（故意不是 48k，让 swr 真的重采样）
   int audio_channels = 2;
   int avc_level = 0;              // 0 = 按面积自动（与浏览器 pickCodec 同一张表）
+  // 上行 Opus 的弱网参数（N-01）。默认值来自 OpusAudioEncoder 的常量，那里写清了
+  // 依据（loss perc=10 是"让 libopus 真的生成 LBRR 的最小值"；DTX 默认开，实测不动
+  // 活动帧的码流）。
+  int opus_loss_perc = OpusAudioEncoder::kDefaultPacketLossPerc;
+  bool opus_dtx = true;
   std::string ffmpeg_bin = "ffmpeg";
   std::string dump_wire;  // 非空 = 只打印协议包样例（协议对照脚本用）
 };
@@ -229,6 +234,10 @@ void print_usage() {
       "  --duration S                  采集时长，0 = 无限（默认 0）\n"
       "  --avc-level IDC               AVC level ×10（默认按面积自动：≤720p L3.0、否则 L4.0）\n"
       "  --audio-format RATE:CH        源 PCM 格式（默认 44100:2，采集端负责重采样到 48k mono）\n"
+      "  --opus-loss-perc N            Opus in-band FEC 的预期丢包率 0..100（默认 10）。\n"
+      "                                实测：5 只有 4%% 的帧带 LBRR，10 才 100%% 带；\n"
+      "                                0 = 完全不带 FEC。依据与实测数据见 opus_encoder.h\n"
+      "  --opus-dtx on|off             Opus DTX（静音段发 1 字节帧，默认 on，依据见源码注释）\n"
       "  --ffmpeg PATH                 ffmpeg 可执行文件（默认 ffmpeg）\n"
       "  --dump-wire PATH              写出协议包样例（- = stdout）后退出\n"
       "  --help                        本帮助\n"
@@ -374,6 +383,30 @@ bool parse_options(int argc, char** argv, Options& o, std::string& err) {
       auto v = next(i, "--avc-level");
       if (!v || !parse_int(*v, o.avc_level) || o.avc_level < 0) {
         err = "--avc-level 需要非负整数（30 = L3.0、40 = L4.0）";
+        return false;
+      }
+    } else if (a == "--opus-loss-perc") {
+      auto v = next(i, "--opus-loss-perc");
+      if (!v) return false;
+      int perc = 0;
+      // 范围与 libopus 的契约一致（0..100，见 OpusAudioEncoder::kMaxPacketLossPerc）。
+      // 越界在解析阶段就拒：编码器那边的 set_packet_loss_perc 也会拒，两处都要硬，
+      // 否则"参数写了但没生效"只会表现为音质悄悄变差。
+      if (!parse_int(*v, perc) || perc < OpusAudioEncoder::kMinPacketLossPerc ||
+          perc > OpusAudioEncoder::kMaxPacketLossPerc) {
+        err = "--opus-loss-perc 需要 0..100 的整数（0 = 不带 in-band FEC）";
+        return false;
+      }
+      o.opus_loss_perc = perc;
+    } else if (a == "--opus-dtx") {
+      auto v = next(i, "--opus-dtx");
+      if (!v) return false;
+      if (*v == "on") {
+        o.opus_dtx = true;
+      } else if (*v == "off") {
+        o.opus_dtx = false;
+      } else {
+        err = "--opus-dtx 只接受 on|off";
         return false;
       }
     } else if (a == "--ffmpeg") {
@@ -1783,9 +1816,20 @@ int run(const Options& o) {
       log_line("Opus 编码器初始化失败：%s", aerr.c_str());
       return 1;
     }
-    log_line("音频：%d Hz/%d ch s16 → swr_convert → 48 kHz mono → libopus %d ms %d bps",
+    // 弱网参数在 open 之后设置（open 会把之前存的值一并下发，这里再设一次是为了
+    // 让"CLI 值 → 编码器实际值"这一段在代码上显式可见，而不是靠成员初值隐式传递）。
+    if (!opus.set_packet_loss_perc(o.opus_loss_perc) || !opus.set_dtx(o.opus_dtx)) {
+      log_line("Opus 弱网参数非法（--opus-loss-perc 需 0..100）");
+      return 1;
+    }
+    // 打印**实际生效值**而不是 CLI 值：fec_enabled() 是"开关打开且 loss perc > 0"，
+    // 所以 --opus-loss-perc 0 会把 fec 显示成 off（libopus 在 loss=0 时不产生 LBRR，
+    // 两条口径必须一致，否则日志会撒谎）。
+    log_line("音频：%d Hz/%d ch s16 → swr_convert → 48 kHz mono → libopus %d ms %d bps"
+             "（in-band fec=%s loss_perc=%d dtx=%s）",
              o.audio_rate, o.audio_channels, OpusAudioEncoder::kFrameMs,
-             OpusAudioEncoder::kBitrateBps);
+             OpusAudioEncoder::kBitrateBps, opus.fec_enabled() ? "on" : "off",
+             opus.packet_loss_perc(), opus.dtx_enabled() ? "on" : "off");
   }
 
   // 视频子进程（v4l2 不用子进程）
