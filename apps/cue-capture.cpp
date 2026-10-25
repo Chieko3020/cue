@@ -84,6 +84,7 @@ extern "C" {
 #include "cue/common/clock.h"
 #include "cue/media/annexb.h"
 #include "cue/media/audio_resampler.h"
+#include "cue/media/avc_level.h"
 #include "cue/media/encoder.h"
 #include "cue/media/ffmpeg_args.h"
 #include "cue/media/opus_encoder.h"
@@ -443,16 +444,12 @@ HostPlatform host_platform() {
 #endif
 }
 
-// AVC level 与浏览器侧 web/app.js 的 pickCodec 同一张表：coded area ≤ 720p 用 L3.0，
-// ≤1080p 用 L4.0。代码里显式指定而不是全交给 x264 自动推导，是为了让"同一分辨率在
-// 两条产线上得到同一个 level"，probe 侧对照编码参数时才有意义。
-// 面积超过 1080p 时浏览器会拒绝（pickCodec 返回 null），采集端不拒绝，退回 auto。
-int pick_avc_level(int w, int h) {
-  const long long area = static_cast<long long>(w) * h;
-  if (area <= 414720) return 30;
-  if (area <= 2097152) return 40;
-  return 0;
-}
+// AVC level 的选择表在 include/cue/media/avc_level.h（media 层，N-09 从这里的匿名
+// 命名空间搬出去）。理由有两条：这张表与浏览器侧 web/app.js 的 pickCodec 是两份
+// 平行实现，必须对同一分辨率给出同一个 level，probe 侧对照编码参数才有意义；而写在
+// app 里的函数 tests/ 链接不到，两个边界值（414720 / 2097152）只能靠人工跑管线验证。
+// 面积超过 1080p 时浏览器会拒绝（pickCodec 返回 null），采集端不拒绝，拿到的 0 表示
+// "交给 x264 自动推导"，调用点据此打一行提示。
 
 // ---------------------------------------------------------------- 子进程
 
@@ -1740,7 +1737,8 @@ int run(const Options& o) {
     source = CaptureSource::Lavfi;
   }
   const bool inproc = o.encode == "inproc";
-  const int level_idc = o.avc_level > 0 ? o.avc_level : pick_avc_level(o.width, o.height);
+  const int level_idc =
+      o.avc_level > 0 ? o.avc_level : cue::media::pick_avc_level(o.width, o.height);
   if (level_idc == 0) {
     log_line("尺寸 %dx%d 超过 1080p：浏览器侧 pickCodec 会拒绝，采集端退回 x264 自动 level",
              o.width, o.height);

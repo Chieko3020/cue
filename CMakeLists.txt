@@ -501,6 +501,15 @@ add_executable(test_capture tests/test_capture.cpp)
 target_link_libraries(test_capture PRIVATE cue_capture)
 add_test(NAME capture COMMAND test_capture)
 
+# N-09：分辨率 → AVC level 选择表。两个边界（414720 = L3.0 上限、2097152 = L4.0 上限）
+# 都是闭区间，两侧各测一条；另有常见档位、0/负尺寸的**现行为**、INT_MAX 溢出，
+# 以及 pick_avc_level → avc_level_name 的文案衔接（30→"3.0"、40→"4.0"、0→"auto"）。
+# 表在 media 层（include/cue/media/avc_level.h）：原来写在 apps/cue-capture.cpp 的匿名
+# 命名空间里，tests/ 链接不到 app，所以这两个边界一直只有人工证据。纯头文件、一个 TU，
+# 毫秒级跑完，不需要摄像头也不需要 ffmpeg。
+add_executable(test_avc_level tests/test_avc_level.cpp)
+add_test(NAME avc_level COMMAND test_avc_level)
+
 # T-30（FR-DEV.6）：Opus 解码往返（440 Hz 正弦 vs 数字静音，RMS 差 > 30 dB）、损坏包被拒
 # 且计入错误、空包/超长包在进解码器之前就被拒、20 ms @48k = 960 样本、50 帧连续解码可对账。
 # 编码侧复用 cue_capture（同一个 OpusAudioEncoder），解码侧链新组件；
@@ -540,7 +549,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
-  test_token_bucket test_frame_guard
+  test_token_bucket test_frame_guard test_avc_level
   test_control_channel test_tools test_delay_injector test_nack test_capture
   test_audio_decoder test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
@@ -586,6 +595,22 @@ if(Python3_Interpreter_FOUND)
   endif()
 else()
   message(WARNING "找不到 python3：不注册 integration / no_external_cdn 测试（scripts/*.py 也需要它）")
+endif()
+
+# ---- Node 驱动的一致性检查（N-09）----
+# 分辨率 → AVC level 有两份平行实现：C++ 的 include/cue/media/avc_level.h 与浏览器侧的
+# web/app.js 的 pickCodec。C++ 那份的边界由 test_avc_level 钉住，但"两份不漂"必须
+# 跨文件比较——这条测试只读源码、不启动浏览器、不发网络请求，秒级跑完；需要真 chromium
+# 的才叫 e2e（scripts/e2e-*.cjs）。node 是前端构建的既有依赖，找不到时只告警、不注册，
+# 与上面 python3 的处理同一口径。
+find_program(NODE_EXECUTABLE node)
+if(NODE_EXECUTABLE)
+  add_test(NAME avc_level_consistency
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-avc-level.mjs)
+  set_tests_properties(avc_level_consistency PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+else()
+  message(WARNING "找不到 node：不注册 avc_level_consistency 测试（scripts/*.mjs 需要它）")
 endif()
 
 # ---- libFuzzer（可选，默认关；技术设计 §13.4 / T-18b）----
@@ -647,7 +672,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 环境变量，包括 CUE_API_KEY。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
                      jitter_buffer control_channel tools delay_injector nack capture config metrics
-                     session_registry generator report audio_decoder h264_decoder)
+                     session_registry generator report audio_decoder h264_decoder avc_level)
   foreach(_t ${_cue_san_tests})
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
@@ -659,8 +684,9 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 第一次是 sandbox，第二次是 session_registry / generator / report / audio_decoder）。
   # 与其靠记性，不如让 configure 直接报错。
   # 豁免：不是 C++ 二进制，不加载 sanitizer 运行时，LD_PRELOAD 对它们没意义。
-  #   layer_isolation 是 cmake -P 脚本测试；no_external_cdn 是 Python 脚本。
-  set(_cue_san_exempt layer_isolation no_external_cdn)
+  #   layer_isolation 是 cmake -P 脚本测试；no_external_cdn 是 Python 脚本；
+  #   avc_level_consistency 是 node 脚本（只读源码，不加载 C++ 运行时）。
+  set(_cue_san_exempt layer_isolation no_external_cdn avc_level_consistency)
   get_property(_cue_all_tests DIRECTORY PROPERTY TESTS)
   set(_cue_missing "")
   foreach(_t ${_cue_all_tests})
