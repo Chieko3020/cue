@@ -832,7 +832,7 @@ std::string Engine::config_hash() const {
                          llm_hash + ep_hash + tools_hash);
 }
 
-PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
+PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg, const std::string& run_dir) {
   PipelineConfig pc;
   pc.cued_bin = cfg.cued_bin;
   // 探针默认跟着 cued 走：显式 --probe 优先，否则取 cued 同目录的 cue-probe。
@@ -862,8 +862,49 @@ PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg) {
   pc.bitrate_kbps = c.bitrate_kbps;
   pc.gop = c.gop;
   pc.preset = c.preset;
+  // 注入 trace（N-11）：M2-3 的「同 seed 逐包可复现」要有自动落盘的文件，而不是让人
+  // 手动去敲 `cued --inject-trace`。路径按 run 目录算：<run_dir>/inject-trace/<case>.trace，
+  // 同一份 suite 两次 run 的 trace 因此可以逐行 diff（run_id 不同、case 名相同）。
+  //
+  // 白名单而不是「有注入就落」：cued 只有两种逐包记录点——出向视频丢包判决
+  // `<frame_id> <pk>` 行（fault.kind=drop）与抖动注入的 `j <frame_id> <pk> <extra_us>`
+  // 行（fault.kind=jitter）。上行丢包 / rate / backlog / 纯 delay 在 cued 里没有逐包
+  // 判定可记，给它们指一个 trace 只会得到一个 0 字节文件，读起来像"trace 丢了"。
+  // run_dir 为空（离线只算档位）时一律不落 trace，绝不回退到 /tmp 或当前目录。
+  const bool traceable = c.fault_kind == "drop" || c.fault_kind == "jitter";
+  if (traceable && c.fault_value > 0.0 && !run_dir.empty()) {
+    pc.inject_trace = run_dir + "/inject-trace/" + c.id + ".trace";
+  }
   return pc;
 }
+
+namespace {
+
+// 注入 trace 的目录（<run_dir>/inject-trace/）随 run 建一次：不存在时 cued 的
+// `fopen(w)` 会失败，trace 就静默没了。建不出来时清掉路径并大声报错——宁可不落
+// trace，也不要让 cued 对着一个不存在的目录写（那样日志里只有一行 "cannot open trace"）。
+void ensure_inject_trace_dir(PipelineConfig& pc, const std::string& case_id) {
+  if (pc.inject_trace.empty()) return;
+  std::error_code ec;
+  std::filesystem::create_directories(std::filesystem::path(pc.inject_trace).parent_path(), ec);
+  if (ec) {
+    std::fprintf(stderr, "[eval][%s] 创建注入 trace 目录失败：%s（本次不落 trace）\n",
+                 case_id.c_str(), ec.message().c_str());
+    pc.inject_trace.clear();
+  }
+}
+
+// Process 分支专用：建目录，并把最终路径记进 outcome 与控制台日志。
+// 只有真的拉起 cued 时才有意义（回放/HTTP 端点不 spawn，也就没有 trace）。
+void prepare_inject_trace(PipelineConfig& pc, const Case& c, CaseOutcome& o) {
+  ensure_inject_trace_dir(pc, c.id);
+  if (pc.inject_trace.empty()) return;
+  o.inject_trace = pc.inject_trace;
+  std::fprintf(stderr, "[eval][%s] 注入 trace → %s（同 seed 的两次 run 可逐行 diff）\n",
+               c.id.c_str(), pc.inject_trace.c_str());
+}
+
+}  // namespace
 
 std::string classify_run_error(const agent::RunResult& res) {
   if (res.error.empty()) return {};  // 显式 give_up 仍计分（算失败，不算 run_error）
@@ -900,6 +941,7 @@ pipeline::PipelineEndpoint to_endpoint(const PipelineConfig& pc) {
   out.inject_delay_ms = pc.inject_delay_ms;
   out.inject_jitter_ms = pc.inject_jitter_ms;
   out.inject_seed = pc.inject_seed;
+  out.inject_trace = pc.inject_trace;
   out.transcode = pc.transcode;
   out.width = pc.width;
   out.height = pc.height;
@@ -1279,7 +1321,7 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   const bool replay_tools = !cfg_.replay_tools_dir.empty();
   const bool record_tools = !cfg_.record_tools_dir.empty();
   const bool http = !cfg_.endpoint.empty();
-  const auto pcfg = pipeline_config_for(c, cfg_);
+  auto pcfg = pipeline_config_for(c, cfg_, run_dir_);
 
   std::string err;
   std::unique_ptr<pipeline::IServicePipeline> pipe;
@@ -1308,6 +1350,7 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     }
   } else {
     // Process 分支：真实 cued 子进程（外部推流由验收脚本提供）
+    prepare_inject_trace(pcfg, c, o);
     pipe = pipeline::make_pipeline(to_endpoint(pcfg), err);
     if (!pipe) {
       o.error_kind = "pipeline_create_failed: " + err;
@@ -1697,7 +1740,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
 
   // 1) 起管线：默认起本机 cued；--endpoint 时改为连一个实现 REST 控制协议的 HTTP 服务。
   //    此后所有使用（监控 / 工具 / SLA 复测）都只经 IServicePipeline，不认识具体后端。
-  const auto pcfg = pipeline_config_for(c, cfg_);
+  auto pcfg = pipeline_config_for(c, cfg_, run_dir_);
   const bool replay_tools = !cfg_.replay_tools_dir.empty();
   const bool record_tools = !cfg_.record_tools_dir.empty();
   // 录制/回放工具观测时不能有后台轮询线程：latest() 的序列按调用顺序消费，
@@ -1733,6 +1776,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   } else {
     // Process 分支：cued 的启动参数原样进 PipelineEndpoint，由 pipeline 层的工厂
     // 造出 ProcessPipelineControl（eval 不认识这个具体类型）。
+    prepare_inject_trace(pcfg, c, o);
     pipe = pipeline::make_pipeline(to_endpoint(pcfg), err);
     if (!pipe) {
       o.error_kind = "pipeline_create_failed: " + err;
@@ -2135,6 +2179,8 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   const std::string run_dir = cfg_.out_dir + "/" + r.run_id;
   // AC-11 审计落点：跟着 run 目录走，run 目录本来就被 .gitignore 排除
   audit_log_path_ = run_dir + "/audit.jsonl";
+  // 注入 trace 的落点也从这里派生（<run_dir>/inject-trace/<case>.trace，N-11）
+  run_dir_ = run_dir;
   const std::string state_path = run_dir + "/state.jsonl";
   {
     std::error_code ec;
@@ -2673,6 +2719,22 @@ std::string Engine::render_markdown(const RunReport& r) const {
         << "）：suite 改名/增删会让公共部分的 diff 失去意义。\n";
     }
   }
+  // 注入 trace（N-11）：只有注入类 case 才有，逐 case 列出落点——读者要能直接找到
+  // 文件去 diff 同 seed 的两次 run，而不是去翻控制台日志。
+  {
+    std::vector<const CaseOutcome*> traced;
+    for (const auto& c : r.cases) {
+      if (!c.inject_trace.empty()) traced.push_back(&c);
+    }
+    if (!traced.empty()) {
+      o << "\n> 注入 trace（" << traced.size()
+        << " 个注入类 case 的逐包判定；同一 suite 同 seed 的两次 run 可逐行 diff，"
+           "行数随推流时长变化，前缀一致即判定序列一致）：\n";
+      for (const auto* c : traced) {
+        o << "> - `" << md_escape(c->id) << "` → `" << md_escape(c->inject_trace) << "`\n";
+      }
+    }
+  }
   o << "\n> 说明：延迟与成功率均为本机实测；跨机场景下的端到端延迟为相对量，不含最小网络传播时间。\n";
   o << "> 判分口径：SLA 由 harness 在 agent 结束后重测（不采信 agent 自报）；"
        "run_error 不计入成功率分母。\n";
@@ -2794,6 +2856,8 @@ std::string Engine::render_json(const RunReport& r) const {
         {"p99_ms_fault", num(c.p99_ms_fault)},
         {"p99_ms_after", num(c.p99_ms_after)},
         {"e2e_null_reason", c.e2e_null_reason.empty() ? json(nullptr) : json(c.e2e_null_reason)},
+        // 注入 trace 的落点：没有 trace 的 case 写 null（"没有这个文件"不是空路径）
+        {"inject_trace", c.inject_trace.empty() ? json(nullptr) : json(c.inject_trace)},
     };
     if (c.scored) {
       cj["score"] = json{{"root", c.score.root},

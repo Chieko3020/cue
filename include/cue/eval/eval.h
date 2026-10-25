@@ -191,6 +191,9 @@ struct PipelineConfig {
   double inject_delay_ms = 0.0;
   double inject_jitter_ms = 0.0;
   uint64_t inject_seed = 42;
+  // 逐包注入判定的 trace 路径：非空时 supervisor 给 cued 传 `--inject-trace`。
+  // 由 pipeline_config_for 按 run 目录算出（N-11），空 = 不落 trace。
+  std::string inject_trace;
 };
 
 // ---------------------------------------------------------------- 解析
@@ -235,6 +238,9 @@ struct CaseOutcome {
   // AC-6：工具观测回放的命中/miss（miss = 录制用尽或参数不符，必须报错并留档）
   std::size_t tool_hits = 0;
   std::size_t tool_misses = 0;
+  // 本 case 的注入 trace 路径（空 = 没有落 trace）。报告里按 case 列出，便于复核
+  // "同 seed 两次 run 的丢包判定是否一致"——trace 是证据文件，不进 state 的判分口径。
+  std::string inject_trace;
 };
 
 struct RunConfig {
@@ -414,8 +420,11 @@ std::vector<FailureMode> summarize_failure_modes(const std::vector<Case>& cases,
 // 没有任何 scored 样本的那一轮不计入（不能拿 1 个样本的轮冒充稳定）。
 Stability compute_stability(const std::vector<CaseOutcome>& outcomes, int repeat);
 
-// real 模式：case → 管线配置（注入档位只来自 case；评测器不替 agent 造结论）
-PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg);
+// real 模式：case → 管线配置（注入档位只来自 case；评测器不替 agent 造结论）。
+// run_dir 是本次 run 的目录（`<out_dir>/<run_id>`）：注入类 case 的 trace 落在这里
+// （`<run_dir>/inject-trace/<case_id>.trace`）。run_dir 为空 = 不落 trace（单测/离线
+// 只检查档位时用），绝不回退到 /tmp 或当前目录。
+PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg, const std::string& run_dir);
 
 // real 模式错误分类：空串 = 计分；否则是 run_error 的 error_kind（不计入成功率分母）
 std::string classify_run_error(const agent::RunResult& res);
@@ -449,6 +458,10 @@ class Engine {
   // run_shell 的审计路径（<out_dir>/<run_id>/audit.jsonl）。run_id 要到 run_cases 里
   // 才算得出来，而 run_real_case_impl 是 const，所以这里用 mutable 存一次。
   mutable std::string audit_log_path_;
+  // 本次 run 的目录（<out_dir>/<run_id>）。同 audit_log_path_：run_id 在 run_cases 里才
+  // 算得出来，而 pipeline_config_for 的调用点在 const 的 run_*_impl 里，故 mutable。
+  // 注入类 case 的 trace 路径由它派生，空 = 不落 trace。
+  mutable std::string run_dir_;
 };
 
 }  // namespace cue::eval

@@ -440,6 +440,13 @@ bool ProcessPipelineControl::spawn_cued_locked(std::string& err) {
     args.push_back("--inject-jitter-ms");
     args.push_back(std::to_string(cfg.inject_jitter_ms));
   }
+  // 注入 trace 同样只在显式给了路径时下传（空 = cued 不落 trace）：它是复现证据，
+  // 不是行为开关，无条件给一个默认路径会让每次起 cued 都写一份没人清理的文件。
+  // 判定仍然由 `should_drop_pkt(seed, permille, seq)` 决定，trace 只记录判决结果。
+  if (!cfg.inject_trace.empty()) {
+    args.push_back("--inject-trace");
+    args.push_back(cfg.inject_trace);
+  }
   if (cfg.transcode) {
     args.push_back("--transcode");
     args.push_back("on");

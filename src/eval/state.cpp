@@ -245,6 +245,9 @@ json outcome_to_json(const CaseOutcome& o) {
                                                             : json(o.e2e_null_reason)},
               {"cassette_hits", o.cassette_hits},
               {"cassette_misses", o.cassette_misses},
+              // 注入 trace 的落点（空串 = 本 case 不落 trace）。续跑复用缓存时要能
+              // 从 state 里读回来，报告才列得出"这次 run 的 trace 在哪"。
+              {"inject_trace", o.inject_trace},
               {"observations", observations_to_json(o.observations)}};
 }
 
@@ -305,6 +308,9 @@ std::expected<CaseOutcome, std::string> outcome_from_json(const json& j) {
     read_u64("final_samples", o.final_samples);
     read_u64("cassette_hits", o.cassette_hits);
     read_u64("cassette_misses", o.cassette_misses);
+    if (j.contains("inject_trace") && j["inject_trace"].is_string()) {
+      o.inject_trace = j["inject_trace"].get<std::string>();
+    }
     if (j.contains("metrics")) {
       std::string merr;
       o.metrics = metrics_from_json(j["metrics"], merr);

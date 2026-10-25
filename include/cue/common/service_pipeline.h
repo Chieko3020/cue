@@ -55,6 +55,14 @@ struct PipelineEndpoint {
   double inject_delay_ms = 0.0;
   double inject_jitter_ms = 0.0;
   uint64_t inject_seed = 42;
+  // 逐包注入判定的 trace 落盘路径（cued 的 `--inject-trace`）。空 = 不落 trace。
+  // 非空时 cued 把每个「被注入吃掉」的包（出向视频 `<frame_id> <pk>` 行，以及抖动注入
+  // 的 `j <frame_id> <pk> <extra_us>` 行）写进该文件；判定本身仍由
+  // `should_drop_pkt(seed, permille, seq)` 决定，所以同一 seed + 同一串包号的 trace
+  // 逐行可复现——这是 M2-3「同 seed 可复现」的证据载体，**不是**生产环境的默认开关：
+  // 只在评测/复现实验里按 case 显式给出路径（见 eval 的 `pipeline_config_for`），
+  // 无条件传一个默认路径只会让每次起进程都往磁盘写一份没人清理的文件。
+  std::string inject_trace;
   bool fec = true;
   // FEC 组大小（FR-PIPE.9）：每 N 个数据包一组。运行期可通过 set_param fec_group 改；
   // 这个字段只是「下一次 spawn 的命令行初值」。

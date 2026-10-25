@@ -239,7 +239,8 @@ int main() {
     eval::RunConfig cfg;
     cfg.cued_bin = "./build/cued";
     const auto c = make_case("netloss-5pct");
-    const auto pc = eval::pipeline_config_for(c, cfg);
+    const std::string run_dir = "runs/run-1";
+    const auto pc = eval::pipeline_config_for(c, cfg, run_dir);
     check(pc.inject_drop == 5.0, "pipeline_config_for 注入来自 case.fault_value");
     check(pc.inject_seed == 42, "pipeline_config_for 种子来自 case.seed");
     check(pc.bitrate_kbps == 900 && pc.gop == 30, "pipeline_config_for 档位来自 case");
@@ -249,7 +250,25 @@ int main() {
     auto no_fault = c;
     no_fault.fault_kind = "none";
     no_fault.fault_value = 5.0;
-    check(eval::pipeline_config_for(no_fault, cfg).inject_drop == 0.0, "kind != drop 时不注入");
+    check(eval::pipeline_config_for(no_fault, cfg, run_dir).inject_drop == 0.0,
+          "kind != drop 时不注入");
+
+    // N-11：注入 trace 按 run 目录 + case 名落点，同 seed 的两次 run 因此可 diff
+    check(pc.inject_trace == run_dir + "/inject-trace/netloss-5pct.trace",
+          "注入类 case 的 trace 落在 <run_dir>/inject-trace/<case>.trace");
+    check(eval::pipeline_config_for(no_fault, cfg, run_dir).inject_trace.empty(),
+          "非注入 case 不落 trace（不无条件给默认路径）");
+    check(eval::pipeline_config_for(c, cfg, "").inject_trace.empty(),
+          "没有 run 目录时不落 trace（不回退到 /tmp 或当前目录）");
+    // cued 只有出向视频丢包与抖动注入两种逐包记录点：其余注入给 trace 只会得到空文件
+    auto ingress = c;
+    ingress.fault_kind = "ingress_drop";
+    check(eval::pipeline_config_for(ingress, cfg, run_dir).inject_trace.empty(),
+          "上行丢包在 cued 里没有逐包记录点，不落 trace");
+    auto jitter = c;
+    jitter.fault_kind = "jitter";
+    check(!eval::pipeline_config_for(jitter, cfg, run_dir).inject_trace.empty(),
+          "抖动注入有 j 行，落 trace");
   }
 
   // 8) run_error 分类：agent 没跑完 ≠ 答错

@@ -216,6 +216,17 @@ void test_markdown_sections() {
   check(has(md, "总体标准差"), "md: 写明标准差用总体标准差");
   check(has(md, "运行状态备注") == false, "md: 没有 run_notes 时不渲染空的运行状态段");
 
+  // N-11：注入 trace 的落点要能在报告里找到（没有 trace 的 run 不渲染这一行）
+  check(!has(md, "注入 trace"), "md: 没有 trace 的 run 不渲染注入 trace 段");
+  {
+    eval::RunReport with_trace = r;
+    with_trace.cases.at(0).inject_trace = "runs/run-abc/inject-trace/a.trace";
+    const std::string md_trace = engine.render_markdown(with_trace);
+    check(has(md_trace, "注入 trace（1 个注入类 case 的逐包判定"),
+          "md: 有 trace 时给出注入 trace 段与计数");
+    check(has(md_trace, "runs/run-abc/inject-trace/a.trace"), "md: 注入 trace 段列出具体路径");
+  }
+
   // N-05：六段延迟表里的 p95 必须是数字（不再是恒 n/a）。这里给每个 case 灌同一组分位，
   // 表里取中位后应逐位显示；同时确认脚注不再说"p95 写 n/a"。
   {
@@ -281,6 +292,10 @@ void test_json_fields() {
         "json: 对象含 root_cause / miss_count / examples");
   check(j["run_notes"].is_array() && j["run_notes"][0] == "cost gate triggered at 6.0",
         "json: run_notes 是独立的字符串数组");
+  // N-11：没有 trace 的 case 写 null（"没有这个文件"不是空路径串）
+  check(j["cases"][0].contains("inject_trace") && j["cases"][0]["inject_trace"].is_null(),
+        "json: 无 trace 的 case 写 inject_trace=null");
+  check(j["cases"][1].contains("inject_trace"), "json: 每个 case 都有 inject_trace 字段");
   check(j["stability"]["repeat"] == 3, "json: stability.repeat");
   check(j["stability"]["rounds"] == 3, "json: stability.rounds = 有样本的轮数");
   check(j["stability"]["informative"] == true, "json: repeat=3 时 informative=true");
