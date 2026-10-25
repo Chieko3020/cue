@@ -1243,6 +1243,15 @@ int main(int argc, char** argv) {
   // 只拿 recovered 一个数讲不了"到底有多少丢了没救回来"。
   uint64_t fec_recovered = 0;
   FecSettle fec_totals;
+  // 幽灵帧守卫的账（M0 教训 / N-02）：两条分支都会遇到"该帧已判定完成，却又有一个
+  // 数据报要为它重建槽位"。重建槽位会让同一帧被计第二次完成数（零丢包时 no_data 恰等于
+  // FEC 包数，完成帧数甚至超过发送帧数）。两条分支的**触发源不同**，所以分开计：
+  //   fec_ghost_discarded  = FEC 冗余包为已完成帧重建槽位（FEC 在整帧数据之后到达）；
+  //   frag_ghost_discarded = 迟到的视频分片/重传为已完成帧重建槽位（NACK 补回的片）。
+  // 分开的理由：两者同时涨说明"又丢又乱"，混成一个数就分不清是 FEC 冗余多余，
+  // 还是重传追不上——而两者的修法完全不同（前者调 FEC 分组，后者调 NACK 延迟）。
+  uint64_t fec_ghost_discarded = 0;
+  uint64_t frag_ghost_discarded = 0;
   uint32_t max_completed = 0;
   // max_completed 的初值是 0，直接用 `fid <= max_completed` 会把**第一帧**（frame_id=0）
   // 当成"已完成帧的迟到分片"丢掉。丢了 IDR 的代价是解码器拿不到 SPS/PPS，接下来整整
@@ -1971,8 +1980,8 @@ int main(int argc, char** argv) {
       const double fps_dec = double(dd) / dt;
       std::printf(
           "[probe] session=%u fps=%.1f frames=%llu lost=%llu pend=%zu pkts=%llu nack=%llu "
-          "sup=%llu pm=%llums mode=%s pause=%llu fec_rec=%llu fec_unrec=%llu rej=%llu "
-          "loss=%.1f%% MB=%.2f fb=%llu  ",
+          "sup=%llu pm=%llums mode=%s pause=%llu fec_rec=%llu fec_unrec=%llu "
+          "ghost=%llu/%llu rej=%llu loss=%.1f%% MB=%.2f fb=%llu  ",
           session_seen, fps_rx, static_cast<unsigned long long>(frames),
           static_cast<unsigned long long>(lost_frames), pending.size(),
           static_cast<unsigned long long>(packets),
@@ -1983,6 +1992,9 @@ int main(int argc, char** argv) {
           static_cast<unsigned long long>(nack_pauses_now),
           static_cast<unsigned long long>(fec_recovered),
           static_cast<unsigned long long>(fec_totals.unrecoverable),
+          // ghost=fec/frag：人读行里同样分开写，免得人工核对时把两个源混成一个数
+          static_cast<unsigned long long>(fec_ghost_discarded),
+          static_cast<unsigned long long>(frag_ghost_discarded),
           static_cast<unsigned long long>(rejected),
           win_loss * 100.0, double(bytes) / (1024.0 * 1024.0),
           static_cast<unsigned long long>(fb_sent));
@@ -2071,6 +2083,12 @@ int main(int argc, char** argv) {
           {"fec_groups_rx", fec_totals.groups_rx},
           {"fec_unrecoverable", fec_totals.unrecoverable},
           {"fec_unrecoverable_pkts", fec_totals.unrecoverable_pkts},
+          // 幽灵帧守卫的计数（N-02）：被丢弃的"为已完成帧重建槽位"次数。两个源分开
+          // 记账的理由见上面 fec_ghost_discarded / frag_ghost_discarded 的定义处。
+          // 恒 0 是正常的（零丢包时不会走到这两条分支）；只有注入丢包 + FEC/NACK
+          // 才会让它涨——所以它不能单独当"幽灵帧存在"的证据，要和 fec_recovered 一起读。
+          {"fec_ghost_discarded", fec_ghost_discarded},
+          {"frag_ghost_discarded", frag_ghost_discarded},
           // feedback 发送计数；RTT/抖动本身是 cued 的消费面，probe 不重复一份。
           {"fb_sent", fb_sent},
           {"rtt_ms", (last_rtt_us >= 0 && last_rtt_at_us > 0 &&
@@ -2444,7 +2462,12 @@ int main(int argc, char** argv) {
         continue;
       }
       const uint32_t base_fid = fph->base_frame_id;
+      // FEC 冗余包通常在整帧数据**之后**到达：该帧若已判定完成，这里会给它重建一个
+      // 空槽位，随后又被 finish_if_complete 计成"第二次完成"——M0 的幽灵帧。
+      // 静默丢弃 + 计数（N-02）：这条路径以前只是 continue，故障期"到底丢了多少"
+      // 无从查起，agent 也就无法把它当证据。
       if (have_completed && base_fid <= max_completed && pending.find(base_fid) == pending.end()) {
+        ++fec_ghost_discarded;
         continue;
       }
       // 组的位置在数据报头里：frag_index = 组起始片号，frag_count = 整帧片数。
@@ -2635,6 +2658,9 @@ int main(int argc, char** argv) {
     // 首帧（还没有任何已完成帧）不适用这条：frame_id 从 0 开始，初值 0 会把 IDR 挡掉。
     if (have_completed && pending.find(h->frame_id) == pending.end() &&
         h->frame_id <= max_completed) {
+      // 与 FEC 分支同一个幽灵帧守卫，但触发源是迟到的视频分片（含 NACK 重传）：
+      // 单独计数才能区分"FEC 冗余多余"与"重传追不上"（见 fec_ghost_discarded 的注释）。
+      ++frag_ghost_discarded;
       continue;
     }
     // frag_count == 0 会让 parts 为空、完整性判定零次迭代 → 判为完成并污染 lat/fps

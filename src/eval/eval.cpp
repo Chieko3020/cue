@@ -1186,12 +1186,26 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   // send 段分位与延迟计数是 T-10 新增的候选键：这条自检路径不跑管线，所以这里给的
   // 是"时延类故障会看到的那组数"（send 段被压住、延迟计数在涨），不是实测值——
   // 与上面 injected=59 同性质。真管线路径（--record-tools / --endpoint）的读数才是证据。
+  // N-02：FEC/幽灵帧/音频帧号与编码档位也是各类 case 会声明的候选键。这条自检路径
+  // 不跑管线，所以这里给的同样是"该类故障会看到的那组数"：
+  //   - e2e_fec_*：注入 5% 丢包 + FEC 时的读数（恢复涨、幽灵帧守卫命中、有坏组）；
+  //   - encode_*：1080p30 的真实档位（AVC level 类 case 的唯一可引用观测）。
+  // 与 injected=59 同性质，不是实测值；真管线路径的读数才是证据。
   ob.data = json{{"fps", 30.3},        {"frames_in", 247},   {"frames_out", 247},
                  {"dropped", 0},       {"injected", 59},     {"decoded", 247},
                  {"decode_errors", 0}, {"budget_drops", 0},  {"encode_p50_ms", 6.4},
                  {"encode_p99_ms", 9.1}, {"op_p50_ms", 0.3}, {"samples", 1},
                  {"send_p50_ms", 201.2}, {"send_p99_ms", 233.0},
-                 {"delayed_pkts", 120},  {"delayed_max_us", 233000}, {"ingress_late", 0}};
+                 {"delayed_pkts", 120},  {"delayed_max_us", 233000}, {"ingress_late", 0},
+                 {"encode_width", 1920}, {"encode_height", 1080},
+                 {"encode_bitrate_kbps", 6000}, {"encode_gop", 60},
+                 {"encode_preset", "veryfast"}, {"encode_transcode", "on"},
+                 {"e2e_fec_recovered", 37}, {"e2e_fec_groups_rx", 118},
+                 {"e2e_fec_unrecoverable", 1}, {"e2e_fec_unrecoverable_pkts", 3},
+                 {"e2e_fec_ghost_discarded", 9}, {"e2e_frag_ghost_discarded", 2},
+                 {"e2e_lost", 4}, {"e2e_audio_datagrams", 1500},
+                 {"e2e_audio_seq_gaps", 12}, {"e2e_audio_dups", 0},
+                 {"e2e_audio_reordered", 1}, {"e2e_audio_stale", 0}};
   ob.text = "metrics=" + ob.data.dump();
   obs.push_back(ob);
 

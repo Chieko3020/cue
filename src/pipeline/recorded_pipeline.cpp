@@ -59,6 +59,16 @@ json metrics_to_json(const PipelineMetrics& m) {
               {"updated_us", m.updated_us},
               {"samples", m.samples},
               {"alive", m.alive},
+              // 编码档位（N-02）：null = 未知（该后端/该快照没有 params），不是 0。
+              {"encode_width", m.encoder_known ? json(m.enc_width) : json(nullptr)},
+              {"encode_height", m.encoder_known ? json(m.enc_height) : json(nullptr)},
+              {"encode_bitrate_kbps", m.encoder_known ? json(m.enc_bitrate_kbps) : json(nullptr)},
+              {"encode_gop", m.encoder_known ? json(m.enc_gop) : json(nullptr)},
+              {"encode_preset", m.encoder_known && !m.enc_preset.empty() ? json(m.enc_preset)
+                                                                         : json(nullptr)},
+              {"encode_transcode", m.encoder_known && !m.enc_transcode.empty()
+                                       ? json(m.enc_transcode)
+                                       : json(nullptr)},
               {"pid", m.pid == 0 ? json(nullptr) : json(static_cast<std::int64_t>(m.pid))}};
 }
 
@@ -149,6 +159,37 @@ bool metrics_from_json(const json& j, PipelineMetrics& m, std::string& err) {
     return false;
   }
   m.alive = j["alive"].get<bool>();
+  // 编码档位（N-02）：旧录制里没有这一组 → encoder_known=false（未知），不报错；
+  // 但字段存在而类型不对仍然 fail-closed（与其它字段同一口径）。
+  bool enc_seen = false;
+  auto enc_num = [&j, &err, &enc_seen](const char* key, int& out) {
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return true;
+    if (!it->is_number_integer()) {
+      err = std::string("metrics 字段 ") + key + " 既不是 null 也不是整数";
+      return false;
+    }
+    out = it->get<int>();
+    enc_seen = true;
+    return true;
+  };
+  auto enc_str = [&j, &err, &enc_seen](const char* key, std::string& out) {
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return true;
+    if (!it->is_string()) {
+      err = std::string("metrics 字段 ") + key + " 既不是 null 也不是字符串";
+      return false;
+    }
+    out = it->get<std::string>();
+    enc_seen = true;
+    return true;
+  };
+  if (!enc_num("encode_width", m.enc_width) || !enc_num("encode_height", m.enc_height) ||
+      !enc_num("encode_bitrate_kbps", m.enc_bitrate_kbps) || !enc_num("encode_gop", m.enc_gop) ||
+      !enc_str("encode_preset", m.enc_preset) || !enc_str("encode_transcode", m.enc_transcode)) {
+    return false;
+  }
+  m.encoder_known = enc_seen;
   if (!j.contains("pid") || j["pid"].is_null()) {
     m.pid = 0;
   } else if (j["pid"].is_number_integer()) {

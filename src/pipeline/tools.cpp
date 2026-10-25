@@ -66,6 +66,20 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"control_channel", m.control_channel.empty() ? json(nullptr)
                                                             : json(m.control_channel)},
               {"control_ops", m.control_ops},
+              // 编码档位（N-02）：AVC level / 分辨率类根因过去只有一个报错字符串可讲，
+              // 因为 agent 看不到"实际在用什么尺寸/码率编码"。这里输出的是 cued
+              // ParamStore 的运行期真值（set_param 改过也在内）。
+              // encoder_known=false（控制通道降级 / HTTP 后端不带 params）时写 null——
+              // "不知道"不能写成 0（0 会被读成"没有转码"或"尺寸为 0"）。
+              {"encode_width", m.encoder_known ? json(m.enc_width) : json(nullptr)},
+              {"encode_height", m.encoder_known ? json(m.enc_height) : json(nullptr)},
+              {"encode_bitrate_kbps", m.encoder_known ? json(m.enc_bitrate_kbps) : json(nullptr)},
+              {"encode_gop", m.encoder_known ? json(m.enc_gop) : json(nullptr)},
+              {"encode_preset", m.encoder_known && !m.enc_preset.empty() ? json(m.enc_preset)
+                                                                         : json(nullptr)},
+              {"encode_transcode", m.encoder_known && !m.enc_transcode.empty()
+                                       ? json(m.enc_transcode)
+                                       : json(nullptr)},
               {"age_ms", age_us < 0 ? -1 : age_us / 1000}};
 }
 
@@ -106,6 +120,26 @@ void add_probe_metrics(json& j, const ProbeMetrics& p) {
   j["e2e_audio_fec_recovered"] = p.audio_fec_recovered;
   j["e2e_audio_plc_frames"] = p.audio_plc_frames;
   j["e2e_audio_unconcealed_frames"] = p.audio_unconcealed_frames;
+  // N-02：FEC / NACK / 幽灵帧 / 音频帧号账。这些数 probe 一直在算、也一直在 METRICS 行
+  // 与 probe.metric 事件里上报，只是没进 agent 的观测面——于是"M0 幽灵帧到底发生过没有"
+  // 在证据层无法成立（m2-constraints 的候选引用了根本不存在的 frames_no_data）。
+  // 口径见 include/cue/common/metrics.h：fec_* 是**视频片**的账，audio_fec_* 是音频帧的账。
+  j["e2e_fec_recovered"] = p.fec_recovered;
+  j["e2e_fec_groups_rx"] = p.fec_groups_rx;
+  j["e2e_fec_unrecoverable"] = p.fec_unrecoverable;
+  j["e2e_fec_unrecoverable_pkts"] = p.fec_unrecoverable_pkts;
+  // 幽灵帧守卫：两条分支分开报。零丢包时恒 0 是**正常读数**（不是"没采到"）：
+  // 只有注入丢包 + FEC/NACK 才会走到丢弃分支，所以引用它时必须同时看 fec_recovered。
+  j["e2e_fec_ghost_discarded"] = p.fec_ghost_discarded;
+  j["e2e_frag_ghost_discarded"] = p.frag_ghost_discarded;
+  j["e2e_lost"] = p.lost;
+  j["e2e_nack_sent"] = p.nack_sent;
+  j["e2e_audio_datagrams"] = p.audio_datagrams;
+  j["e2e_audio_seq_gaps"] = p.audio_seq_gaps;
+  j["e2e_audio_dups"] = p.audio_dups;
+  j["e2e_audio_reordered"] = p.audio_reordered;
+  j["e2e_audio_stale"] = p.audio_stale;
+  j["e2e_audio_decode_errors"] = p.audio_decode_errors;
   if (!p.buffer_reason.empty()) j["e2e_buffer_reason"] = p.buffer_reason;
 }
 

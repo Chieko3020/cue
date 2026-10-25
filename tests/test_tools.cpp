@@ -86,6 +86,53 @@ bool has_value(const std::vector<std::string>& v, const std::string& x) {
   return std::find(v.begin(), v.end(), x) != v.end();
 }
 
+// N-02：agent 的观测面到底长什么样，只有真调一次 query_metrics 才算证明。
+// suite 的 evidence_candidates 写在 JSON 里，但"能不能摘到"取决于这里的输出键名；
+// 过去 m2-constraints 引用的 frames_no_data 就是在这条路径上根本不存在（证据恒 0%）。
+class MetricsPipeline : public FakePipeline {
+ public:
+  pipeline::PipelineMetrics latest() const override {
+    pipeline::PipelineMetrics m;
+    m.samples = 3;
+    m.alive = true;
+    m.fps = 30.0;
+    m.encoder_known = true;
+    m.enc_width = 1920;
+    m.enc_height = 1080;
+    m.enc_bitrate_kbps = 6000;
+    m.enc_gop = 60;
+    m.enc_preset = "veryfast";
+    m.enc_transcode = "on";
+    return m;
+  }
+  pipeline::ProbeMetrics probe_latest() const override {
+    pipeline::ProbeMetrics p;
+    p.alive = true;
+    p.samples = 5;
+    p.fps = 30.0;
+    p.frames = 100;
+    p.decoded = 99;
+    p.fec_recovered = 37;
+    p.fec_groups_rx = 118;
+    p.fec_unrecoverable = 1;
+    p.fec_unrecoverable_pkts = 3;
+    p.fec_ghost_discarded = 9;
+    p.frag_ghost_discarded = 2;
+    p.lost = 4;
+    p.nack_sent = 11;
+    p.audio_datagrams = 1500;
+    p.audio_seq_gaps = 12;
+    p.audio_dups = 1;
+    p.audio_reordered = 2;
+    p.audio_stale = 3;
+    p.audio_decode_errors = 0;
+    p.audio_fec_recovered = 4;
+    p.audio_plc_frames = 2;
+    p.audio_unconcealed_frames = 1;
+    return p;
+  }
+};
+
 }  // namespace
 
 int main() {
@@ -248,8 +295,52 @@ int main() {
           "Deny 模式仍然拒绝 lifecycle");
   }
 
+  // ---------- 8) query_metrics 的观测面：N-02 的证据候选真实存在 ----------
+  {
+    MetricsPipeline mp;
+    mp.running_ = true;
+    tool::Registry r;
+    pipeline::build_real_tools(r, mp, nullptr);
+    const auto res = r.call("query_metrics", json::object());
+    check(res.has_value(), "query_metrics 在有样本时成功");
+    if (res) {
+      const json& d = res->data;
+      // 编码档位（AVC level 类 case 的唯一可引用观测）
+      check(d.value("encode_width", 0) == 1920, "观测面带 encode_width");
+      check(d.value("encode_height", 0) == 1080, "观测面带 encode_height");
+      check(d.value("encode_bitrate_kbps", 0) == 6000, "观测面带 encode_bitrate_kbps");
+      check(d.value("encode_gop", 0) == 60, "观测面带 encode_gop");
+      check(d.value("encode_preset", std::string()) == "veryfast", "观测面带 encode_preset");
+      // FEC / 幽灵帧 / 音频帧号账（m2-constraints 的候选）
+      check(d.value("e2e_fec_recovered", 0) == 37, "观测面带 e2e_fec_recovered");
+      check(d.value("e2e_fec_ghost_discarded", 0) == 9, "观测面带 e2e_fec_ghost_discarded");
+      check(d.value("e2e_frag_ghost_discarded", 0) == 2, "观测面带 e2e_frag_ghost_discarded");
+      check(d.value("e2e_fec_unrecoverable", 0) == 1, "观测面带 e2e_fec_unrecoverable");
+      check(d.value("e2e_fec_unrecoverable_pkts", 0) == 3,
+            "观测面带 e2e_fec_unrecoverable_pkts");
+      check(d.value("e2e_lost", 0) == 4, "观测面带 e2e_lost");
+      check(d.value("e2e_audio_datagrams", 0) == 1500, "观测面带 e2e_audio_datagrams");
+      check(d.value("e2e_audio_seq_gaps", 0) == 12, "观测面带 e2e_audio_seq_gaps");
+      check(d.value("e2e_audio_dups", 0) == 1, "观测面带 e2e_audio_dups");
+      check(d.value("e2e_audio_reordered", 0) == 2, "观测面带 e2e_audio_reordered");
+      check(d.value("e2e_audio_stale", 0) == 3, "观测面带 e2e_audio_stale");
+      // 候选键必须能从观测原文里逐字摘出（scripted 假 agent 走的正是这条路）
+      const std::string text = "metrics=" + d.dump();
+      check(text.find("\"e2e_fec_ghost_discarded\":9") != std::string::npos,
+            "e2e_fec_ghost_discarded=9 可从观测原文摘出");
+      check(text.find("\"encode_width\":1920") != std::string::npos,
+            "encode_width=1920 可从观测原文摘出");
+    }
+    // 编码档位未知时必须是 null，而不是 0（0 会被读成"尺寸为 0"）
+    FakePipeline bare;
+    tool::Registry r2;
+    pipeline::build_real_tools(r2, bare, nullptr);
+    check(!r2.call("query_metrics", json::object()).has_value(),
+          "没有采样时 query_metrics 报错（不返回一份空观测）");
+  }
+
   if (failures == 0) {
-    std::printf("test_tools: OK (6 groups)\n");
+    std::printf("test_tools: OK (7 groups)\n");
     return 0;
   }
   std::printf("test_tools: %d failure(s)\n", failures);

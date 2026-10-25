@@ -84,6 +84,32 @@ struct ProbeMetrics {
   uint64_t audio_fec_recovered = 0;
   uint64_t audio_plc_frames = 0;
   uint64_t audio_unconcealed_frames = 0;
+  // 下行 FEC / NACK / 音频帧号账（N-02）：这些数在 probe 的 METRICS 与 probe.metric
+  // 事件里本来就有，但过去没进 agent 的观测面（query_metrics），于是审计说得出
+  // "FEC 恢复了多少"，agent 却一个都引用不了。
+  // **视频 FEC**（fec_*）与上面的**音频 FEC**（audio_fec_*）是两本账：
+  // 前者按帧的片（fragment）算、XOR 组恢复；后者按 20 ms 音频帧算、LBRR 冗余恢复。
+  uint64_t fec_recovered = 0;            // XOR-FEC 补回的视频片数
+  uint64_t fec_groups_rx = 0;            // 收到过的 FEC 组数（恢复率的分母之一）
+  uint64_t fec_unrecoverable = 0;        // 结算时仍缺 ≥2 片的组数
+  uint64_t fec_unrecoverable_pkts = 0;   // 上面那些组一共缺了几片
+  // 幽灵帧守卫（M0 教训 / N-02）：被丢弃的"为已完成帧重建槽位"次数。
+  // 两个源分开计：FEC 冗余包（fec）与迟到的视频分片/重传（frag）。
+  // 零丢包时恒 0 是正常现象；只有注入丢包 + FEC/NACK 才会涨。
+  uint64_t fec_ghost_discarded = 0;
+  uint64_t frag_ghost_discarded = 0;
+  uint64_t lost = 0;          // 重组阶段判定丢失的帧数（cleanup_stale 累计）
+  uint64_t nack_sent = 0;     // 发出的 NACK 条目数（累计；不是"重传成功"数）
+  // 音频帧号账（见 probe 的 AudioSeqTracker）：gaps=真缺包，dups=重复，
+  // reordered=迟到但在容差内（照播），stale=迟到太多（丢弃）。四者互不重叠。
+  uint64_t audio_datagrams = 0;
+  uint64_t audio_seq_gaps = 0;
+  uint64_t audio_dups = 0;
+  uint64_t audio_reordered = 0;
+  uint64_t audio_stale = 0;
+  uint64_t audio_decode_errors = 0;
+  // 以上计数都是**进程累计**；旧录制里没有这些字段：解析时缺省为 0（不是"解析失败"），
+  // 见 probe_metrics_from_json。
   // 不可用原因（进程没起 / 起不来 / 起来了但一条指标都没上报）。空 = 没有异常。
   // 评测侧据此报 probe_unavailable，而不是退回 cued 指标假装有端到端数据。
   std::string unavailable_reason;
@@ -121,6 +147,21 @@ inline nlohmann::json probe_metrics_to_json(const ProbeMetrics& p) {
       {"audio_fec_recovered", p.audio_fec_recovered},
       {"audio_plc_frames", p.audio_plc_frames},
       {"audio_unconcealed_frames", p.audio_unconcealed_frames},
+      // N-02：FEC / NACK / 幽灵帧 / 音频帧号账。缺字段的旧录制回放时按 0（cnt 口径）。
+      {"fec_recovered", p.fec_recovered},
+      {"fec_groups_rx", p.fec_groups_rx},
+      {"fec_unrecoverable", p.fec_unrecoverable},
+      {"fec_unrecoverable_pkts", p.fec_unrecoverable_pkts},
+      {"fec_ghost_discarded", p.fec_ghost_discarded},
+      {"frag_ghost_discarded", p.frag_ghost_discarded},
+      {"lost", p.lost},
+      {"nack_sent", p.nack_sent},
+      {"audio_datagrams", p.audio_datagrams},
+      {"audio_seq_gaps", p.audio_seq_gaps},
+      {"audio_dups", p.audio_dups},
+      {"audio_reordered", p.audio_reordered},
+      {"audio_stale", p.audio_stale},
+      {"audio_decode_errors", p.audio_decode_errors},
       {"lat_p50_ms", pct(p.lat_p50_ms)},
       {"lat_p95_ms", pct(p.lat_p95_ms)},
       {"lat_p99_ms", pct(p.lat_p99_ms)},
@@ -240,7 +281,17 @@ inline bool probe_metrics_from_json(const nlohmann::json& j, ProbeMetrics& out,
       !cnt("audio_fec_recovered", out.audio_fec_recovered) ||
       !cnt("audio_plc_frames", out.audio_plc_frames) ||
       !cnt("audio_unconcealed_frames", out.audio_unconcealed_frames) ||
-      !seg("recv_us", out.recv) ||
+      // N-02：同一口径——缺字段 = 0 且合法。旧 cassette / 旧 probe（没有这些计数）回放
+      // 时不能整体解析失败，否则"补观测"反而破坏历史录制。
+      !cnt("fec_recovered", out.fec_recovered) || !cnt("fec_groups_rx", out.fec_groups_rx) ||
+      !cnt("fec_unrecoverable", out.fec_unrecoverable) ||
+      !cnt("fec_unrecoverable_pkts", out.fec_unrecoverable_pkts) ||
+      !cnt("fec_ghost_discarded", out.fec_ghost_discarded) ||
+      !cnt("frag_ghost_discarded", out.frag_ghost_discarded) || !cnt("lost", out.lost) ||
+      !cnt("nack_sent", out.nack_sent) || !cnt("audio_datagrams", out.audio_datagrams) ||
+      !cnt("audio_seq_gaps", out.audio_seq_gaps) || !cnt("audio_dups", out.audio_dups) ||
+      !cnt("audio_reordered", out.audio_reordered) || !cnt("audio_stale", out.audio_stale) ||
+      !cnt("audio_decode_errors", out.audio_decode_errors) || !seg("recv_us", out.recv) ||
       !seg("reassembly_us", out.reassembly) || !seg("buffer_us", out.buffer) ||
       !seg("decode_us", out.decode)) {
     return false;
@@ -300,6 +351,20 @@ struct PipelineMetrics {
   // 请求数。空字符串 = 这行 METRICS 来自没有该字段的旧 cued（不要读成"没有控制面"）。
   std::string control_channel;
   uint64_t control_ops = 0;
+  // 编码档位快照（N-02）：来自 cued 的 `metrics.query` 响应里的 `params`（ParamStore 的
+  // 运行期真值，agent 改过的 set_param 会体现在这里）。过去这份数据只在控制面内部
+  // 用来更新 spawn 参数，agent 的 query_metrics 里看不到——于是"AVC level 配错"这类
+  // 根因只有一个报错字符串可讲，没有可引用的观测。
+  //   encoder_known=false = 本后端/本次快照没有 params（例如控制通道降级到 stdout，
+  //   或 HTTP 后端不返回这一段）：输出 null，绝不按 0 写。
+  // transcode 沿用 cued 的写法 "on"/"off"（空 = 未知）。
+  bool encoder_known = false;
+  int enc_width = 0;   // 0 = 沿用解码尺寸（与 RuntimeParams 同义）
+  int enc_height = 0;
+  int enc_bitrate_kbps = 0;
+  int enc_gop = 0;
+  std::string enc_preset;
+  std::string enc_transcode;
 };
 
 }  // namespace cue::pipeline

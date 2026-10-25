@@ -365,6 +365,55 @@ int main() {
           "probe 快照里 audio_plc_frames 是字符串 → 解析失败（不静默当 0）");
   }
 
+  // ---------------------------------------------------------------- probe 快照解析（N-02 字段）
+  //
+  // FEC / NACK / 幽灵帧 / 音频帧号账是后加的观测字段（原来 probe 算了但 agent 看不见）。
+  // 与 N-01 同一口径：缺字段 = 0 且合法，旧 cassette 不能因此整体解析失败；
+  // 但字段存在而类型不对仍然报错（"可缺省"不等于"可以乱写"）。
+  {
+    using cue::pipeline::ProbeMetrics;
+    using cue::pipeline::probe_metrics_from_json;
+    std::string err;
+
+    const json old_snapshot = json{{"fps", 30.0},        {"frames", 100}, {"decoded", 95},
+                                   {"decode_errors", 0}, {"stalls", 0},  {"samples", 3}};
+    ProbeMetrics old;
+    const bool ok_old = probe_metrics_from_json(old_snapshot, old, err);
+    check(ok_old, "probe 旧快照（无 N-02 字段）仍能解析");
+    check(old.fec_recovered == 0 && old.fec_groups_rx == 0 && old.fec_unrecoverable == 0 &&
+              old.fec_unrecoverable_pkts == 0 && old.fec_ghost_discarded == 0 &&
+              old.frag_ghost_discarded == 0 && old.lost == 0 && old.nack_sent == 0 &&
+              old.audio_datagrams == 0 && old.audio_seq_gaps == 0 && old.audio_dups == 0 &&
+              old.audio_reordered == 0 && old.audio_stale == 0 && old.audio_decode_errors == 0,
+          "probe 旧快照缺 N-02 字段 → 全部缺省为 0");
+
+    const json new_snapshot =
+        json{{"fps", 30.0},        {"frames", 100},          {"decoded", 95},
+             {"decode_errors", 0}, {"stalls", 0},            {"samples", 3},
+             {"fec_recovered", 37},
+             {"fec_groups_rx", 118}, {"fec_unrecoverable", 1}, {"fec_unrecoverable_pkts", 3},
+             {"fec_ghost_discarded", 9}, {"frag_ghost_discarded", 2}, {"lost", 4},
+             {"nack_sent", 11},          {"audio_datagrams", 1500},
+             {"audio_seq_gaps", 12},     {"audio_dups", 1},        {"audio_reordered", 2},
+             {"audio_stale", 3},         {"audio_decode_errors", 0}};
+    ProbeMetrics cur;
+    const bool ok_new = probe_metrics_from_json(new_snapshot, cur, err);
+    check(ok_new, "probe 新快照（带 N-02 字段）能解析");
+    check(cur.fec_recovered == 37 && cur.fec_groups_rx == 118 && cur.fec_unrecoverable == 1 &&
+              cur.fec_unrecoverable_pkts == 3 && cur.fec_ghost_discarded == 9 &&
+              cur.frag_ghost_discarded == 2 && cur.lost == 4 && cur.nack_sent == 11 &&
+              cur.audio_datagrams == 1500 && cur.audio_seq_gaps == 12 && cur.audio_dups == 1 &&
+              cur.audio_reordered == 2 && cur.audio_stale == 3,
+          "probe 新快照 N-02 计数按原值读出");
+
+    // 类型错了仍然要报错：这一半语义不能因为"可缺省"而丢掉
+    const json bad_type = json{{"fps", 30.0}, {"frames", 100}, {"decoded", 1},
+                               {"fec_ghost_discarded", "9"}};
+    ProbeMetrics bad;
+    check(!probe_metrics_from_json(bad_type, bad, err),
+          "probe 快照里 fec_ghost_discarded 是字符串 → 解析失败（不静默当 0）");
+  }
+
   if (failures == 0) {
     std::printf("test_metrics: OK\n");
     return 0;

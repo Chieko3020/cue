@@ -843,6 +843,28 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
     m.control_channel = it->get<std::string>();
   }
   m.control_ops = count("control_ops");
+  // 编码档位（N-02）：只有 UDS 的 metrics.query 响应带 params（cued 的 ParamStore 真值）。
+  // stdout 的 METRICS 行没有这一段 → 保持 encoder_known=false，观测面输出 null（未知），
+  // 绝不把"没拿到"写成 0（0 会让"1080p 没在转码"和"不知道尺寸"长得一模一样）。
+  if (const auto pit = j.find("params"); pit != j.end() && pit->is_object()) {
+    auto pnum = [&pit](const char* key, int& out) {
+      const auto f = pit->find(key);
+      if (f == pit->end() || !f->is_number_integer()) return;
+      out = f->get<int>();
+    };
+    auto pstr = [&pit](const char* key, std::string& out) {
+      const auto f = pit->find(key);
+      if (f == pit->end() || !f->is_string()) return;
+      out = f->get<std::string>();
+    };
+    m.encoder_known = true;
+    pnum("width", m.enc_width);
+    pnum("height", m.enc_height);
+    pnum("bitrate_kbps", m.enc_bitrate_kbps);
+    pnum("gop", m.enc_gop);
+    pstr("preset", m.enc_preset);
+    pstr("transcode", m.enc_transcode);
+  }
   const int64_t remote_t = (j.contains("t_us") && j["t_us"].is_number_integer())
                                ? j["t_us"].get<int64_t>()
                                : 0;
