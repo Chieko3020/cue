@@ -38,7 +38,14 @@
 #
 # 环境变量：BUILD_DIR（默认 build；有自己的构建目录时用 BUILD_DIR 指定）、REPEAT（默认 3）、
 #           SUITE（默认 suites/real-faults.json）、WORK_ROOT（默认 runs/ac15-real-faults）、
-#           PUSH_SECONDS（每次推流秒数，默认 10）
+#           PUSH_SECONDS（每次推流秒数，默认 10）、PRODUCER（默认 lavfi）、
+#           PRODUCER_SIZE（默认 640x360）、PRODUCER_BITRATE（默认 1200 kbps）
+#
+# 产帧源（N-28）：默认 `PRODUCER=lavfi`，由 cue-eval 自己按 case 起 cue-capture（真码率源）。
+# 这不是洁癖：旧的 `scripts/test-client.mjs` 每帧发同一个 64×64 静态 IDR，transcode 后码率
+# 远低于 `--send-mbps` 的注入档位（下限 0.1 Mbps），令牌桶永不耗尽，`bw-starved-*` 的
+# `budget_drops > 0` 断言永远不成立——SLA 反而是恒真的。`PRODUCER=none` 可退回旧行为
+# （外部推流），但那样这 3 个 case 只会在 cue-eval 的「注入未生效」判定处失败。
 #
 # 前置：node（scripts/test-client.mjs 合成推流）、python3（state.jsonl 断言）、ss。
 # 端口：cue-eval 的子进程后端把 cued 的 WS/probe 端口固定在 9000/9001；
@@ -54,6 +61,9 @@ REPEAT="${REPEAT:-3}"
 SUITE="${SUITE:-suites/real-faults.json}"
 WORK="${WORK_ROOT:-$ROOT/runs/ac15-real-faults}"
 PUSH_SECONDS="${PUSH_SECONDS:-10}"
+PRODUCER="${PRODUCER:-lavfi}"
+PRODUCER_SIZE="${PRODUCER_SIZE:-640x360}"
+PRODUCER_BITRATE="${PRODUCER_BITRATE:-1200}"
 WS_PORT=9000
 PROBE_PORT=9001
 
@@ -144,21 +154,33 @@ note "工作目录 $WORK（BUILD_DIR=$BUILD_DIR REPEAT=$REPEAT SUITE=$SUITE）"
 # probe 不再由本脚本启动：T-02 起它由 harness（cue-eval 的 ProcessPipelineControl）
 # 自己托管——先起 probe 再起 cued，倒序停。这里只要求端口空闲，
 # 否则 harness 的 probe 绑不上，case 会明确报 run_error=probe_unavailable。
-setsid bash -c '
-  while :; do
-    timeout "$3" node "$1/scripts/test-client.mjs" "ws://127.0.0.1:$2/" "$3" >/dev/null 2>&1 || true
-    sleep 0.1
-  done
- ' _ "$ROOT" "$WS_PORT" "$PUSH_SECONDS" >"$WORK/pusher.log" 2>&1 &
-PUSH_PID=$!
-sleep 0.3
+if [[ "$PRODUCER" == "none" ]]; then
+  setsid bash -c '
+    while :; do
+      timeout "$3" node "$1/scripts/test-client.mjs" "ws://127.0.0.1:$2/" "$3" >/dev/null 2>&1 || true
+      sleep 0.1
+    done
+   ' _ "$ROOT" "$WS_PORT" "$PUSH_SECONDS" >"$WORK/pusher.log" 2>&1 &
+  PUSH_PID=$!
+  sleep 0.3
+else
+  # 由 cue-eval 按 case 起 cue-capture：这里必须**不**再起外部推流，否则两个客户端抢
+  # 同一个 ws 端口（cued 一次只接一个），会随机出现「有时有流有时没有」。
+  PUSH_PID=""
+  note "产帧源：cue-eval 自起 cue-capture（$PRODUCER_SIZE @ ${PRODUCER_BITRATE}kbps）"
+fi
 
 # ---- 真管线 + scripted 假 agent：每 case 跑「故障态 → 修复态」REPEAT 次 ----
 # -j 不用：cue-eval 内部串行；这里只保证同一时刻只有一条 cued（端口写死）。
 note "跑 suite（scripted + 真 cued，repeat=$REPEAT）：$SUITE"
 T0=$(date +%s)
+PRODUCER_ARGS=()
+if [[ "$PRODUCER" != "none" ]]; then
+  PRODUCER_ARGS=(--producer "$PRODUCER" --producer-size "$PRODUCER_SIZE"
+                 --producer-bitrate "$PRODUCER_BITRATE" --capture "$ROOT/$BUILD_DIR/cue-capture")
+fi
 if ! "$EVAL" --suite "$SUITE" --mode scripted --repeat "$REPEAT" --record-tools "$WORK/tools" \
-      --cued "$CUED" --out "$WORK/out" >"$WORK/eval.log" 2>&1; then
+      "${PRODUCER_ARGS[@]}" --cued "$CUED" --out "$WORK/out" >"$WORK/eval.log" 2>&1; then
   tail -60 "$WORK/eval.log" >&2 || true
   fail "cue-eval 未通过（见 $WORK/eval.log）"
 fi
@@ -290,7 +312,14 @@ def check_signature(c, o, m):
         assert m["budget_drops"] == 0 and m["dropped"] == 0, f"{cid}: 编码慢不是链路问题"
     elif root == "resolution_too_high":
         assert enc is not None and enc > 33.0, f"{cid}: 4K 编码应超预算，实际 {enc}"
-        assert op is not None and op > 1.5, f"{cid}: 4K 缩放（op 段）应明显，实际 {op}"
+        # 不能拿 op 段判缩放：scale 内嵌在 X264Encoder（见 N-20 的现状说明），开销记在
+        # encode 段，op 段只剩 passthrough（实测 4K 三条 case 的 op_p50 常在 0.00~0.01ms）。
+        # 这里改用**档位族**（`query_metrics` 的 encode_width/height，N-02b 引入）：
+        # 4K 类 case 的配置就是 3840×2160，而 encoder_too_slow 类是 1360×768~1920×1080。
+        w = m.get("encode_width")
+        h = m.get("encode_height")
+        assert w is not None and h is not None and w >= 3840 and h >= 2160, (
+            f"{cid}: resolution_too_high 应能在观测里读到 4K 档位，实际 {w}x{h}")
         assert m["budget_drops"] == 0 and m["dropped"] == 0, f"{cid}: 分辨率高不是链路问题"
     elif root == "network_delay":
         # 时延类：唯一成立的是"包都发出去了、只是晚了"。fps 不掉、丢包计数全 0，
@@ -344,14 +373,17 @@ for cid, c in cases.items():
     assert len(set(roots)) == 1, f"{cid}: 根因在 {repeat} 次里不一致：{roots}"
     fps_min = fps_min_of(c)
     fps_degraded = want != "network_delay"
-    for o, m in zip(got, faults):
+    for m in faults:
         if fps_degraded:
             assert m["fps"] <= fps_min - 3.0, (
                 f"{cid}: 故障态 fps={m['fps']:.2f} 与阈值 {fps_min} 的余量不足 3 fps")
         else:
             assert m["fps"] >= fps_min, (
                 f"{cid}: 时延故障不该降 fps，实际 {m['fps']:.2f} < 阈值 {fps_min}")
-        check_signature(c, o, m)
+    # 诊断签名只在**稳态样本**（最后一条）上校验：故障窗口的第一条 1 Hz 采样可能只覆盖
+    # 半个窗口（管线刚起、op/encode 环还没样本），拿它判"op 段应明显"会误报——实测
+    # res-4k-medium 第一条采样的 op_p50 是 0.0。与 cue-eval "等满 4 条新采样再取证"同理。
+    check_signature(c, got[-1], faults[-1])
     f_base = med([m["fps"] for m in faults])
     if fps_degraded:
         assert f_base <= fps_min - 5.0, (
@@ -359,11 +391,21 @@ for cid, c in cases.items():
     # 修复态：每次都要明显高于阈值，且离散度小（阈值不能踩在抖动边缘）
     for f in finals:
         assert f >= fps_min + 1.0, f"{cid}: 修复态 fps={f:.2f} 未明显高于阈值 {fps_min}"
-    fspread = (max(finals) - min(finals)) / med(finals)
-    assert fspread <= 0.10, f"{cid}: 修复态 fps 离散度 {fspread:.0%} 过大：{finals}"
-    fspread_fault = (max(m["fps"] for m in faults) - min(m["fps"] for m in faults)) / f_base
+    # 离散度只在有 ≥2 次采样、且分母非 0 时才有意义：repeat=1（或 --fast 的默认）时
+    # 「跨轮离散度」在定义上不存在，硬算会 ZeroDivisionError（本脚本此前就是这么炸的）。
+    fspread = None
+    if len(finals) >= 2 and med(finals) > 0:
+        fspread = (max(finals) - min(finals)) / med(finals)
+        assert fspread <= 0.10, f"{cid}: 修复态 fps 离散度 {fspread:.0%} 过大：{finals}"
+    fspread_fault = None
+    if f_base > 0:
+        fspread_fault = (max(m["fps"] for m in faults) - min(m["fps"] for m in faults)) / f_base
     verdicts[cid] = (want, f_base, med(finals), fspread_fault)
-    m = faults[0]
+    # 用**稳态样本**（最后一条）而不是第一条：故障窗口的第一条 1 Hz 采样可能只覆盖半个
+    # 窗口（管线刚起、op/encode 环还没样本），拿它做诊断特征会误报——实测
+    # res-4k-medium 的 op_p50 在第一条采样里是 0.0，于是"4K 缩放应明显"必然失败。
+    # 与 cue-eval 内部"等满 4 条新采样再取证"是同一条道理。
+    m = faults[-1]
     detail = (f"injected={num(m['injected'],0)} dropped={num(m['dropped'],0)} "
               f"budget_drops={num(m['budget_drops'],0)} "
               f"frames_in/out={num(m['frames_in'],0)}/{num(m['frames_out'],0)} "

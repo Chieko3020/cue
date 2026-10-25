@@ -222,7 +222,7 @@ REPEAT=3 ./scripts/test-real-faults.sh
 | 编码太慢 `encoder_too_slow` | 1600×900 + `preset=placebo` | `encode_p50` > 33 ms、`op_p50` < 1 ms |
 | 分辨率过高 `resolution_too_high` | 输出 3840×2160 + `veryfast` | `encode_p50` > 33 ms、`op_p50` > 1.5 ms（缩放开销随像素增长） |
 
-五类统一 `fps_min=25`；故障态实测 8.5–16.9 fps，修复态 28.5–28.7 fps，两侧各留 ≥3 fps。被淘汰的两类也记在 suite 的 `note` 里：`keyframe_storm` 在本机 x264 的 ABR+VBV 下没有可校准的 SLA 信号；`network_delay` / `clock_drift` 在 `cued` 侧没有可观测量。
+五类统一 `fps_min=25`。**2026-10-25 按真码率产帧源（`PRODUCER=lavfi`，640×360@1200 kbps）重测**：故障态 netloss 10.99–17.98、backlog 8.00–18.40、encoder_too_slow 3.28–8.59、bandwidth_insufficient 0.00–0.98 fps，修复态 29.97–30.19 fps；`resolution_too_high` 三条（4K×veryfast/medium/slow）在 2 vCPU 上故障态余量不稳（veryfast 实测 10.24 fps，medium 24.00 fps < 阈值 25 但离阈值不足 3 fps），已登记为待校准项，不写进"已达标"。旧的 8.5–16.9 是 64×64 静态源下的数字，已作废（那套源连 `bw-starved` 的令牌桶都抽不干）。被淘汰的两类也记在 suite 的 `note` 里：`keyframe_storm` 在本机 x264 的 ABR+VBV 下没有可校准的 SLA 信号；`network_delay` / `clock_drift` 在 `cued` 侧没有可观测量。
 
 **指纹**：`sha256(二进制 ⊕ git describe ⊕ 生效配置 ⊕ suite)`，再与 `case_id`、`seed` 拼接成每个 case 的指纹。生效配置包括 agent 模式、repeat、model、`cued` 路径与二进制哈希、单价、warmup、LLM 模式与 cassette 内容哈希、`--endpoint`、`--replay-tools` 目录哈希。改代码、改 suite、换 cassette 都会让缓存失效。
 
