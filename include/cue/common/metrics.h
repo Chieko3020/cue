@@ -130,7 +130,21 @@ struct ProbeMetrics {
   // 所以证据层只能引用后者（以及 fec_recovered），不能拿前者证明幽灵帧。
   uint64_t fec_ghost_discarded = 0;
   uint64_t frag_ghost_discarded = 0;
-  uint64_t lost = 0;          // 重组阶段判定丢失的帧数（cleanup_stale 累计）
+  // 重组表的内存护栏（N-10 / FR-PIPE.14）：pending 是 `std::map<frame_id, FrameAcc>`，
+  // 此前只受 2 s TTL 与单帧 kMaxFragPerFrame=1024 约束 → **帧数**无界（上行字节来自
+  // 浏览器，每帧发 1 片、帧号递增，2 s 内就能攒出任意多槽位）。现在加了帧数 256 +
+  // 总字节 64 MiB 双上限（include/cue/proto/reassembly_budget.h），超限按最旧优先淘汰：
+  //   reassembly_pending_dropped = 因预算淘汰的帧数。**是 lost 的子集**（淘汰时照常
+  //     ++lost、settle、settle_fec），单独记只为分清"为什么丢"：超时 = 链路问题，
+  //     预算淘汰 = 接收端自保（链路可能完好，只是有人在灌碎片/放大帧）；
+  //   reassembly_pending_bytes   = 当前占用字节数。这是**gauge**而不是累计值：
+  //     它随收片上涨、随帧完成/淘汰回落，旧 cassette 里没有这个字段时按 0；
+  //   reassembly_rejected        = 因预算拒收的包数（单个病态帧自己就超总预算）。
+  //     与协议层的 `rejected`（坏包/几何矛盾）不同：那些包本身不合法。
+  uint64_t reassembly_pending_dropped = 0;
+  uint64_t reassembly_pending_bytes = 0;
+  uint64_t reassembly_rejected = 0;
+  uint64_t lost = 0;          // 重组阶段判定丢失的帧数（cleanup_stale 超时 + 预算淘汰）
   uint64_t nack_sent = 0;     // 发出的 NACK 条目数（累计；不是"重传成功"数）
   // 音频帧号账（见 probe 的 AudioSeqTracker）：gaps=真缺包，dups=重复，
   // reordered=迟到但在容差内（照播），stale=迟到太多（丢弃）。四者互不重叠。
@@ -188,6 +202,10 @@ inline nlohmann::json probe_metrics_to_json(const ProbeMetrics& p) {
       {"fec_unrecoverable_pkts", p.fec_unrecoverable_pkts},
       {"fec_ghost_discarded", p.fec_ghost_discarded},
       {"frag_ghost_discarded", p.frag_ghost_discarded},
+      // N-10：重组表双上限的账（见结构体里的口径）。缺字段的旧录制回放时按 0（cnt 口径）。
+      {"reassembly_pending_dropped", p.reassembly_pending_dropped},
+      {"reassembly_pending_bytes", p.reassembly_pending_bytes},
+      {"reassembly_rejected", p.reassembly_rejected},
       {"lost", p.lost},
       {"nack_sent", p.nack_sent},
       {"audio_datagrams", p.audio_datagrams},
@@ -321,7 +339,12 @@ inline bool probe_metrics_from_json(const nlohmann::json& j, ProbeMetrics& out,
       !cnt("fec_unrecoverable", out.fec_unrecoverable) ||
       !cnt("fec_unrecoverable_pkts", out.fec_unrecoverable_pkts) ||
       !cnt("fec_ghost_discarded", out.fec_ghost_discarded) ||
-      !cnt("frag_ghost_discarded", out.frag_ghost_discarded) || !cnt("lost", out.lost) ||
+      !cnt("frag_ghost_discarded", out.frag_ghost_discarded) ||
+      // N-10：同一口径（缺字段 = 0 且合法）。这三个是后加的：旧 probe / 旧 cassette 里
+      // 没有它们，不能被判成解析失败。
+      !cnt("reassembly_pending_dropped", out.reassembly_pending_dropped) ||
+      !cnt("reassembly_pending_bytes", out.reassembly_pending_bytes) ||
+      !cnt("reassembly_rejected", out.reassembly_rejected) || !cnt("lost", out.lost) ||
       !cnt("nack_sent", out.nack_sent) || !cnt("audio_datagrams", out.audio_datagrams) ||
       !cnt("audio_seq_gaps", out.audio_seq_gaps) || !cnt("audio_dups", out.audio_dups) ||
       !cnt("audio_reordered", out.audio_reordered) || !cnt("audio_stale", out.audio_stale) ||

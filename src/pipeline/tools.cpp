@@ -157,6 +157,14 @@ void add_probe_metrics(json& j, const ProbeMetrics& p) {
   // 所以 suite 的幽灵帧证据用 e2e_fec_recovered + e2e_frag_ghost_discarded。
   j["e2e_fec_ghost_discarded"] = p.fec_ghost_discarded;
   j["e2e_frag_ghost_discarded"] = p.frag_ghost_discarded;
+  // N-10（FR-PIPE.14）：重组表的帧数/字节双上限。三个数一起看才有意义：
+  //   e2e_reassembly_pending_dropped = 因预算淘汰的帧数（**已计入 e2e_lost**，是它的子集），
+  //     它涨而 e2e_lost 同比涨 = 接收端在自保，不是在丢链路；
+  //   e2e_reassembly_pending_bytes   = 当前占用（gauge，不是累计），持续贴近 64 MiB 才是异常；
+  //   e2e_reassembly_rejected        = 病态单帧被拒收的包数（与协议层 rejected 不同）。
+  j["e2e_reassembly_pending_dropped"] = p.reassembly_pending_dropped;
+  j["e2e_reassembly_pending_bytes"] = p.reassembly_pending_bytes;
+  j["e2e_reassembly_rejected"] = p.reassembly_rejected;
   j["e2e_lost"] = p.lost;
   j["e2e_nack_sent"] = p.nack_sent;
   j["e2e_audio_datagrams"] = p.audio_datagrams;

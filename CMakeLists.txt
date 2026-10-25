@@ -373,6 +373,15 @@ add_executable(test_frame_guard tests/test_frame_guard.cpp)
 target_link_libraries(test_frame_guard PRIVATE cue_proto)
 add_test(NAME frame_guard COMMAND test_frame_guard)
 
+# proto/reassembly_budget（N-10 / FR-PIPE.14）：下行的 WS 重组表此前只有 2 s TTL 与
+# 单帧 kMaxFragPerFrame=1024 两道防线，**帧数**无界（每帧发 1 片、帧号递增，2 s 内能攒出
+# 任意多槽位）。帧数/字节双上限的判据在这里抽成纯函数，用单测钉住边界：恰好等于上限不淘汰、
+# 第 +1 帧淘汰 1 帧、多 1 字节就要淘汰、病态单帧只拒收不清队列、一次算出要淘汰的帧数。
+# 纯头文件、无副作用、不碰时钟，毫秒级跑完。
+add_executable(test_reassembly_budget tests/test_reassembly_budget.cpp)
+target_link_libraries(test_reassembly_budget PRIVATE cue_proto)
+add_test(NAME reassembly_budget COMMAND test_reassembly_budget)
+
 add_executable(test_agent tests/test_agent.cpp)
 target_link_libraries(test_agent PRIVATE cue_agent)
 add_test(NAME agent COMMAND test_agent)
@@ -549,7 +558,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
-  test_token_bucket test_frame_guard test_avc_level
+  test_token_bucket test_frame_guard test_avc_level test_reassembly_budget
   test_control_channel test_tools test_delay_injector test_nack test_capture
   test_audio_decoder test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)

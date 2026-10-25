@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -109,6 +110,7 @@ inline void probe_close_socket(probe_socket_t fd) { ::close(fd); }
 #include "cue/media/jitter_buffer.h"
 #include "cue/proto/frame_guard.h"
 #include "cue/proto/nack.h"
+#include "cue/proto/reassembly_budget.h"
 #include "cue/proto/wire.h"
 
 namespace net = boost::asio;
@@ -173,6 +175,10 @@ struct FrameAcc {
   // 旧的一帧一组格式只会产生一条（group_index=0，覆盖整帧）。
   std::map<uint16_t, FecGroupState> fec_groups;
   bool nack_queued = false;
+  // 这个槽位当前占住的字节数（parts 里的分片 + fec_groups 里的校验数据，含 FEC 恢复出的片）。
+  // 自己记一份而不是每次遍历求和：预算判据每收一个包都要问一次，遍历是 O(分片数)。
+  // 它是 `pending_bytes` 总数器的分项，两者必须同步加减（见 main() 里的"重组表内存护栏"段）。
+  uint64_t bytes = 0;
 };
 
 // 丢包率窗口：只在帧结算（完成或超时清理）时累加，样本包含「整帧丢失」的帧，无偏
@@ -233,7 +239,9 @@ struct ClockAlign {
 
 // 逐组尝试 FEC 恢复：每组**恰好缺 1 片**时用 parity 补齐。返回本次恢复的片数。
 // 一组丢 2 片是欠定方程（XOR 只能解一个未知数），不能恢复——这由 fec_recover_one 判定。
-std::size_t try_fec_recover(FrameAcc& fa) {
+// pending_bytes 一并累加：恢复出来的片同样驻留在 pending 里（那是实打实的内存），
+// 漏记就等于给预算凭空多发 1.2 MiB/帧的额度。调用方负责按需再守一次字节上限。
+std::size_t try_fec_recover(FrameAcc& fa, uint64_t& pending_bytes) {
   std::size_t recovered = 0;
   std::vector<uint8_t> rec;
   for (auto& [gi, g] : fa.fec_groups) {
@@ -245,6 +253,8 @@ std::size_t try_fec_recover(FrameAcc& fa) {
     std::size_t missing = 0;
     if (!cue::proto::fec_recover_one(members, g.parity, missing, rec)) continue;
     fa.parts[begin + missing] = rec;
+    fa.bytes += rec.size();
+    pending_bytes += rec.size();
     ++recovered;
   }
   return recovered;
@@ -715,13 +725,16 @@ bool parse_report_addrs(std::string_view spec, std::vector<TcpReporters::Addr>& 
   return true;
 }
 
+// 超时清理（2 s TTL）。**只负责时间这一维**：帧数与字节上限现在由
+// proto/reassembly_budget.h 的预算决策 + evict_oldest 负责（N-10），两者结算口径一致。
 void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, uint64_t& lost,
-                   LossWindow& win, FecSettle& fec) {
+                   LossWindow& win, FecSettle& fec, uint64_t& pending_bytes) {
   for (auto it = pending.begin(); it != pending.end();) {
     if (now_us - it->second.first_seen_us > 2'000'000) {
       ++lost;  // 超时未被完成即计丢失（不再依赖 pending.size()>256 这条死条件）
       settle(win, it->second);
       settle_fec(it->second, fec);
+      pending_bytes -= it->second.bytes;  // 槽位连同它占的字节一起消失
       it = pending.erase(it);
     } else {
       ++it;
@@ -1195,6 +1208,9 @@ int main(int argc, char** argv) {
             {"jitter_max_frames", jb_cfg.max_frames}});
 
   std::map<uint32_t, FrameAcc> pending;
+  // pending 当前占住的总字节数 = 各槽位 `FrameAcc::bytes` 之和（维护在下面"重组表内存护栏"段）。
+  // 单独一个总数器是为了让预算判据 O(1)：判据每收一个包都要问一次。
+  uint64_t pending_bytes = 0;
   LatencyRing lat;
   ClockAlign clk;
   DecodeState dec;
@@ -1301,6 +1317,82 @@ int main(int argc, char** argv) {
   double win_loss = 0.0;
   bool warned_bad_frame = false;
   uint64_t bad_frame_events = 0;
+
+  // ---- 重组表的内存护栏（N-10 / FR-PIPE.14「所有队列有硬上限，超限丢帧并计数」）----
+  // pending 过去的唯一上限是 cleanup_stale 的 2 s TTL（外加单帧 kMaxFragPerFrame=1024），
+  // 于是**帧数**无界：下行字节来自浏览器转发，只要每帧发 1 片、帧号递增，2 s 内就能攒出
+  // 任意多个槽位，每个槽位自带 parts/fec_groups 两份容器。策略在 proto/reassembly_budget.h
+  // （纯函数，单测 test_reassembly_budget），这里只负责"淘汰哪几帧、怎么结算"。
+  // 两个计数**分开**记（判读方式不同，见 metrics.h 同名字段）：
+  //   reassembly_pending_dropped = 因预算被淘汰的帧数（已计入 lost，是它的子集）；
+  //   reassembly_rejected        = 因预算拒收的包数（新槽位连一个分片都装不下）。
+  // 前者是接收端自保（链路可能完全正常、只是有人灌碎片），后者是病态单帧；
+  // 与协议层的 `rejected`（坏包/越界/几何矛盾）也分开——那是"包本身不合法"。
+  uint64_t reassembly_pending_dropped = 0;
+  uint64_t reassembly_rejected = 0;
+
+  // 按 first_seen_us 从最旧开始淘汰 want 帧，结算口径与 cleanup_stale **完全一致**：
+  // ++lost、settle()（丢包率窗口的分子/分母都要算上它）、settle_fec()（FEC 组的账）。
+  // 为什么必须结算而不是直接 erase：被预算挤掉的一帧同样"没完成"，如果不入账，
+  // 内存是有界了，但 lost 与 win.expected 会同时少一帧——丢包率被低估、报告上的丢包
+  // 看起来比实际好。指标不能因为护栏而开始撒谎，所以两处结算必须同一口径。
+  // 淘汰顺序依据 first_seen_us 而**不是** frame_id：后者是 uint32_t 会回绕，回绕点前后
+  // 大小关系翻转，按它取最小会先淘汰刚建的新帧（攻击者把帧号推到回绕点即可）。
+  // keep：不淘汰这一帧（正在填的槽位，调用方还持有它的引用，删了就是 use-after-free）。
+  auto evict_oldest = [&](std::size_t want, std::optional<uint32_t> keep) -> std::size_t {
+    std::vector<std::pair<int64_t, uint32_t>> order;
+    order.reserve(pending.size());
+    for (const auto& [fid, fa] : pending) {
+      if (keep && fid == *keep) continue;
+      order.emplace_back(fa.first_seen_us, fid);
+    }
+    if (order.empty() || want == 0) return 0;
+    want = std::min(want, order.size());
+    // 定时器精度是微秒、而同一微秒内建的两个槽位会有相同的 first_seen_us：
+    // std::pair 的字典序把 fid 当次级键，结果因此是确定的（不依赖 map 的遍历顺序）。
+    std::sort(order.begin(), order.end());
+    std::size_t evicted = 0;
+    for (std::size_t i = 0; i < want; ++i) {
+      const auto it = pending.find(order[i].second);
+      if (it == pending.end()) continue;
+      ++lost_frames;  // 与 cleanup_stale 同一口径：没完成的帧计丢失
+      settle(win, it->second);
+      settle_fec(it->second, fec_totals);
+      pending_bytes -= it->second.bytes;
+      pending.erase(it);
+      ++reassembly_pending_dropped;
+      ++evicted;
+    }
+    return evicted;
+  };
+
+  // 新建槽位前的预算判据。返回 false = 这一包被拒收（调用方 ++reassembly_rejected 后 continue）。
+  // 已有槽位不走这里：那一帧已经在账上了，给它加片走下面的 grow_guard。
+  auto reserve_slot = [&](uint32_t fid, std::size_t incoming_bytes) -> bool {
+    if (pending.find(fid) != pending.end()) return true;
+    const auto dec =
+        cue::proto::plan_reassembly_budget(pending.size(), pending_bytes, incoming_bytes);
+    if (dec.reject) return false;  // 病态单帧：拒收它，不拿存量队列陪葬
+    if (dec.evict != 0) evict_oldest(dec.evict, std::nullopt);
+    // 字节维度策略只给得出"至少 1 帧"的下界（它不知道每帧多大），这里继续按最旧优先
+    // 逐帧淘汰直到装下。循环必然终止：reject 已挡住 incoming > 上限，队列淘汰空之后
+    // 0 + incoming 一定装得下（此时 over 为假）。
+    while (cue::proto::reassembly_over_bytes(pending_bytes, incoming_bytes) && !pending.empty()) {
+      if (evict_oldest(1, std::nullopt) == 0) break;
+    }
+    return !cue::proto::reassembly_over_bytes(pending_bytes, incoming_bytes);
+  };
+
+  // 给某一帧加片（分片 / FEC 校验包 / FEC 恢复出的片）之后的字节守卫。
+  // 光有帧数上限挡不住"少数几帧喂满 1024 片"：256 帧 × 1.2 MiB ≈ 300 MiB > 64 MiB。
+  // 淘汰最旧的**其他**帧，绝不淘汰 keep_fid——它的引用还在调用方手里。
+  // 收敛性：单帧最多 kMaxFragPerFrame × kMaxUdpPayload ≈ 1.2 MiB，远小于总预算，
+  // 所以"只剩 keep_fid 一个槽位"时一定已经不超了。
+  auto grow_guard = [&](uint32_t keep_fid) {
+    while (pending_bytes > cue::proto::kMaxPendingBytes) {
+      if (evict_oldest(1, keep_fid) == 0) break;
+    }
+  };
 
   // ---- feedback（技术设计 §4.2）：每 200 ms 一条，载荷 4 个 f32 ----
   // RTT 复用时钟对齐的回环请求：除了 30 s 一次的 8 样本批，另外每秒发 1 个单发回环，
@@ -1735,6 +1827,7 @@ int main(int argc, char** argv) {
     // 用 now_done 会让每个 GOP 都把抖动估计顶穿。reassembly 段已经把这段单独度量了。
     jf.first_arrival_us = fa.first_seen_us;
     jf.payload = assemble(fa);
+    pending_bytes -= fa.bytes;  // 槽位连同它占的字节一起出账（预算口径见"重组表内存护栏"段）
     pending.erase(fid);
     // 到达间隔必须在 push **之前**采样，而且用同一个 now_done：
     //  · push 之后采样的前提是这一帧没被 late_dropped 掉，而迟到帧同样是"到达"，
@@ -1937,7 +2030,7 @@ int main(int argc, char** argv) {
       }
     }
     if (now_tick - t_last_cleanup >= 500'000) {
-      cleanup_stale(pending, now_tick, lost_frames, win, fec_totals);
+      cleanup_stale(pending, now_tick, lost_frames, win, fec_totals, pending_bytes);
       t_last_cleanup = now_tick;
     }
     if (now_tick - t_last_window >= 1'000'000) {
@@ -1988,10 +2081,15 @@ int main(int argc, char** argv) {
       const uint64_t dd = fs.decoded - decoded_prev;
       const double fps_rx = double(df) / dt;
       const double fps_dec = double(dd) / dt;
+      // 重组表占预算的比例（人读行的 rpend=N/M%）。分母是字节上限 kMaxPendingBytes：
+      // 正常链路长期在 1% 以下，持续上涨才是"有人在每帧塞碎片"的信号。
+      // pend（槽位数）与 rpend（字节占用）分开看：碎片攻击先顶满 pend、放大攻击先顶满 rpend。
+      const int rpend_pct = static_cast<int>(
+          100.0 * double(pending_bytes) / double(cue::proto::kMaxPendingBytes));
       std::printf(
           "[probe] session=%u fps=%.1f frames=%llu lost=%llu pend=%zu pkts=%llu nack=%llu "
           "sup=%llu pm=%llums mode=%s pause=%llu fec_rec=%llu fec_unrec=%llu "
-          "ghost=%llu/%llu rej=%llu loss=%.1f%% MB=%.2f fb=%llu  ",
+          "ghost=%llu/%llu rej=%llu rpend=%llu/%d%% loss=%.1f%% MB=%.2f fb=%llu  ",
           session_seen, fps_rx, static_cast<unsigned long long>(frames),
           static_cast<unsigned long long>(lost_frames), pending.size(),
           static_cast<unsigned long long>(packets),
@@ -2006,6 +2104,7 @@ int main(int argc, char** argv) {
           static_cast<unsigned long long>(fec_ghost_discarded),
           static_cast<unsigned long long>(frag_ghost_discarded),
           static_cast<unsigned long long>(rejected),
+          static_cast<unsigned long long>(pending_bytes), rpend_pct,
           win_loss * 100.0, double(bytes) / (1024.0 * 1024.0),
           static_cast<unsigned long long>(fb_sent));
       std::printf(
@@ -2103,6 +2202,18 @@ int main(int argc, char** argv) {
           //     零丢包实测 0、5% 丢包 2~3——这个才是幽灵帧的真证据。
           {"fec_ghost_discarded", fec_ghost_discarded},
           {"frag_ghost_discarded", frag_ghost_discarded},
+          // 重组表的内存护栏（N-10 / FR-PIPE.14）：pending 此前唯一的数量上限是单帧
+          // kMaxFragPerFrame=1024，**帧数**无界（每帧发 1 片、帧号递增，2 s TTL 内就能
+          // 攒出任意多槽位）。现在多了帧数 256 + 字节 64 MiB 双上限，超限按最旧优先淘汰，
+          // 淘汰的帧**照常结算成 lost**（++lost、settle、settle_fec）——所以 lost 不会因为
+          // "内存变有界"而变小，丢包率也不会被护栏美化。
+          //   reassembly_pending_dropped = 因预算淘汰的帧数（**是 lost 的子集**，单独记是为了
+          //     分清"为什么丢"：超时 = 链路问题，预算淘汰 = 接收端自保，两者处置不同）；
+          //   reassembly_pending_bytes   = 当前占用（**gauge**，不是累计；正常链路远小于 1%）；
+          //   reassembly_rejected        = 因预算拒收的包数（病态单帧，与协议层的 rejected 分开）。
+          {"reassembly_pending_dropped", reassembly_pending_dropped},
+          {"reassembly_pending_bytes", pending_bytes},
+          {"reassembly_rejected", reassembly_rejected},
           // feedback 发送计数；RTT/抖动本身是 cued 的消费面，probe 不重复一份。
           {"fb_sent", fb_sent},
           {"rtt_ms", (last_rtt_us >= 0 && last_rtt_at_us > 0 &&
@@ -2338,6 +2449,7 @@ int main(int argc, char** argv) {
     const auto reset_stream = [&](const char* reason) {
       const uint32_t old_max = max_completed;
       pending.clear();
+      pending_bytes = 0;  // 表清空 → 预算计数器必须同步归零，否则换代后预算恒为"已满"
       max_completed = 0;
       have_completed = false;
       dec.params = ParamSets{};
@@ -2499,6 +2611,16 @@ int main(int argc, char** argv) {
         ++rejected;  // 组的范围越界：伪造/损坏包，不能拿它去 resize 别人的槽位
         continue;
       }
+      // 新建槽位前的预算判据（N-10）：FEC 校验包与视频分片共用同一个 pending，也共用
+      // 同一本账——否则 FEC 分支就是绕过帧数上限的后门（每帧一个伪造的 base_frame_id
+      // 也不大，同样能刷出无限槽位）。这一包要占的字节 = 校验包载荷长度。
+      const std::size_t parity_off =
+          cue::proto::kDatagramHeaderSize + cue::proto::kFecPayloadHeaderSize;
+      const std::size_t parity_bytes = static_cast<std::size_t>(n) - parity_off;
+      if (!reserve_slot(base_fid, parity_bytes)) {
+        ++reassembly_rejected;  // 与协议层的 rejected 分开计：这一包本身合法，是预算装不下
+        continue;
+      }
       auto& ffa = pending[base_fid];
       if (ffa.count == 0) {
         ffa.count = total;
@@ -2511,8 +2633,6 @@ int main(int argc, char** argv) {
         ++rejected;  // 同一 frame_id 的 FEC 与数据报对整帧片数说法不一致
         continue;
       }
-      const std::size_t parity_off =
-          cue::proto::kDatagramHeaderSize + cue::proto::kFecPayloadHeaderSize;
       auto& grp = ffa.fec_groups[fph->group_index];
       if (grp.available && (grp.offset != offset || grp.member_count != members)) {
         ++rejected;  // 同一 group_index 的几何信息前后矛盾
@@ -2520,9 +2640,17 @@ int main(int argc, char** argv) {
       }
       grp.offset = offset;
       grp.member_count = members;
+      // 同一 group_index 的重复校验包是**覆盖写**：先把旧的那份从账上扣掉，否则重复包
+      // 会让 pending_bytes 越加越大（assign 只替换内存、不新增），预算于是被凭空收紧。
+      const std::size_t old_parity_bytes = grp.parity.size();
+      pending_bytes -= old_parity_bytes;
+      ffa.bytes -= old_parity_bytes;
       grp.parity.assign(buf.data() + parity_off, buf.data() + n);
+      pending_bytes += parity_bytes;
+      ffa.bytes += parity_bytes;
       grp.available = true;
-      fec_recovered += try_fec_recover(ffa);
+      fec_recovered += try_fec_recover(ffa, pending_bytes);
+      grow_guard(base_fid);  // 校验包 + 恢复出的片都进了账，再守一次字节上限
       // 恢复后必须重新判定完整性：否则被 FEC 修好的帧永远不会被计为完成（实测踩到的坑）
       mark_probe_if_recovered(base_fid);
       finish_if_complete(base_fid, ffa);
@@ -2689,6 +2817,15 @@ int main(int argc, char** argv) {
       ++rejected;
       continue;
     }
+    // 新建槽位前的预算判据（N-10 / FR-PIPE.14）：pending 是**无界**的攻击面——
+    // 已有两道防线都不管帧数（kMaxFragPerFrame 只约束单帧、cleanup_stale 只管 2 s TTL），
+    // 而上行字节来自浏览器：每帧只发 1 片、帧号递增就能在 2 s 内攒出任意多槽位。
+    // 所以先按预算淘汰最旧的帧；连淘汰都装不下这个分片就拒收它（不动存量队列）。
+    const std::size_t part_bytes = static_cast<std::size_t>(n) - cue::proto::kDatagramHeaderSize;
+    if (!reserve_slot(h->frame_id, part_bytes)) {
+      ++reassembly_rejected;  // 与协议层的 rejected 分开计：这一包合法，是预算装不下
+      continue;
+    }
     auto& fa = pending[h->frame_id];
     if (fa.count == 0) {
       fa.count = h->frag_count;
@@ -2702,15 +2839,21 @@ int main(int argc, char** argv) {
     }
     if (h->frag_index < fa.count && fa.parts[h->frag_index].empty()) {
       fa.parts[h->frag_index].assign(buf.data() + cue::proto::kDatagramHeaderSize, buf.data() + n);
+      // 字节账只在**真正写入**时加（上面那个 empty() 判断保证同一下标只计一次：
+      // 重复分片 / NACK 重传补同一片都不再改内存，也就不能再记一遍预算）。
+      fa.bytes += part_bytes;
+      pending_bytes += part_bytes;
       // 丢包率只统计**原始传输**：重传包（flags bit1）补回来的是链路已经丢过的那一片，
       // 把它算成"收到"会让丢失率随 NACK 修复一起下降——那样 >10% 冷却阈值永远不会触发，
       // 指标也会把一条 30% 丢包的链路报成 9%。FEC 恢复的片同样不计（它没走过链路）。
       if ((h->flags & cue::proto::kDownFlagRetransmit) == 0) ++fa.recv_parts;
+      grow_guard(h->frame_id);  // 分片把它喂大了：再守一次字节上限（不动这一帧自己）
     }
 
     // FEC 与 NACK 必须协同：FEC 包先到（当时缺 2 片无法恢复），NACK 补回 1 片后
     // 仍缺 1 片，此刻本可恢复 —— 旧实现只在 FEC 包到达那一刻试一次，白丢一帧。
-    fec_recovered += try_fec_recover(fa);
+    fec_recovered += try_fec_recover(fa, pending_bytes);
+    grow_guard(h->frame_id);  // 恢复出的片也占内存
     mark_probe_if_recovered(h->frame_id);
     finish_if_complete(h->frame_id, fa);
 
