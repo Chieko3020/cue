@@ -7,7 +7,7 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 - **评测** — 声明式 case、三重判分（根因 / 证据 / SLA）、pass^k、指纹、回归对比、人读报告
 - **可观测** — `cue-serve` + React 控制台五页、SSE 事件流、审批 UI；`cue-probe` 跨机接收端
 
-当前状态：`ctest` **33 项**（`ctest -N` 实测：C++ 单测 29 + 静态检查 3 + 起真进程的集成测试 1；sanitizer 构建不注册集成测试，对应 32 项）。最近一次全量实测是 **32/32 绿**（N-11 / N-14 两轮），N-14 新增的 `tool_schema` 还没在插桩构建下跑过；sanitizer 的两个构建目录仍是 N-12 时的 31 项配置，重新 configure 后才是 32 项。控制台五个 tab、SSE 与审批 UI 可用；cassette、benchmark 脚本（`scripts/bench.sh`，数据不入库）、proto fuzz、CI workflow 都在仓库里。**AC-15 全量通过**（18 case × REPEAT=3 = 54 次，根因/证据/SLA 全 1.0，三次 repeat 的 stddev 全 0）。**AC-1 已在真机验证**：Windows 的集成摄像头 + Realtek 麦克风经浏览器推流，cued 侧 `frames_in 594` / `audio_frames_in 1000` / `decode_errors 0`。
+当前状态：主构建 `ctest` **33 项全绿**（C++ 单测 29 + 静态检查 3 + 起真进程的集成测试 1；2026-10-25 复核）；`build-asan`（ASan+UBSan）与 `build-tsan` 各 **32 项全绿**（不注册集成测试）。控制台五个 tab、SSE 与审批 UI 可用；cassette、benchmark 脚本（`scripts/bench.sh`，数据不入库）、proto fuzz、CI workflow 都在仓库里。**AC-15 全量通过**（18 case × REPEAT=3 = 54 次，根因/证据/SLA 全 1.0，三次 repeat 的 stddev 全 0）。**AC-1 已在真机验证**：Windows 的集成摄像头 + Realtek 麦克风经浏览器推流，cued 侧 `frames_in 594` / `audio_frames_in 1000` / `decode_errors 0`。
 
 CI 分两层：**常驻**（每次 push）跑 build + ctest、AC-13 静态检查、e2e-console；**手动**（`workflow_dispatch`）跑 sanitizer（ASan/UBSan、TSan）与 fuzz。sanitizer 不常驻的原因写在 `.forgejo/workflows/sanitizer.yml` 头部：本机 2 vCPU / 1967 MB（DSH 常驻近 1 GB）+ runner 的 `MemoryHigh=700M`，插桩构建连 `-g1` 都压不进预算（`MemoryCurrent` 恒贴 734M，单 TU 编 5 分钟）。
 
