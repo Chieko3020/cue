@@ -920,16 +920,29 @@ Metrics to_metrics(const pipeline::PipelineMetrics& m) {
   out.decode_errors = m.decode_errors;
   out.updated_us = m.updated_us;
   out.samples = m.samples;
-  // 数据源只采到这些分位：p95 与 encode 段 parse_line 没有解析 →
-  // 保持 NaN，报告写 n/a（不编 0 冒充实测，见 review-eval.md #11）
+  // 六段分位在数据源侧就是齐的：cued 的 METRICS / metrics.query 一直发 p50/p95/p99，
+  // consume 侧（process_control → PipelineMetrics）N-05 起也把六段三位都收下，
+  // 包括此前连字段都没有的 recv/buffer p99。这里逐段按位搬运，不做任何"补 0"：
+  // 某一位在 cued 侧没有样本（段为 null）就保持 NaN，报告照旧写 n/a。
   if (m.samples > 0) {
     out.recv.p50 = m.recv_p50;
+    out.recv.p95 = m.recv_p95;
+    out.recv.p99 = m.recv_p99;
     out.buffer.p50 = m.buffer_p50;
+    out.buffer.p95 = m.buffer_p95;
+    out.buffer.p99 = m.buffer_p99;
     out.decode.p50 = m.decode_p50;
+    out.decode.p95 = m.decode_p95;
     out.decode.p99 = m.decode_p99;
     out.op.p50 = m.op_p50;
+    out.op.p95 = m.op_p95;
     out.op.p99 = m.op_p99;
+    out.encode.p50 = m.encode_p50;
+    out.encode.p95 = m.encode_p95;
+    out.encode.p99 = m.encode_p99;
     out.send.p50 = m.send_p50;
+    out.send.p95 = m.send_p95;
+    out.send.p99 = m.send_p99;
   }
   return out;
 }
@@ -951,12 +964,16 @@ ProbeSummary to_probe_summary(const pipeline::ProbeMetrics& p) {
     out.e2e.p95 = p.lat_p95_ms;
     out.e2e.p99 = p.lat_p99_ms;
     out.recv_us.p50 = p.recv.p50;
+    out.recv_us.p95 = p.recv.p95;
     out.recv_us.p99 = p.recv.p99;
     out.reassembly_us.p50 = p.reassembly.p50;
+    out.reassembly_us.p95 = p.reassembly.p95;
     out.reassembly_us.p99 = p.reassembly.p99;
     out.buffer_us.p50 = p.buffer.p50;
+    out.buffer_us.p95 = p.buffer.p95;
     out.buffer_us.p99 = p.buffer.p99;
     out.decode_us.p50 = p.decode.p50;
+    out.decode_us.p95 = p.decode.p95;
     out.decode_us.p99 = p.decode.p99;
   }
   out.synced = p.synced;
@@ -2661,12 +2678,12 @@ std::string Engine::render_markdown(const RunReport& r) const {
        "run_error 不计入成功率分母。\n";
   o << "> SLA 重测口径：取 agent 结束后最后 3 条采样（约 1 s 一条）的中位 fps；"
        "dropped 取窗口增量而不是进程累计值（累计值随 cued 重启清零）。\n";
-  o << "> 分位口径：数据源（cued 统计行）只采集 recv/buffer/decode/op/send 的部分分位，"
-       "p95 与 encode 段写 n/a，不补 0。\n";
+  o << "> 分位口径：六段（recv/buffer/decode/op/encode/send）的 p50/p95/p99 都由 cued 的"
+       "统计行采集、经 `PipelineMetrics` 全量搬运到本报告；某格写 n/a 只表示**该段在该重测"
+       "窗口没有样本**（典型：未开转码时 encode 段为空；某段整段输出 null），不补 0。\n";
   o << "> 端到端口径：`case.expect.sla` 的 lat_p50_ms / lat_p99_ms / max_stall_ms / stalls "
        "由 harness 用探针（cue-probe）重测；探针不可用时该 case 记 "
        "`run_error=probe_unavailable`，不会退回 cued 指标判分。\n";
-  o << "> 抖动缓冲段（buffer）目前为 null：cued 侧抖动缓冲尚未实现，接收端没有这一段可测。\n";
   return o.str();
 }
 

@@ -20,6 +20,32 @@ inline constexpr double kNoSample = std::numeric_limits<double>::quiet_NaN();
 // 该分位是否真的采到了（NaN 表示没有样本）
 inline bool has_sample(double v) { return std::isfinite(v); }
 
+// 解析 cued 的单段分位对象 `{"p50","p95","p99"}`（METRICS 行顶层六段、
+// metrics.query 响应里的同名段都用这一个口径）。
+//
+// 语义是 fail-soft，与旧 parse_line 的 stage() 完全一致：
+//   · 整段键缺失 / 不是对象 → 三位都保持 NaN（旧 cued 不发这一段 = 没有样本）；
+//   · 单个分位缺失 / null / 不是数字 → 只那一位保持 NaN，不把整条 METRICS 判坏，
+//     更不补 0。
+// 为什么不 fail-closed：这行来自子进程的 stdout，reader 线程不能被一个坏字段打断；
+// 录制/回放的**坏文件**才需要 fail-closed（见 recorded_pipeline.cpp 的 metrics_from_json）。
+// 为什么不把 p95 丢掉：生产端三处（summary / session_snapshot / metric.sample）
+// 一直发 p50/p95/p99，消费端丢 p95 会让报告里的 p95 永远 n/a——那是解析问题，
+// 不是"数据源没采"（N-05）。
+inline void apply_stage_percentiles(const nlohmann::json& j, const char* key, double& p50,
+                                    double& p95, double& p99) {
+  const auto it = j.find(key);
+  if (it == j.end() || !it->is_object()) return;
+  auto num = [&it](const char* k, double& out) {
+    const auto f = it->find(k);
+    if (f == it->end() || !f->is_number()) return;
+    out = f->get<double>();
+  };
+  num("p50", p50);
+  num("p95", p95);
+  num("p99", p99);
+}
+
 // 一条事件：cued stdout 里的 [cue-event] 行，或 harness 自己合成的控制面事件。
 // data 原样保留（不同 ev 的字段不同，消费者按键取），t_us 是事件时间（unix us），
 // seen_us 是本进程读到它的单调时钟时刻——两者口径不同，跨进程比较只能用 seen_us。
@@ -32,8 +58,11 @@ struct PipelineEvent {
 
 // 探针（cue-probe）的一段微秒分位。与 PipelineMetrics 的六段（ms）分开：这里的样本
 // 来自接收端自己的时钟，且 probe 可能根本不在（假域 / 回放），可用性必须单独表达。
+// p50/p95/p99 三位都在 probe 的 METRICS 与 probe.metric 事件里上报；NaN = 这一段
+// 没有样本（整段 null），不是"耗时 0 微秒"。
 struct ProbeLatencyUs {
   double p50 = kNoSample;
+  double p95 = kNoSample;
   double p99 = kNoSample;
 };
 
@@ -123,6 +152,8 @@ inline nlohmann::json probe_metrics_to_json(const ProbeMetrics& p) {
   auto pct = [](double v) { return has_sample(v) ? nlohmann::json(v) : nlohmann::json(nullptr); };
   auto seg = [](const ProbeLatencyUs& s) {
     return nlohmann::json{{"p50", has_sample(s.p50) ? nlohmann::json(s.p50)
+                                                   : nlohmann::json(nullptr)},
+                          {"p95", has_sample(s.p95) ? nlohmann::json(s.p95)
                                                    : nlohmann::json(nullptr)},
                           {"p99", has_sample(s.p99) ? nlohmann::json(s.p99)
                                                     : nlohmann::json(nullptr)}};
@@ -253,7 +284,7 @@ inline bool probe_metrics_from_json(const nlohmann::json& j, ProbeMetrics& out,
       d = f->get<double>();
       return true;
     };
-    return inner("p50", dst.p50) && inner("p99", dst.p99);
+    return inner("p50", dst.p50) && inner("p95", dst.p95) && inner("p99", dst.p99);
   };
   auto flag = [&j](const char* key, bool& dst) {
     const auto it = j.find(key);
@@ -336,11 +367,17 @@ struct PipelineMetrics {
   // 它和延迟注入的关系必须能读出来：延迟注入只压下行数据报，**不**改变帧的年龄，
   // 所以注入 delay 时这个计数应该保持 0；一旦它涨，说明是真的积压/时钟问题，不是注入。
   uint64_t ingress_late = 0;
-  // 六段 p50（ms）。NaN = 这一段没有样本（cued 的 METRICS 对应段是 null）：
-  // "没采到"与"花了 0 ms"是两件事，消费者必须输出 null/n/a，不能用 0 冒充。
+  // 六段分位（ms）：recv/buffer/decode/op/encode/send 各 p50/p95/p99。
+  // 生产端（cued 的 summary / session_snapshot / metric.sample）三处都发这三个分位，
+  // 所以消费端六段的三分位**一律可读**：某一位是 NaN 只表示**那一位没有样本**
+  // （cued 的 METRICS 对应段为 null），不是"花了 0 ms"。消费者必须输出 null/n/a，
+  // 不能用 0 冒充——"没采到"与"测到 0"在判分上是相反的结论。
   double recv_p50 = kNoSample, buffer_p50 = kNoSample, decode_p50 = kNoSample,
          op_p50 = kNoSample, encode_p50 = kNoSample, send_p50 = kNoSample;
-  // 六段 p99（ms，同上：只有 cued 真正打印了 p99 的段才有值）
+  double recv_p95 = kNoSample, buffer_p95 = kNoSample, decode_p95 = kNoSample,
+         op_p95 = kNoSample, encode_p95 = kNoSample, send_p95 = kNoSample;
+  // recv/buffer 两段的 p99 曾被整段丢掉（生产端在发、结构体没有字段），与 p95 同类。
+  double recv_p99 = kNoSample, buffer_p99 = kNoSample;
   double decode_p99 = kNoSample, op_p99 = kNoSample, encode_p99 = kNoSample;
   // send 段 p99：延迟注入的主观测点（延迟只体现在发送侧尾部，不体现在计数上）
   double send_p99 = kNoSample;

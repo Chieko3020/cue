@@ -110,15 +110,25 @@ void parse_metrics(const json& j, PipelineMetrics& m, int64_t now) {
   cnt("encode_errors", m.encode_errors);
   cnt("decode_drops", m.decode_drops);
   cnt("budget_drops", m.budget_drops);
+  // 六段分位（N-05）：REST 后端的 /api/state 若带 p95/p99 就照读；缺失保持 NaN。
   pct("recv_p50_ms", m.recv_p50);
+  pct("recv_p95_ms", m.recv_p95);
+  pct("recv_p99_ms", m.recv_p99);
   pct("buffer_p50_ms", m.buffer_p50);
+  pct("buffer_p95_ms", m.buffer_p95);
+  pct("buffer_p99_ms", m.buffer_p99);
   pct("decode_p50_ms", m.decode_p50);
+  pct("decode_p95_ms", m.decode_p95);
   pct("decode_p99_ms", m.decode_p99);
   pct("op_p50_ms", m.op_p50);
+  pct("op_p95_ms", m.op_p95);
   pct("op_p99_ms", m.op_p99);
   pct("encode_p50_ms", m.encode_p50);
+  pct("encode_p95_ms", m.encode_p95);
   pct("encode_p99_ms", m.encode_p99);
   pct("send_p50_ms", m.send_p50);
+  pct("send_p95_ms", m.send_p95);
+  pct("send_p99_ms", m.send_p99);
   cnt("samples", m.samples);
   const auto pid_it = j.find("pid");
   if (pid_it != j.end() && pid_it->is_number_integer()) {

@@ -55,7 +55,7 @@ int main() {
     check(j["lat_p50_ms"].is_null(), "无样本：端到端 p50 落成 null");
     check(j["recv_us"]["p50"].is_null(), "无样本：recv 段 p50 落成 null");
     check(j["decode_us"]["p99"].is_null(), "无样本：decode 段 p99 落成 null");
-    check(j["buffer_us"]["p50"].is_null(), "buffer 段恒为 null（cued 抖动缓冲未实现）");
+    check(j["buffer_us"]["p50"].is_null(), "buffer 段无样本时整段 null（不是 0）");
     check(j["buffer_reason"] == "cued_jitter_buffer_unimplemented", "buffer 段带原因");
     check(j["unavailable_reason"] == "probe 进程未运行", "不可用原因往返");
 
@@ -81,10 +81,10 @@ int main() {
     p.decode_errors = 2;
     p.stalls = 3;
     p.max_stall_us = 88000;
-    p.recv = {120.0, 480.0};
-    p.reassembly = {900.0, 4200.0};
+    p.recv = {120.0, 240.0, 480.0};
+    p.reassembly = {900.0, 2100.0, 4200.0};
     p.buffer = {};  // 没有样本
-    p.decode = {1500.0, 6100.0};
+    p.decode = {1500.0, 3100.0, 6100.0};
     p.lat_p50_ms = 42.5;
     p.lat_p95_ms = 71.0;
     p.lat_p99_ms = 96.25;
@@ -94,7 +94,10 @@ int main() {
     const json j = pipeline::probe_metrics_to_json(p);
     check(j["samples"] == 7, "有样本：samples 往返");
     check(j["lat_p99_ms"] == 96.25, "有样本：端到端 p99 往返");
+    check(j["lat_p95_ms"] == 71.0, "有样本：端到端 p95 往返");
+    check(j["recv_us"]["p95"] == 240.0, "有样本：recv 段 p95 往返（N-05）");
     check(j["buffer_us"]["p50"].is_null(), "有样本但 buffer 无样本：仍是 null");
+    check(j["buffer_us"]["p95"].is_null(), "有样本但 buffer 无样本：p95 也是 null（不是 0）");
     check(j["max_stall_us"] == 88000, "有样本：max_stall_us 往返");
 
     pipeline::ProbeMetrics back;
@@ -104,8 +107,12 @@ int main() {
     check(back.stalls == 3, "回读 stalls");
     check(pipeline::has_sample(back.lat_p99_ms) && back.lat_p99_ms == 96.25, "回读 p99 有样本");
     check(back.recv.p99 == 480.0, "回读 recv p99");
+    check(back.recv.p95 == 240.0, "回读 recv p95");
+    check(back.reassembly.p95 == 2100.0, "回读 reassembly p95");
+    check(back.decode.p95 == 3100.0, "回读 decode p95");
     check(back.decode.p50 == 1500.0, "回读 decode p50");
     check(!pipeline::has_sample(back.buffer.p50), "回读 buffer 仍无样本");
+    check(!pipeline::has_sample(back.buffer.p95), "回读 buffer p95 仍是 NaN（不是 0）");
     check(back.offset_us == -1234, "回读 offset_us（负数）");
   }
   {

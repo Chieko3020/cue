@@ -53,7 +53,8 @@ struct ProbeSummary {
   uint64_t stalls = 0;
   double max_stall_ms = kNoValue;  // 窗口内最长卡顿（ms）；NaN = 无样本
   Latency e2e;                     // 端到端 p50/p95/p99（ms）
-  // 四段分解（µs，只有 p50/p99 有值）；buffer 段在 cued 抖动缓冲实现前恒为 NaN
+  // 四段分解（µs，p50/p95/p99 都有值；NaN = 该位没有样本）。buffer 段来自探针自己的
+  // 抖动缓冲等待（进队 → 放行），不再恒为 NaN。
   Latency recv_us, reassembly_us, buffer_us, decode_us;
   bool synced = false;
   int64_t offset_us = 0;

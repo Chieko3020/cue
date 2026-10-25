@@ -31,17 +31,28 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"injected", m.injected},
               {"decoded", m.decoded},
               {"decode_errors", m.decode_errors},
+              // 六段分位（ms）：每段 p50/p95/p99 一律输出；值为 null = 该位没有样本。
+              // N-05 之前这里只有 p50 与部分 p99，且 p95 在解析侧就被丢掉了——
+              // agent 的 query_metrics 里根本读不到 p95，"证据里写 p95=..."无从谈起。
               {"recv_p50_ms", pct(m.recv_p50)},
+              {"recv_p95_ms", pct(m.recv_p95)},
+              {"recv_p99_ms", pct(m.recv_p99)},
               {"buffer_p50_ms", pct(m.buffer_p50)},
+              {"buffer_p95_ms", pct(m.buffer_p95)},
+              {"buffer_p99_ms", pct(m.buffer_p99)},
               {"decode_p50_ms", pct(m.decode_p50)},
+              {"decode_p95_ms", pct(m.decode_p95)},
               {"decode_p99_ms", pct(m.decode_p99)},
               {"op_p50_ms", pct(m.op_p50)},
+              {"op_p95_ms", pct(m.op_p95)},
               {"op_p99_ms", pct(m.op_p99)},
               {"encode_p50_ms", pct(m.encode_p50)},
+              {"encode_p95_ms", pct(m.encode_p95)},
               {"encode_p99_ms", pct(m.encode_p99)},
               {"send_p50_ms", pct(m.send_p50)},
-              // send 段 p99：延迟注入（FR-PIPE.10 的 delay / jitter）的主观测点。
+              // send 段 p95/p99：延迟注入（FR-PIPE.10 的 delay / jitter）的主观测点。
               // 没有它，网络时延类根因在 cued 侧就没有任何可引用的分位（D-7）。
+              {"send_p95_ms", pct(m.send_p95)},
               {"send_p99_ms", pct(m.send_p99)},
               // 进程身份/存活：pid=null 表示当前没有 cued（不是 pid 0 的真进程）
               {"pid", m.pid == 0 ? json(nullptr) : json(static_cast<int64_t>(m.pid))},
@@ -104,9 +115,20 @@ void add_probe_metrics(json& j, const ProbeMetrics& p) {
   j["e2e_recv_p50_us"] = pct(p.recv.p50);
   j["e2e_reassembly_p50_us"] = pct(p.reassembly.p50);
   j["e2e_decode_p50_us"] = pct(p.decode.p50);
+  // 四段的 p95：probe 的 METRICS 与 probe.metric 一直带 p50/p95/p99，
+  // 只是过去这里没搬（与 cued 侧 p95 同类问题）。命名沿用 e2e_*_p50_us/p99_us。
+  j["e2e_recv_p95_us"] = pct(p.recv.p95);
+  j["e2e_reassembly_p95_us"] = pct(p.reassembly.p95);
+  j["e2e_decode_p95_us"] = pct(p.decode.p95);
   // 抖动缓冲段：probe 侧的等待时长（进队 → 放行）。没有样本时是 null，绝不写 0。
   j["e2e_buffer_p50_us"] = pct(p.buffer.p50);
+  j["e2e_buffer_p95_us"] = pct(p.buffer.p95);
   j["e2e_buffer_p99_us"] = pct(p.buffer.p99);
+  // 四段 p99 也补齐（过去只搬了 buffer 的 p99）：agent 引用 e2e recv/decode 尾部时
+  // 不该只有 p50 可讲。同样 null = 没有样本。
+  j["e2e_recv_p99_us"] = pct(p.recv.p99);
+  j["e2e_reassembly_p99_us"] = pct(p.reassembly.p99);
+  j["e2e_decode_p99_us"] = pct(p.decode.p99);
   // 抖动缓冲的状态：level 涨说明升档在换平滑（代价是延迟），skipped 涨说明帧真的丢了。
   j["e2e_jb_level"] = p.jb_level;
   j["e2e_jb_switches"] = p.jb_switches;

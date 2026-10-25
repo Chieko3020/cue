@@ -216,6 +216,22 @@ void test_markdown_sections() {
   check(has(md, "总体标准差"), "md: 写明标准差用总体标准差");
   check(has(md, "运行状态备注") == false, "md: 没有 run_notes 时不渲染空的运行状态段");
 
+  // N-05：六段延迟表里的 p95 必须是数字（不再是恒 n/a）。这里给每个 case 灌同一组分位，
+  // 表里取中位后应逐位显示；同时确认脚注不再说"p95 写 n/a"。
+  {
+    eval::RunReport with_p95 = r;
+    for (auto& c : with_p95.cases) {
+      c.metrics.decode.p50 = 1.0;
+      c.metrics.decode.p95 = 2.0;
+      c.metrics.decode.p99 = 3.0;
+      c.metrics.send.p95 = 12.5;
+    }
+    const std::string md5 = engine.render_markdown(with_p95);
+    check(has(md5, "| decode | 1.00 | 2.00 | 3.00 |"), "md: decode 段 p95 渲染成数字");
+    check(has(md5, "| send | n/a | 12.50 | n/a |"), "md: send 段 p95 渲染成数字");
+    check(!has(md5, "p95 与 encode 段写 n/a"), "md: 脚注不再声称 p95 恒写 n/a");
+  }
+
   // run_notes 与 failure_modes 分开渲染
   r.run_notes = {"truncated: 计划 6 次，实际执行 2 次"};
   r.failure_modes = {eval::FailureMode{"network_loss", 2, {"a(root)", "c(sla)"}}};

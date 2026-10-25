@@ -816,28 +816,18 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   m.delayed_pkts = count("delayed_pkts");
   m.delayed_max_us = count("delayed_max_us");
   m.ingress_late = count("ingress_late");
-  // 段分位：cued 写 null（本秒没有样本）或整段缺失 → 保持 NaN，绝不写成 0
-  auto stage = [&j](const char* key, double& p50, double& p95, double& p99) {
-    const auto it = j.find(key);
-    if (it == j.end() || !it->is_object()) return;
-    auto num = [&it](const char* k, double& out) {
-      const auto f = it->find(k);
-      if (f == it->end() || !f->is_number()) return;
-      out = f->get<double>();
-    };
-    num("p50", p50);
-    num("p95", p95);
-    num("p99", p99);
-  };
-  double sink_p95 = kNoSample;  // p95 目前没有消费者，丢弃但不污染 p99
-  stage("recv", m.recv_p50, sink_p95, sink_p95);
-  stage("buffer", m.buffer_p50, sink_p95, sink_p95);
-  stage("decode", m.decode_p50, sink_p95, m.decode_p99);
-  stage("op", m.op_p50, sink_p95, m.op_p99);
-  stage("encode", m.encode_p50, sink_p95, m.encode_p99);
-  // send 段的 p99 是延迟注入的主证据（send 段涨、计数不涨），必须单独解析，
-  // 不能再塞进 sink_p95（那样工具面永远看不到它）。
-  stage("send", m.send_p50, sink_p95, m.send_p99);
+  // 段分位：cued 写 null（本秒没有样本）或整段缺失 → 保持 NaN，绝不写成 0。
+  // p95 过去被塞进一个丢弃用的 sink（"没有消费者"）——这正是报告 p95 恒 n/a 的根因：
+  // 生产端一直在发，消费端解析出来就扔了（N-05）。现在六段各收各的三分位，
+  // recv/buffer 的 p99 也补上了字段（否则与 p95 一样白丢）。解析语义见
+  // apply_stage_percentiles：整段缺失/坏字段都只让对应位保持 NaN，不把整行判坏。
+  apply_stage_percentiles(j, "recv", m.recv_p50, m.recv_p95, m.recv_p99);
+  apply_stage_percentiles(j, "buffer", m.buffer_p50, m.buffer_p95, m.buffer_p99);
+  apply_stage_percentiles(j, "decode", m.decode_p50, m.decode_p95, m.decode_p99);
+  apply_stage_percentiles(j, "op", m.op_p50, m.op_p95, m.op_p99);
+  apply_stage_percentiles(j, "encode", m.encode_p50, m.encode_p95, m.encode_p99);
+  // send 段：延迟注入的主证据（send 段涨、计数不涨）在 p99 上，p95 同样保留。
+  apply_stage_percentiles(j, "send", m.send_p50, m.send_p95, m.send_p99);
   // 控制面字段（T-05）：通道类型与 cued 累计处理的控制请求数
   if (const auto it = j.find("control_channel"); it != j.end() && it->is_string()) {
     m.control_channel = it->get<std::string>();

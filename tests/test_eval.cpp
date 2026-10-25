@@ -216,6 +216,8 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     m.pid = 4242;
     m.updated_us = 123456;
     m.decode_p50 = 1.24;
+    m.decode_p95 = 1.8;   // N-05：p95 必须进录制并能回放（过去结构体里根本没有这个字段）
+    m.send_p95 = 0.11;
     // 没采到的分位：回放后必须仍是 NaN，不能变成 0
     m.decode_p99 = cue::pipeline::kNoSample;
     m.encode_p50 = cue::pipeline::kNoSample;
@@ -232,9 +234,9 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     p.decoded = 298;
     p.stalls = 2;
     p.max_stall_us = 66000;
-    p.recv = {0.12, 0.48};
-    p.reassembly = {0.9, 4.2};
-    p.decode = {1.5, 6.1};
+    p.recv = {0.12, 0.31, 0.48};
+    p.reassembly = {0.9, 2.4, 4.2};
+    p.decode = {1.5, 3.7, 6.1};
     p.lat_p50_ms = 42.5;
     p.lat_p95_ms = 71.0;
     p.lat_p99_ms = 96.25;
@@ -315,7 +317,10 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
   }
   check(file_text.find("\"v\":1") != std::string::npos, "case11 录制带版本字段");
   check(file_text.find("\"decode_p50_ms\":1.24") != std::string::npos, "case11 有样本的分位写数字");
+  check(file_text.find("\"decode_p95_ms\":1.8") != std::string::npos, "case11 有样本的 p95 也进录制");
+  check(file_text.find("\"send_p95_ms\":0.11") != std::string::npos, "case11 send p95 进录制");
   check(file_text.find("\"decode_p99_ms\":null") != std::string::npos, "case11 无样本的分位写 null");
+  check(file_text.find("\"encode_p95_ms\":null") != std::string::npos, "case11 无样本的 encode p95 写 null");
   check(file_text.find("\"encode_p50_ms\":null") != std::string::npos, "case11 无样本的 encode 写 null");
   check(file_text.find("\"decode_p99_ms\":0") == std::string::npos, "case11 无样本绝不写成 0");
   check(file_text.find("\"op\":\"probe_latest\"") != std::string::npos, "case11 端到端快照进录制");
@@ -333,9 +338,13 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     const auto p = rp.probe_latest();
     check(p.samples == 1 && p.lat_p99_ms == 96.25 && p.stalls == 2, "case11 回放端到端指标一致");
     check(cue::pipeline::has_sample(p.decode.p50) && p.decode.p50 == 1.5, "case11 回放 decode 段还原");
+    check(cue::pipeline::has_sample(p.recv.p95) && p.recv.p95 == 0.31, "case11 回放 probe recv p95 还原");
     check(!cue::pipeline::has_sample(p.buffer.p50), "case11 回放 buffer 段仍是 NaN（不是 0）");
+    check(!cue::pipeline::has_sample(p.buffer.p95), "case11 回放 buffer p95 仍是 NaN");
     check(p.buffer_reason == "cued_jitter_buffer_unimplemented", "case11 回放 buffer 原因保留");
     check(cue::pipeline::has_sample(m.decode_p50) && m.decode_p50 == 1.24, "case11 回放 p50 还原");
+    check(cue::pipeline::has_sample(m.decode_p95) && m.decode_p95 == 1.8, "case11 回放 p95 还原（N-05）");
+    check(cue::pipeline::has_sample(m.send_p95) && m.send_p95 == 0.11, "case11 回放 send p95 还原");
     check(!cue::pipeline::has_sample(m.decode_p99), "case11 回放 NaN 仍是 NaN（不是 0）");
     check(!cue::pipeline::has_sample(m.encode_p50), "case11 回放 encode NaN 仍是 NaN");
 
@@ -393,6 +402,47 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     check(!rp.set_param("bitrate_kbps", "800", err), "case11 参数不符 → 回放明确失败");
     check(err.find("参数不符") != std::string::npos, "case11 参数不符不被静默接受");
     check(rp.stats().misses == 1, "case11 参数不符计 miss");
+  }
+
+  // 向后兼容：N-05 之前的旧录制没有 *_p95_ms（也没有 recv/buffer p99），
+  // 回放必须能整体加载，缺失位按 kNoSample（NaN）处理——不能因为"新增观测"
+  // 就把历史录制判成坏文件，也不能把缺失补成 0。
+  {
+    const std::string old_path = (dir / "old.tools.jsonl").string();
+    {
+      std::ofstream out(old_path);
+      out << R"({"v":1,"op":"start","ret":{"ok":true}})" << "\n";
+      out << R"({"v":1,"op":"latest","ret":{"fps":29.97,"frames_in":300,"frames_out":280,)"
+             R"("dropped":20,"injected":0,"decoded":280,"decode_errors":0,"rejected":0,)"
+             R"("send_errors":0,"encode_errors":0,"decode_drops":0,"budget_drops":0,)"
+             R"("recv_p50_ms":0.01,"buffer_p50_ms":0.02,"decode_p50_ms":1.24,)"
+             R"("op_p50_ms":0.0,"encode_p50_ms":null,"send_p50_ms":0.08,)"
+             R"("decode_p99_ms":3.3,"op_p99_ms":0.05,"encode_p99_ms":null,)"
+             R"("updated_us":123456,"samples":1,"alive":true,"pid":4242}})"
+          << "\n";
+      out << R"({"v":1,"op":"probe_latest","ret":{"fps":29.5,"frames":100,"decoded":98,)"
+             R"("stalls":1,"samples":1,"recv_us":{"p50":0.12,"p99":0.48}}})"
+          << "\n";
+    }
+    ReplayPipeline rp(old_path);
+    if (!rp.load_error().empty()) {
+      std::printf("旧录制裁剪失败原因: %s\n", rp.load_error().c_str());
+    }
+    check(rp.load_error().empty(), "旧录制（无 p95 键）仍能加载");
+    std::string err;
+    check(rp.start(err), "旧录制 start 命中");
+    const auto m = rp.latest();
+    check(m.samples == 1 && m.fps == 29.97, "旧录制 latest 可读");
+    check(!cue::pipeline::has_sample(m.decode_p95), "旧录制缺 decode p95 → NaN（不是 0）");
+    check(!cue::pipeline::has_sample(m.send_p95), "旧录制缺 send p95 → NaN");
+    check(!cue::pipeline::has_sample(m.recv_p99), "旧录制缺 recv p99 → NaN");
+    check(cue::pipeline::has_sample(m.decode_p50) && m.decode_p50 == 1.24,
+          "旧录制已有的 p50 照常读出");
+    const auto p = rp.probe_latest();
+    check(p.samples == 1, "旧录制 probe_latest 可读");
+    check(cue::pipeline::has_sample(p.recv.p50) && p.recv.p50 == 0.12, "旧录制 probe p50 照常读出");
+    check(!cue::pipeline::has_sample(p.recv.p95), "旧录制 probe 段缺 p95 → NaN（不是 0）");
+    check(!cue::pipeline::has_sample(p.buffer.p95), "旧录制 probe buffer 缺 p95 → NaN");
   }
 
   // 负向：文件不存在 → 加载失败，不允许空实现

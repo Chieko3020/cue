@@ -47,15 +47,26 @@ json metrics_to_json(const PipelineMetrics& m) {
               {"encode_errors", m.encode_errors},
               {"decode_drops", m.decode_drops},
               {"budget_drops", m.budget_drops},
+              // 六段分位（N-05）：与 tools.cpp 的 metrics_json 同一组键。
+              // null = 该位没有样本；旧录制缺这些键，回读按 kNoSample（见 metrics_from_json）。
               {"recv_p50_ms", pct_json(m.recv_p50)},
+              {"recv_p95_ms", pct_json(m.recv_p95)},
+              {"recv_p99_ms", pct_json(m.recv_p99)},
               {"buffer_p50_ms", pct_json(m.buffer_p50)},
+              {"buffer_p95_ms", pct_json(m.buffer_p95)},
+              {"buffer_p99_ms", pct_json(m.buffer_p99)},
               {"decode_p50_ms", pct_json(m.decode_p50)},
-              {"op_p50_ms", pct_json(m.op_p50)},
-              {"encode_p50_ms", pct_json(m.encode_p50)},
-              {"send_p50_ms", pct_json(m.send_p50)},
+              {"decode_p95_ms", pct_json(m.decode_p95)},
               {"decode_p99_ms", pct_json(m.decode_p99)},
+              {"op_p50_ms", pct_json(m.op_p50)},
+              {"op_p95_ms", pct_json(m.op_p95)},
               {"op_p99_ms", pct_json(m.op_p99)},
+              {"encode_p50_ms", pct_json(m.encode_p50)},
+              {"encode_p95_ms", pct_json(m.encode_p95)},
               {"encode_p99_ms", pct_json(m.encode_p99)},
+              {"send_p50_ms", pct_json(m.send_p50)},
+              {"send_p95_ms", pct_json(m.send_p95)},
+              {"send_p99_ms", pct_json(m.send_p99)},
               {"updated_us", m.updated_us},
               {"samples", m.samples},
               {"alive", m.alive},
@@ -139,15 +150,27 @@ bool metrics_from_json(const json& j, PipelineMetrics& m, std::string& err) {
   if (!get_u64(j, "encode_errors", m.encode_errors, err)) return false;
   if (!get_u64(j, "decode_drops", m.decode_drops, err)) return false;
   if (!get_u64(j, "budget_drops", m.budget_drops, err)) return false;
+  // 六段分位（N-05）：get_pct 的口径是「字段缺失/null → kNoSample」，所以旧录制
+  // （没有 *_p95_ms / recv_p99_ms / buffer_p99_ms / send_p99_ms）依然能回放，
+  // 不会因为"新增观测"而整体解析失败；但键存在而类型不对仍然 fail-closed。
   if (!get_pct(j, "recv_p50_ms", m.recv_p50, err)) return false;
+  if (!get_pct(j, "recv_p95_ms", m.recv_p95, err)) return false;
+  if (!get_pct(j, "recv_p99_ms", m.recv_p99, err)) return false;
   if (!get_pct(j, "buffer_p50_ms", m.buffer_p50, err)) return false;
+  if (!get_pct(j, "buffer_p95_ms", m.buffer_p95, err)) return false;
+  if (!get_pct(j, "buffer_p99_ms", m.buffer_p99, err)) return false;
   if (!get_pct(j, "decode_p50_ms", m.decode_p50, err)) return false;
-  if (!get_pct(j, "op_p50_ms", m.op_p50, err)) return false;
-  if (!get_pct(j, "encode_p50_ms", m.encode_p50, err)) return false;
-  if (!get_pct(j, "send_p50_ms", m.send_p50, err)) return false;
+  if (!get_pct(j, "decode_p95_ms", m.decode_p95, err)) return false;
   if (!get_pct(j, "decode_p99_ms", m.decode_p99, err)) return false;
+  if (!get_pct(j, "op_p50_ms", m.op_p50, err)) return false;
+  if (!get_pct(j, "op_p95_ms", m.op_p95, err)) return false;
   if (!get_pct(j, "op_p99_ms", m.op_p99, err)) return false;
+  if (!get_pct(j, "encode_p50_ms", m.encode_p50, err)) return false;
+  if (!get_pct(j, "encode_p95_ms", m.encode_p95, err)) return false;
   if (!get_pct(j, "encode_p99_ms", m.encode_p99, err)) return false;
+  if (!get_pct(j, "send_p50_ms", m.send_p50, err)) return false;
+  if (!get_pct(j, "send_p95_ms", m.send_p95, err)) return false;
+  if (!get_pct(j, "send_p99_ms", m.send_p99, err)) return false;
   if (!j.contains("updated_us") || !j["updated_us"].is_number_integer()) {
     err = "metrics 字段 updated_us 缺失或不是整数";
     return false;

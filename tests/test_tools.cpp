@@ -103,6 +103,18 @@ class MetricsPipeline : public FakePipeline {
     m.enc_gop = 60;
     m.enc_preset = "veryfast";
     m.enc_transcode = "on";
+    // N-05：六段分位（含 p95 与 recv/buffer p99）必须真的出现在 agent 观测面
+    m.decode_p50 = 1.2;
+    m.decode_p95 = 2.8;
+    m.decode_p99 = 3.3;
+    m.send_p95 = 0.12;
+    m.send_p99 = 0.2;
+    m.recv_p95 = 0.02;
+    m.recv_p99 = 0.03;
+    m.buffer_p95 = 0.04;
+    m.buffer_p99 = 0.05;
+    m.op_p95 = 0.01;
+    m.encode_p95 = 3.9;
     return m;
   }
   pipeline::ProbeMetrics probe_latest() const override {
@@ -129,6 +141,11 @@ class MetricsPipeline : public FakePipeline {
     p.audio_fec_recovered = 4;
     p.audio_plc_frames = 2;
     p.audio_unconcealed_frames = 1;
+    // N-05：probe 四段 p95 也要进 e2e_*_p95_us
+    p.recv = {10.0, 20.0, 30.0};
+    p.reassembly = {40.0, 50.0, 60.0};
+    p.buffer = {70.0, 80.0, 90.0};
+    p.decode = {100.0, 110.0, 120.0};
     return p;
   }
 };
@@ -324,10 +341,27 @@ int main() {
       check(d.value("e2e_audio_dups", 0) == 1, "观测面带 e2e_audio_dups");
       check(d.value("e2e_audio_reordered", 0) == 2, "观测面带 e2e_audio_reordered");
       check(d.value("e2e_audio_stale", 0) == 3, "观测面带 e2e_audio_stale");
+      // 六段分位（N-05）：p95 与 recv/buffer p99 必须在 agent 观测面里可读
+      check(d.value("decode_p95_ms", 0.0) == 2.8, "观测面带 decode_p95_ms");
+      check(d.value("send_p95_ms", 0.0) == 0.12, "观测面带 send_p95_ms");
+      check(d.value("recv_p95_ms", 0.0) == 0.02, "观测面带 recv_p95_ms");
+      check(d.value("recv_p99_ms", 0.0) == 0.03, "观测面带 recv_p99_ms（过去连字段都没有）");
+      check(d.value("buffer_p95_ms", 0.0) == 0.04, "观测面带 buffer_p95_ms");
+      check(d.value("buffer_p99_ms", 0.0) == 0.05, "观测面带 buffer_p99_ms");
+      check(d.value("op_p95_ms", 0.0) == 0.01, "观测面带 op_p95_ms");
+      check(d.value("encode_p95_ms", 0.0) == 3.9, "观测面带 encode_p95_ms");
+      check(d.value("e2e_recv_p95_us", 0.0) == 20.0, "观测面带 e2e_recv_p95_us");
+      check(d.value("e2e_reassembly_p95_us", 0.0) == 50.0, "观测面带 e2e_reassembly_p95_us");
+      check(d.value("e2e_buffer_p95_us", 0.0) == 80.0, "观测面带 e2e_buffer_p95_us");
+      check(d.value("e2e_decode_p95_us", 0.0) == 110.0, "观测面带 e2e_decode_p95_us");
       // 候选键必须能从观测原文里逐字摘出（scripted 假 agent 走的正是这条路）
       const std::string text = "metrics=" + d.dump();
       check(text.find("\"e2e_fec_ghost_discarded\":9") != std::string::npos,
             "e2e_fec_ghost_discarded=9 可从观测原文摘出");
+      check(text.find("\"decode_p95_ms\":2.8") != std::string::npos,
+            "decode_p95_ms=2.8 可从观测原文摘出");
+      check(text.find("\"send_p95_ms\":0.12") != std::string::npos,
+            "send_p95_ms=0.12 可从观测原文摘出");
       check(text.find("\"encode_width\":1920") != std::string::npos,
             "encode_width=1920 可从观测原文摘出");
     }

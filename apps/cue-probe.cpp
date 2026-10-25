@@ -318,10 +318,14 @@ class LatencyRing {
 };
 
 // 分位行：没有样本时整段是 null。写成 0 会被下游读成「这一段花了 0 ms」——
-// 对 buffer 段尤其致命（cued 的抖动缓冲还没实现，0 就是伪造出来的数据）。
+// 对 buffer 段尤其致命（0 会看起来像"抖动缓冲没等待"，而它可能只是没样本）。
+// p95 与 p50/p99 同源：probe 本地就有 LatencyRing，没有理由只发两位而让
+// 报告/agent 侧读不到四段的 p95（N-05）。
 json seg_or_null(const LatencyRing& r) {
   if (r.size() == 0) return nullptr;
-  return json{{"p50", r.percentile(0.50)}, {"p99", r.percentile(0.99)}};
+  return json{{"p50", r.percentile(0.50)},
+              {"p95", r.percentile(0.95)},
+              {"p99", r.percentile(0.99)}};
 }
 
 // ---------------------------------------------------------------- Annex-B 参数集

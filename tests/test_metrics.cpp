@@ -414,6 +414,110 @@ int main() {
           "probe 快照里 fec_ghost_discarded 是字符串 → 解析失败（不静默当 0）");
   }
 
+  // ---------------------------------------------------------------- 六段分位解析（N-05）
+  //
+  // cued 的 METRICS / metrics.query 一直发 p50/p95/p99；消费端曾把 p95 塞进一个
+  // 丢弃用的 sink，导致报告里 p95 恒 n/a。这里把"六段 × 三分位"的解析语义钉死：
+  //   · 有值 → 按原值读出；
+  //   · 整段缺失 / 不是对象 → 三位都保持 NaN（没有样本，绝不是 0）；
+  //   · 单个字段是字符串（坏字段）→ 只那一位保持 NaN，其余照读（fail-soft，
+  //     与旧 parse_line 的 stage() 同口径；METRICS 行来自子进程，不能让它打断 reader）。
+  {
+    using cue::pipeline::apply_stage_percentiles;
+    using cue::pipeline::has_sample;
+    using cue::pipeline::kNoSample;
+
+    const char* stages[] = {"recv", "buffer", "decode", "op", "encode", "send"};
+    json line = json::object();
+    for (int i = 0; i < 6; ++i) {
+      line[stages[i]] = json{{"p50", 10.0 + i}, {"p95", 20.0 + i}, {"p99", 30.0 + i}};
+    }
+    bool all_read = true;
+    for (int i = 0; i < 6; ++i) {
+      double p50 = kNoSample, p95 = kNoSample, p99 = kNoSample;
+      apply_stage_percentiles(line, stages[i], p50, p95, p99);
+      all_read = all_read && p50 == 10.0 + i && p95 == 20.0 + i && p99 == 30.0 + i;
+    }
+    check(all_read, "六段 p50/p95/p99 有值 → 全部按原值读出（p95 不再被丢）");
+
+    // 整段缺失：三位保持 NaN；不是对象也一样（旧 cued 不发这一段 = 没有样本）
+    {
+      double p50 = kNoSample, p95 = kNoSample, p99 = kNoSample;
+      apply_stage_percentiles(json::object(), "recv", p50, p95, p99);
+      check(!has_sample(p50) && !has_sample(p95) && !has_sample(p99),
+            "整段缺失 → 三位都是 NaN（不是 0）");
+      p50 = p95 = p99 = kNoSample;
+      apply_stage_percentiles(json{{"send", 5}}, "send", p50, p95, p99);
+      check(!has_sample(p50) && !has_sample(p95) && !has_sample(p99),
+            "段不是对象 → 三位都是 NaN");
+      // p95 是 null（本秒没有该位样本）→ 只 p95 是 NaN，p50/p99 照读
+      p50 = p95 = p99 = kNoSample;
+      apply_stage_percentiles(
+          json{{"decode", {{"p50", 1.2}, {"p95", nullptr}, {"p99", 3.3}}}},
+          "decode", p50, p95, p99);
+      check(p50 == 1.2 && !has_sample(p95) && p99 == 3.3,
+            "p95 为 null → 只有 p95 是 NaN，不污染 p50/p99");
+    }
+
+    // 坏字段（字符串）：只有那一位不覆盖，其余照读——fail-soft，不抛也不补 0
+    {
+      double p50 = kNoSample, p95 = kNoSample, p99 = kNoSample;
+      apply_stage_percentiles(
+          json{{"op", {{"p50", 0.01}, {"p95", "fast"}, {"p99", 0.05}}}},
+          "op", p50, p95, p99);
+      check(p50 == 0.01 && !has_sample(p95) && p99 == 0.05,
+            "op.p95 是字符串 → 该位保持 NaN，p50/p99 照读（fail-soft）");
+    }
+
+    // 旧 cued 只发 p50/p99（没有 p95 键）：p95 保持 NaN，不报错、不写 0
+    {
+      double p50 = kNoSample, p95 = kNoSample, p99 = kNoSample;
+      apply_stage_percentiles(json{{"recv", {{"p50", 0.01}, {"p99", 0.03}}}},
+                              "recv", p50, p95, p99);
+      check(p50 == 0.01 && !has_sample(p95) && p99 == 0.03,
+            "旧 cued 缺 p95 键 → p95 仍是 NaN");
+    }
+  }
+
+  // ---------------------------------------------------------------- probe 四段 p95（N-05）
+  //
+  // probe 的 recv/reassembly/buffer/decode 现在都发 p50/p95/p99；旧 cassette 只有
+  // p50/p99，缺 p95 必须仍能整体解析（该位 NaN），而键存在但类型错仍 fail-closed。
+  {
+    using cue::pipeline::ProbeMetrics;
+    using cue::pipeline::probe_metrics_from_json;
+
+    std::string err;
+    const json old_cassette =
+        json{{"fps", 30.0}, {"frames", 100}, {"decoded", 95}, {"stalls", 0}, {"samples", 3},
+             {"recv_us", {{"p50", 0.12}, {"p99", 0.48}}},
+             {"decode_us", {{"p50", 1.5}, {"p99", 6.1}}}};
+    ProbeMetrics old;
+    check(probe_metrics_from_json(old_cassette, old, err), "probe 旧快照（段内无 p95）仍能解析");
+    check(old.recv.p50 == 0.12 && old.recv.p99 == 0.48, "旧快照 p50/p99 照常读出");
+    check(!cue::pipeline::has_sample(old.recv.p95), "旧快照 recv p95 → NaN（不是 0）");
+    check(!cue::pipeline::has_sample(old.decode.p95), "旧快照 decode p95 → NaN");
+
+    const json new_snapshot =
+        json{{"fps", 30.0}, {"frames", 100}, {"decoded", 95}, {"stalls", 0}, {"samples", 3},
+             {"recv_us", {{"p50", 0.12}, {"p95", 0.24}, {"p99", 0.48}}},
+             {"reassembly_us", {{"p50", 0.9}, {"p95", 2.1}, {"p99", 4.2}}},
+             {"buffer_us", {{"p50", 5.0}, {"p95", 9.0}, {"p99", 12.0}}},
+             {"decode_us", {{"p50", 1.5}, {"p95", 3.1}, {"p99", 6.1}}}};
+    ProbeMetrics cur;
+    check(probe_metrics_from_json(new_snapshot, cur, err), "probe 新快照（四段带 p95）能解析");
+    check(cur.recv.p95 == 0.24 && cur.reassembly.p95 == 2.1 && cur.buffer.p95 == 9.0 &&
+              cur.decode.p95 == 3.1,
+          "probe 四段 p95 按原值读出");
+    check(cur.recv.p50 == 0.12 && cur.buffer.p99 == 12.0, "p50/p99 与 p95 互不覆盖");
+
+    const json bad_p95 = json{{"fps", 30.0}, {"frames", 100}, {"decoded", 1},
+                              {"recv_us", {{"p50", 0.1}, {"p95", "fast"}}}};
+    ProbeMetrics bad;
+    check(!probe_metrics_from_json(bad_p95, bad, err),
+          "probe 段内 p95 是字符串 → 解析失败（坏录制不静默当没样本）");
+  }
+
   if (failures == 0) {
     std::printf("test_metrics: OK\n");
     return 0;

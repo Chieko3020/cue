@@ -432,9 +432,14 @@ class MockPipeline {
   json metrics_locked() const {
     const bool have = samples_ > 0;
     auto pct = [have](double v) { return have && pipeline::has_sample(v) ? json(v) : json(nullptr); };
+    const double decode_p95 = have ? 2.8 : pipeline::kNoSample;
     const double decode_p99 = have ? 3.2 : pipeline::kNoSample;
+    const double encode_p95 = have ? 3.9 : pipeline::kNoSample;
     const double encode_p99 = have ? 4.1 : pipeline::kNoSample;
+    const double op_p95 = have ? 0.03 : pipeline::kNoSample;
     const double op_p99 = have ? 0.05 : pipeline::kNoSample;
+    const double send_p95 = have ? 0.09 + delay_ms_ : pipeline::kNoSample;
+    const double send_p99 = have ? 0.11 + delay_ms_ : pipeline::kNoSample;
     return json{
         {"fps", last_fps_},
         {"frames_in", frames_in_},
@@ -443,15 +448,25 @@ class MockPipeline {
         {"injected", static_cast<uint64_t>(std::llround(drop_pct_))},
         {"decoded", frames_out_},
         {"decode_errors", uint64_t{0}},
+        // 六段分位与真 cued 同形：每段 p50/p95/p99；没有样本时 null（不是 0）。
         {"recv_p50_ms", pct(0.01)},
+        {"recv_p95_ms", pct(0.02)},
+        {"recv_p99_ms", pct(0.03)},
         {"buffer_p50_ms", pct(0.01)},
+        {"buffer_p95_ms", pct(0.02)},
+        {"buffer_p99_ms", pct(0.03)},
         {"decode_p50_ms", pct(1.2)},
+        {"decode_p95_ms", pct(decode_p95)},
         {"decode_p99_ms", pct(decode_p99)},
         {"op_p50_ms", pct(0.0)},
+        {"op_p95_ms", pct(op_p95)},
         {"op_p99_ms", pct(op_p99)},
         {"encode_p50_ms", pct(3.4)},
+        {"encode_p95_ms", pct(encode_p95)},
         {"encode_p99_ms", pct(encode_p99)},
         {"send_p50_ms", pct(0.08 + delay_ms_)},
+        {"send_p95_ms", pct(send_p95)},
+        {"send_p99_ms", pct(send_p99)},
         {"pid", kPid},
         {"alive", running_},
         {"rejected", uint64_t{0}},
