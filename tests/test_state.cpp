@@ -284,6 +284,10 @@ int main() {
     check(eval::classify_run_error(r) == "agent_turn_budget", "轮次耗尽 → agent_turn_budget");
     r.error = "too many guard rejects";
     check(eval::classify_run_error(r) == "agent_guard_loop", "守卫死循环 → agent_guard_loop");
+    // 上下文裁完仍超限：必须优先于「零轮次」判定，否则首轮就超限的 run 会被误归成 llm_unavailable
+    agent::RunResult ro;
+    ro.error = "context_overflow";
+    check(eval::classify_run_error(ro) == "context_overflow", "上下文裁完仍超限 → context_overflow");
     agent::RunResult r0;
     r0.error = "curl: timeout";
     check(eval::classify_run_error(r0) == "llm_unavailable", "零轮次失败 → llm_unavailable");

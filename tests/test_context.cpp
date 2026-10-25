@@ -191,8 +191,114 @@ int main() {
     check(t1 >= agent::estimate_tokens(msgs), "effective >= raw estimate");
   }
 
+  // ---- N-13：裁完之后是否仍在预算内（TrimResult::still_over / over_by）----
+
+  // 1) 正常预算：不丢不截，也不算 overflow
+  {
+    std::vector<llm::ChatMessage> msgs;
+    msgs.push_back(msg("system", 300, 's'));
+    msgs.push_back(msg("user", 300, 'u'));
+    msgs.push_back(msg("tool", 300, 'o'));
+    agent::ContextBudget b;
+    b.max_tokens = 5000;
+    b.keep_recent = 2;
+    const auto tr = agent::trim_report(msgs, b);
+    check(tr.dropped == 0 && tr.truncated == 0, "N-13 fit: nothing trimmed");
+    check(!tr.still_over, "N-13 fit: still_over=false");
+    check(tr.over_by == 0, "N-13 fit: over_by=0");
+    check(msgs.size() == 3, "N-13 fit: messages untouched");
+  }
+
+  // 2) 需要裁剪、但丢完就够：dropped>0 且 still_over=false
+  {
+    std::vector<llm::ChatMessage> msgs;
+    msgs.push_back(msg("system", 300, 's'));
+    msgs.push_back(msg("user", 300, 'u'));
+    for (int i = 0; i < 18; ++i) msgs.push_back(msg("tool", 3000));
+    agent::ContextBudget b;
+    b.max_tokens = 10000;
+    b.keep_recent = 6;
+    const auto tr = agent::trim_report(msgs, b);
+    check(tr.dropped > 0, "N-13 trim sufficient: dropped>0");
+    check(!tr.still_over, "N-13 trim sufficient: still_over=false");
+    check(tr.over_by == 0, "N-13 trim sufficient: over_by=0");
+    check(agent::effective_tokens(msgs, b) <= b.max_tokens, "N-13 trim sufficient: within budget");
+  }
+
+  // 3) 裁完仍超限：极小预算 + 保护区里必留的大消息 → still_over=true，
+  //    且 system 与最后一条 user（阶段提示）必须原样保留（不允许为了凑预算截断它们）
+  {
+    const std::string sys = std::string(300, 's');
+    const std::string goal = std::string(900, 'g');
+    const std::string hint = std::string(600, 'h');
+    std::vector<llm::ChatMessage> msgs;
+    msgs.push_back(msg("system", 300, 's'));
+    msgs.push_back(msg("user", 900, 'g'));
+    for (int i = 0; i < 8; ++i) msgs.push_back(msg("tool", 3000, 'o'));
+    msgs.push_back(msg("user", 600, 'h'));  // 阶段提示：每轮追加在末尾
+    agent::ContextBudget b;
+    b.max_tokens = 50;
+    b.keep_recent = 2;
+    const auto tr = agent::trim_report(msgs, b);
+    check(tr.dropped > 0, "N-13 over: dropped>0");
+    check(tr.still_over, "N-13 over: still_over=true");
+    check(tr.over_by > 0, "N-13 over: over_by>0");
+    check(msgs.front().content == sys, "N-13 over: system prompt untouched");
+    check(msgs[1].content == goal, "N-13 over: current goal untouched");
+    check(msgs.back().content == hint, "N-13 over: stage hint untouched");
+    check(msgs.size() == b.keep_recent + 2, "N-13 over: only middle rounds dropped");
+  }
+
+  // 4) 单条截断后仍超限：巨大 tool 观测 + 头部本身也很重 → truncated>0 且 still_over=true
+  {
+    const std::string sys = std::string(3000, 's');
+    std::vector<llm::ChatMessage> msgs;
+    msgs.push_back(msg("system", 3000, 's'));
+    msgs.push_back(msg("user", 3000, 'u'));
+    msgs.push_back(msg("tool", 20000, 'L'));
+    agent::ContextBudget b;
+    b.max_tokens = 2000;
+    b.keep_recent = 2;
+    b.single_msg_tokens = 500;  // 单条截到 1500 B
+    const auto tr = agent::trim_report(msgs, b);
+    check(tr.truncated == 1, "N-13 truncate then over: truncated==1");
+    check(tr.still_over, "N-13 truncate then over: still_over=true");
+    check(tr.over_by > 0, "N-13 truncate then over: over_by>0");
+    check(msgs.front().content == sys, "N-13 truncate then over: system untouched");
+    check(msgs[2].content.find("[truncated") != std::string::npos,
+          "N-13 truncate then over: marker kept");
+  }
+
+  // 5) reserve_tokens 参与出口判定：同一份输入，reserve 加大后从 fit 变 over；
+  //    reserve 是每轮固定开销，裁历史裁不掉它
+  {
+    auto build = [] {
+      std::vector<llm::ChatMessage> msgs;
+      msgs.push_back(msg("system", 300, 's'));
+      msgs.push_back(msg("user", 300, 'u'));
+      msgs.push_back(msg("tool", 300, 'o'));
+      return msgs;
+    };
+    agent::ContextBudget b;
+    b.max_tokens = 2000;
+    b.keep_recent = 2;
+    b.reserve_tokens = 0;
+    auto msgs = build();
+    const auto fit = agent::trim_report(msgs, b);
+    check(!fit.still_over, "N-13 reserve: fit without reserve");
+    check(fit.over_by == 0, "N-13 reserve: fit over_by=0");
+
+    b.reserve_tokens = 5000;  // 仅 tools schema 就装不下
+    msgs = build();
+    const auto over = agent::trim_report(msgs, b);
+    check(over.still_over, "N-13 reserve: over with large reserve");
+    check(over.dropped == 0 && over.truncated == 0, "N-13 reserve: reserve cannot be trimmed away");
+    check(over.over_by == agent::effective_tokens(msgs, b) - b.max_tokens,
+          "N-13 reserve: over_by consistent with effective_tokens");
+  }
+
   if (failures == 0) {
-    std::printf("test_context: OK (8 cases)\n");
+    std::printf("test_context: OK (13 cases)\n");
     return 0;
   }
   std::printf("test_context: %d failure(s)\n", failures);

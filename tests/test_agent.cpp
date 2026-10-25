@@ -561,8 +561,43 @@ int main() {
     check(mocks.metrics_calls == 1, "case15 truncated tool call not executed");
   }
 
+  // ---------- 用例 16（N-13）：裁完仍超预算 → context.overflow + 终止，且不再发请求 ----------
+  {
+    MockTools mocks;
+    tool::Registry reg;
+    mocks.build(reg);
+
+    llm::ScriptedClient llm;
+    llm.push(call("o1", "query_metrics", json::object()));
+    llm.push(call("o2", "query_metrics", json::object()));
+
+    auto cfg = make_cfg(tool::ApprovalMode::Auto);
+    cfg.max_context_tokens = 64;  // 光 tools schema 的 reserve 就装不下
+    agent::Runner runner(llm, reg, cfg);
+    int overflows = 0;
+    json overflow_data;
+    const auto res = runner.run("把下行 p99 压到 120ms 以下", agent::Budget{},
+                                [&](const agent::Event& e) {
+                                  if (e.type == "context.overflow") {
+                                    ++overflows;
+                                    overflow_data = e.data;
+                                  }
+                                });
+    check(overflows == 1, "case16 context.overflow emitted");
+    check(res.error == "context_overflow", "case16 stop reason is context_overflow");
+    check(res.turns == 0, "case16 run stopped before any turn");
+    check(llm.remaining() == 2, "case16 no chat request sent");
+    check(res.final_stage == agent::Stage::GiveUp, "case16 final stage give_up");
+    check(overflow_data.contains("est_tokens") && overflow_data.contains("max_tokens") &&
+              overflow_data.contains("reserve") && overflow_data.contains("dropped") &&
+              overflow_data.contains("truncated") && overflow_data.contains("over_by"),
+          "case16 overflow event carries structured fields");
+    check(overflow_data["max_tokens"].get<std::size_t>() == 64, "case16 max_tokens reported");
+    check(overflow_data["over_by"].get<std::size_t>() > 0, "case16 over_by>0");
+  }
+
   if (failures == 0) {
-    std::printf("test_agent: OK (15 cases)\n");
+    std::printf("test_agent: OK (16 cases)\n");
     return 0;
   }
   std::printf("test_agent: %d failure(s)\n", failures);

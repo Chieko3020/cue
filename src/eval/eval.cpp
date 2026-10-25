@@ -1425,6 +1425,9 @@ std::string classify_run_error(const agent::RunResult& res) {
   // replay 缺 cassette 是环境/素材问题，不是模型答错：必须先于「零轮次」判定，
   // 否则会被归成 llm_unavailable，报告读不出「该补录制」这一动作。
   if (e.find("cassette miss") != std::string::npos) return "cassette_miss";
+  // 上下文裁完仍超预算（N-13）：harness 主动终止，不是模型答错，也不是 LLM 不可用。
+  // 必须先于「零轮次」判定——首轮就超限时 turns==0，否则会被误归成 llm_unavailable。
+  if (e.find("context_overflow") != std::string::npos) return "context_overflow";
   if (res.turns == 0) return "llm_unavailable";
   if (e.find("wall clock") != std::string::npos) return "agent_timeout";
   if (e.find("cost budget") != std::string::npos) return "agent_cost_budget";

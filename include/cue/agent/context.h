@@ -51,6 +51,12 @@ inline std::size_t effective_tokens(const std::vector<llm::ChatMessage>& msgs, c
 struct TrimResult {
   std::size_t dropped = 0;    // 删掉的消息条数（按整轮）
   std::size_t truncated = 0;  // 被单条截断的消息条数
+  // 出口判定：裁完之后是否仍超预算。true 表示调用方**不能**再拿这份消息去请求，
+  // 必须终止本轮 run（runner 侧发 context.overflow，stop_reason=context_overflow）。
+  // 判定口径与裁剪判据完全一致：同一次 effective_tokens（estimate × k × 1.2 + reserve）。
+  bool still_over = false;
+  // 仍超出多少 token（同一估算口径）；still_over=false 时为 0。
+  std::size_t over_by = 0;
 };
 
 // 只从"中间"丢，永不丢 system[0] 与最后 keep_recent 条。
@@ -91,6 +97,14 @@ inline TrimResult trim_report(std::vector<llm::ChatMessage>& msgs, const Context
     m.content += "\n…[truncated " + std::to_string(cut) + " bytes]";
     ++out.truncated;
   }
+
+  // 出口（N-13）：裁完再按**同一个** over() 口径算一次，而不是另立一套。
+  // 注意这里只报告、不再继续裁：protect_head（system + 当前目标）与最近 keep_recent 条
+  // 是硬保护，为了凑预算去截断它们等于丢失任务本身；单条截断也只针对 tool 观测。
+  // 因此 still_over 时唯一的正确动作是终止 run，由调用方决定怎么收口。
+  const std::size_t est = effective_tokens(msgs, b);
+  out.still_over = est > b.max_tokens;
+  out.over_by = out.still_over ? est - b.max_tokens : 0;
   return out;
 }
 

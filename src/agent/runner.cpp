@@ -315,10 +315,26 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       cb.reserve_tokens = estimate_tokens(req.tools);
       const TrimResult tr = trim_report(req.messages, cb);
       if (tr.dropped > 0 || tr.truncated > 0) {
+        // 既有字段名保持不变（报告/cassette 有依赖），只新增下面独立的 overflow 事件
         emit("context.trim", {{"dropped", tr.dropped},
                               {"truncated", tr.truncated},
                               {"est_tokens", estimate_tokens(req.messages)},
                               {"k", ctx_k_}});
+      }
+      // 出口（N-13）：裁完仍超预算就**不能再发这次请求**。此前没有这个判定，
+      // 极端情况下会带着超预算的请求继续，只能等模型侧 400——既没有事件，也没停 run。
+      // system 提示与当前阶段目标（首条 user、以及本轮追加在末尾的 stage_hint）都不在
+      // 裁剪候选集里，这里同样不允许为了让估算过关去截断它们。
+      // 事件字段：est_tokens 是生效估算（含 k、1.2、reserve），故 over_by == est_tokens - max_tokens。
+      if (tr.still_over) {
+        emit("context.overflow", {{"est_tokens", effective_tokens(req.messages, cb)},
+                                  {"max_tokens", cb.max_tokens},
+                                  {"reserve", cb.reserve_tokens},
+                                  {"dropped", tr.dropped},
+                                  {"truncated", tr.truncated},
+                                  {"over_by", tr.over_by}});
+        stop_reason = "context_overflow";
+        break;
       }
     }
 
