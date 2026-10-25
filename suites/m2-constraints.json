@@ -1,7 +1,7 @@
 {
   "suite": "m2-constraints",
   "version": 1,
-  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。两者都只能人工复现（AVC level 由浏览器侧 configure 决定，FEC 幽灵帧不在 8 类根因枚举内），因此标 manual_only：real 模式跳过、不计入成功率分母。suite 字段必须全部被引擎认识——未知字段一律报错，避免『写错字段 → SLA 恒真 → 假绿灯』。evidence_candidates 只能引用 query_metrics 真实输出的字段（N-02）：曾经引用的 frames_no_data / frames_completed 在整个仓库里都不存在，证据层因此永远 0%。",
+  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。两者都只能人工复现（AVC level 由浏览器侧 configure 决定，FEC 幽灵帧不在 8 类根因枚举内），因此标 manual_only：real 模式跳过、不计入成功率分母。suite 字段必须全部被引擎认识——未知字段一律报错，避免『写错字段 → SLA 恒真 → 假绿灯』。evidence_candidates 只能引用 query_metrics 真实输出、且在该故障场景里语义成立的字段（N-02）：曾经引用的 frames_no_data / frames_completed 在整个仓库里都不存在，证据层因此永远 0%。fec-ghost-frame 的候选里 e2e_fec_ghost_discarded 是**常态计数**（FEC 校验包总在整帧数据之后到达：实测零丢包 8 s/241 帧 → 250 次，约每完成帧 1 次），它出现在候选里只是因为它确实可引用，**不能**拿来证明幽灵帧；幽灵帧的证据落在 e2e_fec_recovered（丢包相关：0% = 0、5% = 45~52）与 e2e_frag_ghost_discarded（异常指示：0% = 0、5% = 2~3）上。",
   "cases": [
     {
       "id": "avc-level-mismatch",
@@ -46,13 +46,13 @@
       "pipeline": {
         "transcode": false
       },
-      "prompt": "下行注入 5% 丢包并启用 XOR-FEC。检查 probe 侧是否出现幽灵帧（FEC 冗余包或迟到分片为已完成的帧重建接收槽位），并给出根因。",
+      "prompt": "下行注入 5% 丢包并启用 XOR-FEC。检查 probe 侧是否出现幽灵帧（迟到的视频分片/重传为已完成的帧重建接收槽位），并给出根因。",
       "expect": {
         "root_cause": "fec_ghost_frame",
         "evidence_candidates": [
           "e2e_fec_recovered",
-          "e2e_fec_ghost_discarded",
-          "e2e_frag_ghost_discarded"
+          "e2e_frag_ghost_discarded",
+          "e2e_fec_ghost_discarded"
         ],
         "allowed_actions": [
           "inject_fault",

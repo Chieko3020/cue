@@ -1245,11 +1245,16 @@ int main(int argc, char** argv) {
   FecSettle fec_totals;
   // 幽灵帧守卫的账（M0 教训 / N-02）：两条分支都会遇到"该帧已判定完成，却又有一个
   // 数据报要为它重建槽位"。重建槽位会让同一帧被计第二次完成数（零丢包时 no_data 恰等于
-  // FEC 包数，完成帧数甚至超过发送帧数）。两条分支的**触发源不同**，所以分开计：
-  //   fec_ghost_discarded  = FEC 冗余包为已完成帧重建槽位（FEC 在整帧数据之后到达）；
-  //   frag_ghost_discarded = 迟到的视频分片/重传为已完成帧重建槽位（NACK 补回的片）。
-  // 分开的理由：两者同时涨说明"又丢又乱"，混成一个数就分不清是 FEC 冗余多余，
-  // 还是重传追不上——而两者的修法完全不同（前者调 FEC 分组，后者调 NACK 延迟）。
+  // FEC 包数，完成帧数甚至超过发送帧数）。两条分支的**性质不同**，所以分开计：
+  //   fec_ghost_discarded  = FEC 组的校验包在该帧已判完成后到达 → 不给它重建槽位。
+  //     FEC 校验包本来就排在整帧数据之后，所以这是 FEC 开启后的**常态**：实测零丢包
+  //     8 s / 241 帧 → 250 次（约每完成帧 1 次）；5% 丢包 8 s → 187~190 次（6 s
+  //     实测 146 次），随完成帧数同比例下降。它是"守卫在跑、这条路径有账"的读数，
+  //     **不是异常指标**；必须与 frames / fec_groups_rx 一起看比率才有意义。
+  //   frag_ghost_discarded = 迟到的视频分片 / NACK 重传试图为已完成帧重建槽位。
+  //     正常链路不该发生：实测零丢包 = 0；5% 丢包 = 2~3。**这个才是异常指示**。
+  // 分开的理由：混成一个数会把"每完成帧一次的常态"读成故障，也会把真正需要关注的
+  // 迟到分片淹没在常态里——两者的判读方式完全不同（比率 vs 是否为 0）。
   uint64_t fec_ghost_discarded = 0;
   uint64_t frag_ghost_discarded = 0;
   uint32_t max_completed = 0;
@@ -2083,10 +2088,14 @@ int main(int argc, char** argv) {
           {"fec_groups_rx", fec_totals.groups_rx},
           {"fec_unrecoverable", fec_totals.unrecoverable},
           {"fec_unrecoverable_pkts", fec_totals.unrecoverable_pkts},
-          // 幽灵帧守卫的计数（N-02）：被丢弃的"为已完成帧重建槽位"次数。两个源分开
-          // 记账的理由见上面 fec_ghost_discarded / frag_ghost_discarded 的定义处。
-          // 恒 0 是正常的（零丢包时不会走到这两条分支）；只有注入丢包 + FEC/NACK
-          // 才会让它涨——所以它不能单独当"幽灵帧存在"的证据，要和 fec_recovered 一起读。
+          // 幽灵帧守卫的计数（N-02）：被丢弃的"为已完成帧重建槽位"次数。
+          // 两者口径不同，读法也不同（实测见变量定义处）：
+          //   fec_ghost_discarded  = **常态**：FEC 校验包总在整帧之后到，零丢包实测
+          //     8 s / 241 帧 → 250 次（约每帧 1 次），与完成帧数成正比、与丢包无关
+          //     （5% 丢包反而降到 187~190，因为完成帧少了）。它只能当"守卫在跑"的
+          //     读数，**不是故障指示**，不能拿来证明幽灵帧发生过。
+          //   frag_ghost_discarded = **异常**：迟到分片/重传去重建已完成帧。
+          //     零丢包实测 0、5% 丢包 2~3——这个才是幽灵帧的真证据。
           {"fec_ghost_discarded", fec_ghost_discarded},
           {"frag_ghost_discarded", frag_ghost_discarded},
           // feedback 发送计数；RTT/抖动本身是 cued 的消费面，probe 不重复一份。
@@ -2462,10 +2471,11 @@ int main(int argc, char** argv) {
         continue;
       }
       const uint32_t base_fid = fph->base_frame_id;
-      // FEC 冗余包通常在整帧数据**之后**到达：该帧若已判定完成，这里会给它重建一个
+      // FEC 校验包总在整帧数据**之后**到达：该帧若已判定完成，这里会给它重建一个
       // 空槽位，随后又被 finish_if_complete 计成"第二次完成"——M0 的幽灵帧。
-      // 静默丢弃 + 计数（N-02）：这条路径以前只是 continue，故障期"到底丢了多少"
-      // 无从查起，agent 也就无法把它当证据。
+      // 静默丢弃 + 计数（N-02）：这条路径以前只是 continue，于是"守卫每帧都在命中"
+      // 这件事没有任何账可查（实测零丢包 8 s / 241 帧 → 250 次）。它是**常态读数**，
+      // 不是异常；真正的异常指示是 frag_ghost_discarded（零丢包 0）。
       if (have_completed && base_fid <= max_completed && pending.find(base_fid) == pending.end()) {
         ++fec_ghost_discarded;
         continue;
@@ -2658,8 +2668,10 @@ int main(int argc, char** argv) {
     // 首帧（还没有任何已完成帧）不适用这条：frame_id 从 0 开始，初值 0 会把 IDR 挡掉。
     if (have_completed && pending.find(h->frame_id) == pending.end() &&
         h->frame_id <= max_completed) {
-      // 与 FEC 分支同一个幽灵帧守卫，但触发源是迟到的视频分片（含 NACK 重传）：
-      // 单独计数才能区分"FEC 冗余多余"与"重传追不上"（见 fec_ghost_discarded 的注释）。
+      // 与 FEC 分支同一个幽灵帧守卫，但触发源是迟到的视频分片（含 NACK 重传）。
+      // 这才是**异常**：正常链路不该出现（实测零丢包 = 0、5% 丢包 = 2~3）；
+      // 与 fec 那条"每完成帧一次的常态"必须分开计，否则会被常态淹没
+      // （见 fec_ghost_discarded 的定义处）。
       ++frag_ghost_discarded;
       continue;
     }

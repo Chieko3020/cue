@@ -94,8 +94,11 @@ struct ProbeMetrics {
   uint64_t fec_unrecoverable = 0;        // 结算时仍缺 ≥2 片的组数
   uint64_t fec_unrecoverable_pkts = 0;   // 上面那些组一共缺了几片
   // 幽灵帧守卫（M0 教训 / N-02）：被丢弃的"为已完成帧重建槽位"次数。
-  // 两个源分开计：FEC 冗余包（fec）与迟到的视频分片/重传（frag）。
-  // 零丢包时恒 0 是正常现象；只有注入丢包 + FEC/NACK 才会涨。
+  // 两个源的**判读方式不同**（实测见 apps/cue-probe.cpp 的定义处）：
+  //   fec_ghost_discarded  = 常态（FEC 校验包总在整帧之后到；零丢包 8 s/241 帧 →
+  //     250 次，约每完成帧 1 次），只能当"守卫在跑"的读数，不是故障指示；
+  //   frag_ghost_discarded = 异常（迟到分片/重传；零丢包 0、5% 丢包 2~3）。
+  // 所以证据层只能引用后者（以及 fec_recovered），不能拿前者证明幽灵帧。
   uint64_t fec_ghost_discarded = 0;
   uint64_t frag_ghost_discarded = 0;
   uint64_t lost = 0;          // 重组阶段判定丢失的帧数（cleanup_stale 累计）

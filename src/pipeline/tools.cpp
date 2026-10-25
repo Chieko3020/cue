@@ -128,8 +128,11 @@ void add_probe_metrics(json& j, const ProbeMetrics& p) {
   j["e2e_fec_groups_rx"] = p.fec_groups_rx;
   j["e2e_fec_unrecoverable"] = p.fec_unrecoverable;
   j["e2e_fec_unrecoverable_pkts"] = p.fec_unrecoverable_pkts;
-  // 幽灵帧守卫：两条分支分开报。零丢包时恒 0 是**正常读数**（不是"没采到"）：
-  // 只有注入丢包 + FEC/NACK 才会走到丢弃分支，所以引用它时必须同时看 fec_recovered。
+  // 幽灵帧守卫：两条分支分开报，判读方式不同（实测见 metrics.h 同名字段）。
+  //   e2e_fec_ghost_discarded  = 常态：FEC 校验包总在整帧之后到（零丢包 8 s/241 帧 →
+  //     250 次），只能当"守卫在跑"的读数，**不是故障指示**；
+  //   e2e_frag_ghost_discarded = 异常：迟到分片/重传去重建已完成帧（零丢包 0、5% 丢包 2~3）。
+  // 所以 suite 的幽灵帧证据用 e2e_fec_recovered + e2e_frag_ghost_discarded。
   j["e2e_fec_ghost_discarded"] = p.fec_ghost_discarded;
   j["e2e_frag_ghost_discarded"] = p.frag_ghost_discarded;
   j["e2e_lost"] = p.lost;
