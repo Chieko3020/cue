@@ -164,6 +164,36 @@ struct Score {
   bool all() const { return root && evidence && sla; }
 };
 
+// 「注入是否真的生效」（N-23）：判的是**故障有没有发生**，与「模型答得对不对」是两件事。
+//
+// 为什么需要这一层：rate 类 case 的故障是"发送速率上限"，令牌桶只有源码率**超过**上限时
+// 才会耗尽。评测的旧产帧源（scripts/test-client.mjs）每帧发同一个 64×64 静止 IDR，
+// 经 x264 后每帧只有几百字节，30 fps 合计远低于 0.1 Mbps（12.5 kB/s）——于是
+// budget_drops=0、frames_in==frames_out、fps 30，SLA（fps_min=25）**恒真**。
+// 没有这一层判定，那种"故障根本没发生"的 run 会以 100% 通过、退出码 0 收场，
+// 比失败更危险。
+//
+// 判据只取三类有明确单一计数的故障：
+//   rate         → budget_drops > 0（令牌桶真的被抽干）
+//   drop         → injected > 0（出向真的有包被 Injector 吃掉）
+//   ingress_drop → injected > 0（上行真的有包被吃掉）
+// backlog / delay / jitter 没有单一计数能判"注入了没有"（积压要看 frames_in−frames_out
+// 与队列深度、延迟类要看分位），不做自动判定，报告里注明「未做自动判定」，不硬凑。
+struct InjectionCheck {
+  std::string fault_kind;
+  bool checked = false;    // 这个故障类有自动判定判据（上面三类之一）
+  bool effective = false;  // checked 且故障窗口的读数满足判据
+  // 故障窗口的读数（判据用的两个计数，留档便于复核；未取到样本时为 0 且 checked=false）
+  uint64_t budget_drops = 0;
+  uint64_t injected = 0;
+  // 一句可直接写进报告的中文判定（含读数与原因），空 = 没做判定
+  std::string detail;
+};
+
+// 纯函数（可单测）：按故障类与故障窗口读数给出「注入是否生效」判定。
+InjectionCheck judge_injection(const std::string& fault_kind, uint64_t budget_drops,
+                               uint64_t injected);
+
 // 证据校验：证据必须（a）是某条真实观测里逐字摘抄的 key=value 片段，
 // （b）除引用、工具名与单位外不含解释性文字。见 review-eval.md 的伪造构造表。
 bool evidence_matches(const std::string& evidence, const std::vector<Observation>& obs);
@@ -175,6 +205,9 @@ Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<O
 struct PipelineConfig {
   std::string cued_bin;
   std::string probe_bin;
+  // cued 的 WS 上行端口：既用于 Process 后端的启动参数，也用于产帧源拼
+  // `ws://127.0.0.1:<ws_port>/`（N-23）。默认 9000 与 PipelineEndpoint 一致。
+  int ws_port = 9000;
   bool transcode = false;
   int width = 0;
   int height = 0;
@@ -241,6 +274,10 @@ struct CaseOutcome {
   // 本 case 的注入 trace 路径（空 = 没有落 trace）。报告里按 case 列出，便于复核
   // "同 seed 两次 run 的丢包判定是否一致"——trace 是证据文件，不进 state 的判分口径。
   std::string inject_trace;
+  // 注入是否生效（N-23）：故障窗口的计数判定。checked=false = 该故障类没有自动判据
+  // （或无管线可读）。它不改 scored / score（"故障没发生"不是"模型答错"），
+  // 但会让整轮 run 不能以退出码 0 收场，见 RunReport::injection_ineffective。
+  InjectionCheck injection;
 };
 
 struct RunConfig {
@@ -259,6 +296,21 @@ struct RunConfig {
   // M7 / AC-16：非空 = 被测管线是一个实现了 REST 控制协议的 HTTP 服务（例如
   // apps/cue-mock-svc.cpp），而不是本机子进程。空 = 现有子进程路径，行为完全不变。
   std::string endpoint;
+  // ---- 产帧源（N-23）----
+  // 评测自备的合成源。为什么需要它：rate 类故障注入的是"发送速率上限"，令牌桶只有
+  // 源码率超过上限时才耗尽；外部推流脚本发的是 64×64 静止画面，经编码后码率极低，
+  // 于是 budget_drops 恒 0、故障不发生。开启后每个 case 由评测自己起 cue-capture
+  // （--backend lavfi：testsrc2 合成画面，真有 640×360@1200 kbps 的码率）。
+  //   producer = "none"（默认）→ 完全沿用旧行为：靠外部推流，不起任何额外进程
+  //   producer = "lavfi"        → 每个 case 在 cued 起来之后起一个 cue-capture，
+  //                               case 结束（成功/失败/run_error）时连同它的 ffmpeg
+  //                               子进程一起收掉
+  std::string producer = "none";
+  std::string producer_size = "640x360";  // WxH，宽高需为偶数（yuv420p）
+  int producer_bitrate = 1200;            // kbps
+  // cue-capture 二进制。与 cued_bin 一样是启动参数，不做"自动找同目录"——
+  // 找不到就是评测环境缺件，必须报 run_error 而不是猜一个路径。
+  std::string capture_bin = "./build/cue-capture";
   std::string model = "deepseek-chat";  // real 模式模型名
   double yuan_per_mtok = 2.0;           // 成本核算单价（估算，不是账单）
   // LLM 传输（SPEC §7.9）：replay = 只读 cassette（默认，零成本）；live = 真实网络。
@@ -370,6 +422,11 @@ struct RunReport {
   int executed = 0;   // 实际执行（含复用缓存）的 case 次数
   int scored = 0;
   int run_errors = 0;
+  // 「注入未生效」的 case 尝试数（N-23）。它与 run_error 是两件事，因此单独计数：
+  //  · 不进成功率分母，也不改该 case 的 scored/score（模型答得对不对与故障有没有发生无关）；
+  //  · 但它让整轮 run 不能以退出码 0 收场，报告/终端摘要各有一段显眼说明。
+  // 理由：带这种 case 的 run 证据链不成立（SLA 恒真），给绿灯就是把假通过当结论。
+  int injection_ineffective = 0;
   int io_errors = 0;  // state/报告写入失败次数（写失败必须非零退出）
   bool gated = false;      // 成本闸门触发
   bool truncated = false;  // 闸门/取消导致未跑完计划数

@@ -455,8 +455,37 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
   fs::remove_all(dir);
 }
 
+  // 12) 注入是否真的生效（N-23）：判据必须把「故障没发生」与「模型答错」分开。
+  // 重点是 rate 的 budget_drops=0：那正是"源码率低于注入上限、令牌桶没被抽干"的形态，
+  // 旧路径会把这种 case 判成 SLA 达标（fps 恒 30），这一层就是来堵这个假通过点的。
+  {
+    const auto rate_dead = eval::judge_injection("rate", 0, 0);
+    check(rate_dead.checked, "case12 rate 有自动判据");
+    check(!rate_dead.effective, "case12 rate budget_drops=0 → 注入未生效");
+    check(rate_dead.detail.find("budget_drops=0") != std::string::npos,
+          "case12 未生效说明里带出读数");
+
+    const auto rate_ok = eval::judge_injection("rate", 60, 0);
+    check(rate_ok.checked && rate_ok.effective, "case12 rate budget_drops=60 → 注入生效");
+
+    const auto drop_dead = eval::judge_injection("drop", 0, 0);
+    check(drop_dead.checked && !drop_dead.effective, "case12 drop injected=0 → 注入未生效");
+    const auto drop_ok = eval::judge_injection("drop", 0, 59);
+    check(drop_ok.checked && drop_ok.effective, "case12 drop injected=59 → 注入生效");
+    const auto ingress_ok = eval::judge_injection("ingress_drop", 0, 7);
+    check(ingress_ok.checked && ingress_ok.effective, "case12 ingress_drop injected=7 → 注入生效");
+
+    // backlog / delay / jitter 没有单一计数判据：必须明确"未判定"，不能硬凑一个结论
+    const auto backlog = eval::judge_injection("backlog", 0, 0);
+    check(!backlog.checked, "case12 backlog 不做自动判定");
+    check(backlog.detail.find("未做自动判定") != std::string::npos,
+          "case12 backlog 的说明写明未做自动判定");
+    const auto none = eval::judge_injection("none", 0, 0);
+    check(!none.checked && none.detail.empty(), "case12 none 类没有判定也无说明");
+  }
+
   if (failures == 0) {
-    std::printf("test_eval: OK (11 groups)\n");
+    std::printf("test_eval: OK (12 groups)\n");
     return 0;
   }
   std::printf("test_eval: %d failure(s)\n", failures);

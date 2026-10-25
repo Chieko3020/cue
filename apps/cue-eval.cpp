@@ -351,6 +351,37 @@ int main(int argc, char** argv) {
     return do_diff(diff_a, diff_b, cfg.out_dir);
   }
 
+  // ---- 产帧源（N-23）----
+  // --gen / --diff 不开 case，产帧源在这两种模式下是空操作（忽略，不报错）。
+  // 其余情况：--producer 只对 Process 后端有意义，HTTP 端点与工具回放都不起进程，
+  // 给它们一个产帧源既没有 WS 目标、又会把「没人推流」伪装成正常结果——
+  // 所以这里在启动时就明确拒绝，而不是忽略 + 打日志（后者只能靠人去看日志才发现）。
+  if (cfg.producer != "none" && !cfg.producer.empty()) {
+    if (!cfg.endpoint.empty()) {
+      std::fprintf(stderr, "--producer 只对本机子进程后端有意义，不能与 --endpoint 同用\n");
+      return 2;
+    }
+    if (!cfg.replay_tools_dir.empty()) {
+      std::fprintf(stderr, "--producer 只对本机子进程后端有意义，不能与 --replay-tools 同用\n");
+      return 2;
+    }
+    if (cfg.agent_mode == "scripted" && cfg.record_tools_dir.empty()) {
+      std::fprintf(stderr,
+                   "--producer %s 需要 Process 后端：--mode scripted 不带 --record-tools 时"
+                   "不起管线，也就没人消费产帧源（加 --record-tools 或改用 --mode real）\n",
+                   cfg.producer.c_str());
+      return 2;
+    }
+    std::error_code cap_ec;
+    if (!std::filesystem::is_regular_file(cfg.capture_bin, cap_ec)) {
+      // 不在这里退出：按 case 记 run_error=producer_start_failed 才有报告可查，
+      // 但先大声提醒一句，免得 33 个 case 全红才发现路径写错。
+      cue::log::warn("cli", "capture_missing",
+                     "产帧源 " + cfg.capture_bin + " 不存在：每个 case 都会记 "
+                     "run_error=producer_start_failed（先构建 cue-capture）");
+    }
+  }
+
   // AC-6：工具观测的录制/回放互斥；回放时没有要连的后端，与 --endpoint 同给会让
   // 「回放的是哪份观测」变得不可解释。
   if (!cfg.record_tools_dir.empty() && !cfg.replay_tools_dir.empty()) {
@@ -476,7 +507,11 @@ int main(int argc, char** argv) {
   }
   cue::log::info("eval", "run_start",
                  "suite=" + cfg.suite_path + " cases=" + std::to_string(cases->size()) +
-                     " mode=" + cfg.agent_mode + " repeat=" + std::to_string(cfg.repeat));
+                     " mode=" + cfg.agent_mode + " repeat=" + std::to_string(cfg.repeat) +
+                     (cfg.producer == "none" || cfg.producer.empty()
+                          ? std::string()
+                          : " producer=" + cfg.producer + "(" + cfg.producer_size + "@" +
+                                std::to_string(cfg.producer_bitrate) + "kbps)"));
   if (cfg.agent_mode == "real") {
     cue::log::info("eval", "llm_transport",
                    "LLM=" + cfg.llm_mode + " cassette=" + cfg.cassette_dir +
@@ -582,9 +617,12 @@ int main(int argc, char** argv) {
   if (report.scored == 0) return 1;
   // 截断（成本闸门/取消）不是"全过"：剩余 case 没跑，CI 不能绿灯
   if (report.truncated) return 1;
-  // 退出码必须覆盖三级成功率与 pass^k：只看 root/evidence 时 SLA 全灭也会返回 0（假绿灯）
-  return (report.run_errors == 0 && report.root_rate >= 1.0 && report.evidence_rate >= 1.0 &&
-          report.sla_rate >= 1.0 && report.pass_k >= 1.0)
+  // 退出码必须覆盖三级成功率与 pass^k：只看 root/evidence 时 SLA 全灭也会返回 0（假绿灯）。
+  // 「注入未生效」（N-23）同样不能给 0：那些 case 的 SLA 是恒真的，混进 100% 通过
+  // 就是假通过。它不进成功率分母（不是模型答错），但让本次 run 不是绿灯。
+  return (report.run_errors == 0 && report.injection_ineffective == 0 &&
+          report.root_rate >= 1.0 && report.evidence_rate >= 1.0 && report.sla_rate >= 1.0 &&
+          report.pass_k >= 1.0)
              ? 0
              : 1;
 }

@@ -47,6 +47,33 @@ double atof_or(std::string_view s, double fallback) {
   return std::atof(tmp.c_str());
 }
 
+// 产帧源尺寸（N-23）：「WxH」两个正整数，且必须是偶数——yuv420p 不能有奇数宽高，
+// cue-capture 自己也会拒（apps/cue-capture.cpp:431）。这里提前拒是为了报在命令行/
+// 配置行上，而不是等到每个 case 都吃一次 run_error。
+std::expected<void, std::string> parse_producer_size(std::string_view v) {
+  const auto x = v.find_first_of("xX");
+  if (x == std::string_view::npos || x == 0 || x + 1 >= v.size()) {
+    return std::unexpected("尺寸要写成 WxH（例如 640x360），收到：" + std::string(v));
+  }
+  const std::string ws(v.substr(0, x));
+  const std::string hs(v.substr(x + 1));
+  auto is_digits = [](const std::string& t) {
+    return !t.empty() && t.find_first_not_of("0123456789") == std::string::npos;
+  };
+  if (!is_digits(ws) || !is_digits(hs)) {
+    return std::unexpected("尺寸要写成 WxH（例如 640x360），收到：" + std::string(v));
+  }
+  const int w = std::atoi(ws.c_str());
+  const int h = std::atoi(hs.c_str());
+  if (w < 16 || h < 16 || w > 3840 || h > 2160) {
+    return std::unexpected("尺寸超出范围（16..3840 × 16..2160），收到：" + std::string(v));
+  }
+  if (w % 2 != 0 || h % 2 != 0) {
+    return std::unexpected("宽高必须是偶数（yuv420p 的要求），收到：" + std::string(v));
+  }
+  return {};
+}
+
 // ---- 配置文件里的 eval 段 ----
 
 std::expected<void, config::Error> apply_eval_config(const config::Doc& doc, EvalOptions& o) {
@@ -55,7 +82,9 @@ std::expected<void, config::Error> apply_eval_config(const config::Doc& doc, Eva
       "out_dir",      "warmup_s",        "cued_bin",     "probe_bin",
       "endpoint",     "model",           "yuan_per_mtok", "llm_mode",
       "cassette_dir", "record",          "record_tools_dir",
-      "replay_tools_dir", "sla_settle_ms"};
+      "replay_tools_dir", "sla_settle_ms",
+      // 产帧源（N-23）
+      "producer",     "producer_size",   "producer_bitrate", "capture_bin"};
   if (auto ok = doc.reject_unknown_keys("eval", kKnown); !ok) return std::unexpected(ok.error());
 
   auto& cfg = o.cfg;
@@ -162,6 +191,33 @@ std::expected<void, config::Error> apply_eval_config(const config::Doc& doc, Eva
     if (!v) return std::unexpected(v.error());
     cfg.sla_settle_ms = static_cast<int>(*v);
   }
+  // ---- 产帧源（N-23）----
+  if (doc.contains("eval.producer")) {
+    static constexpr std::string_view kProducers[] = {"none", "lavfi"};
+    auto v = doc.get_enum("eval.producer", kProducers);
+    if (!v) return std::unexpected(v.error());
+    cfg.producer = *v;
+  }
+  if (doc.contains("eval.producer_size")) {
+    auto v = doc.get_string("eval.producer_size");
+    if (!v) return std::unexpected(v.error());
+    auto sz = parse_producer_size(*v);
+    if (!sz) return std::unexpected(doc.error("eval.producer_size", sz.error()));
+    cfg.producer_size = *v;
+  }
+  if (doc.contains("eval.producer_bitrate")) {
+    auto v = doc.get_int("eval.producer_bitrate", 1, 200000);
+    if (!v) return std::unexpected(v.error());
+    cfg.producer_bitrate = static_cast<int>(*v);
+  }
+  if (doc.contains("eval.capture_bin")) {
+    auto v = doc.get_string("eval.capture_bin");
+    if (!v) return std::unexpected(v.error());
+    // 不在这里判"文件存在"：找不到要按 case 记 run_error=producer_start_failed
+    // （静默退回"无流"才是这个项目最不能接受的假绿灯），启动期拒掉就没有报告可查了。
+    cfg.capture_bin = *v;
+  }
+
   // 配置文件自身内部的互斥项：在行号还能对上原文时先拒（FR-OBS.5 要的是行号）。
   if (auto ok = doc.forbid_together("eval.record_tools_dir", "eval.replay_tools_dir"); !ok) {
     return std::unexpected(ok.error());
@@ -197,6 +253,17 @@ void print_eval_usage() {
       "  --probe path    cue-probe 二进制（默认与 --cued 同目录的 cue-probe）。探针由\n"
       "                  harness 托管：起不来/没有样本时该 case 记 run_error=probe_unavailable，\n"
       "                  端到端 SLA 绝不退回 cued 指标判分。\n"
+      "  --producer none|lavfi  产帧源（默认 none = 靠外部推流，行为与以前完全一致）。\n"
+      "                 lavfi：每个 case 在 cued 起来之后由评测自己起 cue-capture\n"
+      "                 （testsrc2 合成源，真有码率），case 结束连同它的 ffmpeg 一起收掉。\n"
+      "                 为什么需要它：rate 类故障注入的是发送速率上限，源码率低于上限时\n"
+      "                 令牌桶永不耗尽（budget_drops=0、fps 30），故障根本不发生。\n"
+      "                 起不来/找不到时该 case 记 run_error=producer_start_failed，\n"
+      "                 绝不会静默变成「无流」。只对 Process 后端有效（不能与 --endpoint /\n"
+      "                 --replay-tools 同用）。\n"
+      "  --producer-size WxH    合成源尺寸（默认 640x360，宽高须为偶数）。\n"
+      "  --producer-bitrate K   合成源码率 kbps（默认 1200）。\n"
+      "  --capture BIN          cue-capture 二进制（默认 ./build/cue-capture）。\n"
       "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
       "  real 模式的 LLM 传输默认 replay：只读 cassette，零成本；缺录制直接报错\n"
       "  （run_error=cassette_miss，不静默走网络）。--live 才用真实网络（需 CUE_API_KEY /\n"
@@ -207,7 +274,7 @@ void print_eval_usage() {
       "  --log-file PATH / --log-level LEVEL / --log-text / --log-json：结构化日志开关\n"
       "                  （默认 JSON-line 写 stderr；--log-file 额外写轮转文件）。\n"
       "\n"
-      "  退出码：0 全过 / 1 有未通过 / 2 用法或无法产出 / 3 diff 不可比 /\n"
+      "  退出码：0 全过 / 1 有未通过（含「注入未生效」）/ 2 用法或无法产出 / 3 diff 不可比 /\n"
       "          4 diff case 集变动 / 5 写入失败 / 130 被取消\n");
 }
 
@@ -291,6 +358,33 @@ std::expected<EvalOptions, config::Error> parse_eval_options(int argc, char** ar
       if (!take_value(argc, argv, i, cfg.cued_bin)) return std::unexpected(cli_error("--cued 缺少取值"));
     } else if (name == "--probe") {
       if (!take_value(argc, argv, i, cfg.probe_bin)) return std::unexpected(cli_error("--probe 缺少取值"));
+    } else if (name == "--producer") {
+      if (!take_value(argc, argv, i, cfg.producer)) {
+        return std::unexpected(cli_error("--producer 缺少取值"));
+      }
+      if (cfg.producer != "none" && cfg.producer != "lavfi") {
+        return std::unexpected(cli_error("--producer 只能是 none 或 lavfi（收到：" + cfg.producer +
+                                         "）"));
+      }
+    } else if (name == "--producer-size") {
+      if (!take_value(argc, argv, i, v)) {
+        return std::unexpected(cli_error("--producer-size 缺少取值"));
+      }
+      if (auto ok = parse_producer_size(v); !ok) return std::unexpected(cli_error(ok.error()));
+      cfg.producer_size = v;
+    } else if (name == "--producer-bitrate") {
+      if (!take_value(argc, argv, i, v)) {
+        return std::unexpected(cli_error("--producer-bitrate 缺少取值"));
+      }
+      const int kbps = std::atoi(v.c_str());
+      if (kbps <= 0) {
+        return std::unexpected(cli_error("--producer-bitrate 只接受正整数 kbps（收到：" + v + "）"));
+      }
+      cfg.producer_bitrate = kbps;
+    } else if (name == "--capture") {
+      if (!take_value(argc, argv, i, cfg.capture_bin)) {
+        return std::unexpected(cli_error("--capture 缺少取值"));
+      }
     } else if (name == "--endpoint") {
       if (!take_value(argc, argv, i, cfg.endpoint)) {
         return std::unexpected(cli_error("--endpoint 缺少取值"));

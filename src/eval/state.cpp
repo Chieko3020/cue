@@ -248,6 +248,15 @@ json outcome_to_json(const CaseOutcome& o) {
               // 注入 trace 的落点（空串 = 本 case 不落 trace）。续跑复用缓存时要能
               // 从 state 里读回来，报告才列得出"这次 run 的 trace 在哪"。
               {"inject_trace", o.inject_trace},
+              // 注入是否真的生效（N-23）：续跑复用缓存时这个判定必须一起回来，
+              // 否则 resume 出来的 run 会把"注入未生效"悄悄洗掉。
+              {"injection",
+               {{"fault_kind", o.injection.fault_kind},
+                {"checked", o.injection.checked},
+                {"effective", o.injection.effective},
+                {"budget_drops", o.injection.budget_drops},
+                {"injected", o.injection.injected},
+                {"detail", o.injection.detail}}},
               {"observations", observations_to_json(o.observations)}};
 }
 
@@ -310,6 +319,20 @@ std::expected<CaseOutcome, std::string> outcome_from_json(const json& j) {
     read_u64("cassette_misses", o.cassette_misses);
     if (j.contains("inject_trace") && j["inject_trace"].is_string()) {
       o.inject_trace = j["inject_trace"].get<std::string>();
+    }
+    // 旧 state 没有 injection 段：缺省 = 未判定（checked=false），不能补成"生效"。
+    if (j.contains("injection") && j["injection"].is_object()) {
+      const auto& inj = j["injection"];
+      if (inj.contains("fault_kind") && inj["fault_kind"].is_string()) {
+        o.injection.fault_kind = inj["fault_kind"].get<std::string>();
+      }
+      o.injection.checked = inj.value("checked", false);
+      o.injection.effective = inj.value("effective", false);
+      o.injection.budget_drops = inj.value("budget_drops", uint64_t{0});
+      o.injection.injected = inj.value("injected", uint64_t{0});
+      if (inj.contains("detail") && inj["detail"].is_string()) {
+        o.injection.detail = inj["detail"].get<std::string>();
+      }
     }
     if (j.contains("metrics")) {
       std::string merr;

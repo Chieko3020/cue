@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -18,6 +21,11 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "cue/common/clock.h"
 #include "cue/common/sha256.h"
@@ -31,6 +39,40 @@
 namespace cue::eval {
 
 bool has_value(double v) { return !std::isnan(v); }
+
+// 「注入是否真的生效」（N-23）：判据只取三种有明确单一计数的故障类，别的类不做自动
+// 判定（见 eval.h 里 InjectionCheck 的注释）。detail 是可以直接贴进报告的一句话，
+// 带上读数与原因，读者不必回头翻 metrics。
+InjectionCheck judge_injection(const std::string& fault_kind, uint64_t budget_drops,
+                               uint64_t injected) {
+  InjectionCheck out;
+  out.fault_kind = fault_kind;
+  out.budget_drops = budget_drops;
+  out.injected = injected;
+  if (fault_kind == "rate") {
+    out.checked = true;
+    out.effective = budget_drops > 0;
+    out.detail = out.effective
+                     ? "rate 注入生效：budget_drops=" + std::to_string(budget_drops)
+                     : "rate 注入未生效：budget_drops=0（源码率低于注入上限，令牌桶没被抽干）";
+    return out;
+  }
+  if (fault_kind == "drop" || fault_kind == "ingress_drop") {
+    out.checked = true;
+    out.effective = injected > 0;
+    out.detail = out.effective ? fault_kind + " 注入生效：injected=" + std::to_string(injected)
+                               : fault_kind + " 注入未生效：injected=0（没有包被注入吃掉）";
+    return out;
+  }
+  // backlog / delay / jitter / none：没有单一计数能判"注入了没有"，明确不判，
+  // 报告里写「未做自动判定」——硬凑一个判据只会制造新的假结论。
+  out.checked = false;
+  out.effective = false;
+  if (!fault_kind.empty() && fault_kind != "none") {
+    out.detail = fault_kind + " 未做自动判定（该故障类没有单一计数判据）";
+  }
+  return out;
+}
 
 namespace {
 
@@ -804,6 +846,241 @@ std::string cassette_dir_hash(const std::string& dir) {
   return cue::sha256_hex(acc);
 }
 
+// 读日志尾部（产帧源起不来时把它的最后几句话塞进 run_error）：
+// 只读最后 max_bytes 字节，避免一个大日志被整份读进内存。
+std::string read_log_tail(const std::string& path, std::size_t max_bytes) {
+  if (path.empty()) return {};
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(path, ec);
+  if (ec) return {};
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return {};
+  const std::uintmax_t begin = size > max_bytes ? size - max_bytes : 0;
+  in.seekg(static_cast<std::streamoff>(begin));
+  std::string out((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+  return out;
+}
+
+// ---------------------------------------------------------------- 产帧源（N-23）
+//
+// 为什么评测要自己起源：rate 类注入是「发送速率上限」，令牌桶只有在源码率**超过**
+// 上限时才会耗尽。旧的产帧源 `scripts/test-client.mjs` 每帧发同一个 64×64 内嵌 IDR
+// （约 677 B），30 fps 合计远低于 0.1 Mbps（12.5 kB/s）——budget_drops 恒 0、
+// frames_in == frames_out、fps 30，故障根本没发生，SLA 却判达标。
+//
+// 这里起的是 `cue-capture --backend lavfi`（testsrc2 合成画面），参数形式与
+// `scripts/run.sh:161-166` 起采集端时一致，只有 WS 目标端口来自本 case 的 cued。
+// 默认（--producer none）一个进程都不起，命令与环境与改动前完全一致。
+//
+// 生命周期（谁起谁收，顺序不能反）：
+//   cued 起来（pipe->start 成功）→ 起 cue-capture → warmup 等流 → 跑 case
+//   → 收 cue-capture（连同它的 ffmpeg 子进程）→ 收 cued
+// 先收 cued 的话采集端会疯狂重连、日志刷屏，还可能留下一个仍在跑的 ffmpeg。
+//
+// 为什么不做"采集端挂了自动重拉"：Process 后端的注入（fault.set）与档位
+// （param.set 的 bitrate/gop/preset/transcode）都是热生效，一个 case 内 cued
+// 不会重启；会重启的只有崩溃，而崩溃本身就该让该 case 以无流/重测无采样显式失败
+// （cue-capture 在 WS 断开时自己退出，不会留下一个"看起来还在跑"的假源）。
+// 加一个后台重拉线程反而会在这种时候把"管线崩了"变成"流又回来了"，掩盖真问题。
+class Producer {
+ public:
+  Producer() = default;
+  ~Producer() { stop(); }
+  Producer(const Producer&) = delete;
+  Producer& operator=(const Producer&) = delete;
+
+  // 起进程并确认它真的活着（fork 后 1.5 s 内退出 = 起不来，必须报 run_error，
+  // 否则会静默变成"无流"→ warmup 失败 → 更糟的是被读成"SLA 恒真"）。
+  bool start(const RunConfig& cfg, int ws_port, int fps, const std::string& case_id,
+             const std::string& run_dir, std::string& err);
+  void stop();
+  const std::string& command() const { return command_; }
+
+ private:
+  pid_t pid_ = -1;
+  std::string command_;
+  std::string log_path_;
+};
+
+bool Producer::start(const RunConfig& cfg, int ws_port, int fps, const std::string& case_id,
+                     const std::string& run_dir, std::string& err) {
+  stop();
+  if (cfg.capture_bin.empty()) {
+    err = "--capture 为空";
+    return false;
+  }
+  std::error_code fec;
+  if (!std::filesystem::is_regular_file(cfg.capture_bin, fec)) {
+    err = "找不到 " + cfg.capture_bin + "（需先构建 cue-capture，或用 --capture 指路径）";
+    return false;
+  }
+  std::vector<std::string> args{
+      cfg.capture_bin,
+      "--backend", "lavfi",
+      "--size", cfg.producer_size,
+      "--bitrate", std::to_string(cfg.producer_bitrate),
+      "--fps", std::to_string(fps),
+      "--audio", "off",
+      "--duration", "0",
+      "--ws", "ws://127.0.0.1:" + std::to_string(ws_port) + "/",
+  };
+  command_.clear();
+  for (std::size_t i = 0; i < args.size(); ++i) command_ += (i == 0 ? "" : " ") + args[i];
+
+  // 采集端的输出落到 run 目录的 producer.log（不进 git）：它起不来时的原因几乎只在
+  // 自己的 stderr 里（例如 ffmpeg 缺失），吞掉就成了"报了个 run_error 但不知道为什么"。
+  int out_fd = -1;
+  log_path_.clear();
+  if (!run_dir.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(run_dir, ec);
+    log_path_ = run_dir + "/producer.log";
+    out_fd = ::open(log_path_.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+    if (out_fd >= 0) {
+      const std::string head = "\n=== " + case_id + " " + command_ + "\n";
+      const ssize_t ignored = ::write(out_fd, head.data(), head.size());
+      (void)ignored;
+    }
+  }
+  if (out_fd < 0) out_fd = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+
+  int hs[2];
+  if (::pipe2(hs, O_CLOEXEC) != 0) {
+    err = std::string("pipe2: ") + std::strerror(errno);
+    if (out_fd >= 0) ::close(out_fd);
+    return false;
+  }
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+  argv.push_back(nullptr);
+
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    err = std::string("fork: ") + std::strerror(errno);
+    ::close(hs[0]);
+    ::close(hs[1]);
+    if (out_fd >= 0) ::close(out_fd);
+    return false;
+  }
+  if (pid == 0) {
+    // 自成进程组：收的时候 kill(-pid) 一次连它拉起的 ffmpeg 一起收（不留孤儿）。
+    ::setpgid(0, 0);
+    ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (::getppid() == 1) _exit(127);
+    if (out_fd >= 0) {
+      ::dup2(out_fd, STDOUT_FILENO);
+      ::dup2(out_fd, STDERR_FILENO);
+      if (out_fd > STDERR_FILENO) ::close(out_fd);
+    }
+    // 把父进程的其它 fd 全部打上 CLOEXEC：不这样做，采集端会白持有 cued 控制通道、
+    // probe 管道之类的 fd，harness 侧的 EOF/关闭语义就变得莫名其妙。
+    // 与 src/pipeline/process_control.cpp 的 mark_inherited_fds_cloexec 同一做法。
+    long maxfd = ::sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+    for (int fd = 3; fd < static_cast<int>(maxfd); ++fd) {
+      (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    ::execv(argv[0], argv.data());
+    const int exec_errno = errno;
+    const ssize_t ignored = ::write(hs[1], &exec_errno, sizeof(exec_errno));
+    (void)ignored;
+    _exit(127);
+  }
+  ::close(hs[1]);
+  if (out_fd >= 0) ::close(out_fd);
+
+  // exec 结果：成功时子进程的 hs[1] 被 CLOEXEC 关掉 → read 返回 0；
+  // 失败时子进程把 errno 写回来（"假装起来了"是评测里最贵的错误之一）。
+  int child_errno = 0;
+  ssize_t hn = 0;
+  do {
+    hn = ::read(hs[0], &child_errno, sizeof(child_errno));
+  } while (hn < 0 && errno == EINTR);
+  ::close(hs[0]);
+  if (hn == static_cast<ssize_t>(sizeof(child_errno))) {
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    err = "exec " + cfg.capture_bin + ": " + std::strerror(child_errno);
+    return false;
+  }
+
+  // 起来就退（典型：ffmpeg 不在、lavfi 参数被拒）也算起不来。1.5 s 覆盖 ffmpeg
+  // 进程创建 + 编码器初始化（实测 0.3–0.5 s）与首次 WS 连接。
+  for (int i = 0; i < 15; ++i) {
+    int status = 0;
+    const pid_t w = ::waitpid(pid, &status, WNOHANG);
+    if (w == pid) {
+      const std::string tail = read_log_tail(log_path_, 600);
+      err = "'" + command_ + "' 起来后立刻退出（" +
+            (WIFSIGNALED(status) ? "signal=" + std::to_string(WTERMSIG(status))
+                                 : "exit=" + std::to_string(WEXITSTATUS(status))) +
+            "）" + (tail.empty() ? std::string() : "；它会话日志尾部：" + tail);
+      return false;
+    }
+    if (w < 0 && errno == ECHILD) {
+      err = "无法回收产帧源进程（waitpid: " + std::string(std::strerror(errno)) + "）";
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  pid_ = pid;
+  return true;
+}
+
+void Producer::stop() {
+  if (pid_ <= 0) return;
+  // 先整组 SIGTERM（cue-capture 自己也会收 ffmpeg，这里是兜底）：
+  // 进程组是产帧源的，所以 kill(-pid) 不会波及 cued / probe。
+  ::kill(-pid_, SIGTERM);
+  ::kill(pid_, SIGTERM);
+  bool reaped = false;
+  for (int i = 0; i < 50; ++i) {  // 最多 5 s；它有 1 s 的 ffmpeg 收尾窗口
+    int status = 0;
+    const pid_t w = ::waitpid(pid_, &status, WNOHANG);
+    if (w == pid_ || (w < 0 && errno == ECHILD)) {
+      reaped = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (!reaped) {
+    ::kill(-pid_, SIGKILL);
+    ::kill(pid_, SIGKILL);
+    int status = 0;
+    while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  pid_ = -1;
+}
+
+// 起产帧源（N-23）：只在 Process 后端且 producer=lavfi 时生效。
+// 返回值语义：nullptr + err 为空 = 本次不需要产帧源（默认）；nullptr + err 非空 =
+// 需要但起不来（调用方记 run_error=producer_start_failed）。
+// HTTP / 录制回放后端没有可推流的本机 cued，给了 --producer 也只能报错：
+// 静默忽略会让"SLA 恒真"以另一种形式回来（没人推流，case 却按达标收场）。
+std::unique_ptr<Producer> start_producer_if_needed(const RunConfig& cfg, const Case& c,
+                                                   const PipelineConfig& pc, bool process_backend,
+                                                   int fps, const std::string& run_dir,
+                                                   std::string& err) {
+  if (cfg.producer == "none") return nullptr;
+  if (!process_backend) {
+    err = "--producer " + cfg.producer + " 只对本机子进程后端（Process）有意义；"
+          "HTTP 端点与工具回放不起进程，也就没有可推流的目标";
+    return nullptr;
+  }
+  std::string perr;
+  auto prod = std::make_unique<Producer>();
+  if (!prod->start(cfg, pc.ws_port, fps, c.id, run_dir, perr)) {
+    err = perr;
+    return nullptr;
+  }
+  std::fprintf(stderr, "[eval][%s] 产帧源已起：%s\n", c.id.c_str(), prod->command().c_str());
+  return prod;
+}
+
 }  // namespace
 
 std::string Engine::config_hash() const {
@@ -826,10 +1103,18 @@ std::string Engine::config_hash() const {
   const std::string tools_hash =
       cfg_.replay_tools_dir.empty() ? std::string()
                                     : "|replay_tools=" + cassette_dir_hash(cfg_.replay_tools_dir);
+  // 产帧源（N-23）：换了源，同一 case 的 metrics 完全不同，缓存必须失效。
+  // 只在启用时进指纹——默认（none）的指纹必须与改动前逐字节一致，否则既有
+  // runs/ 的续跑缓存会整体作废。
+  const std::string producer_hash =
+      (cfg_.producer == "none" || cfg_.producer.empty())
+          ? std::string()
+          : "|producer=" + cfg_.producer + ":" + cfg_.producer_size + "@" +
+                std::to_string(cfg_.producer_bitrate);
   return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
                          "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
                          fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s) +
-                         llm_hash + ep_hash + tools_hash);
+                         llm_hash + ep_hash + tools_hash + producer_hash);
 }
 
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg, const std::string& run_dir) {
@@ -933,6 +1218,8 @@ pipeline::PipelineEndpoint to_endpoint(const PipelineConfig& pc) {
   pipeline::PipelineEndpoint out;
   out.kind = pipeline::PipelineEndpoint::Kind::Process;
   out.cued_bin = pc.cued_bin;
+  // 产帧源（N-23）要按这个端口拼 ws://127.0.0.1:<port>/，必须与 cued 的监听一致。
+  out.ws_port = pc.ws_port;
   out.probe_bin = pc.probe_bin;
   out.inject_drop = pc.inject_drop;
   out.inject_ingress_drop = pc.inject_ingress_drop;
@@ -1235,6 +1522,12 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   }
   CaseOutcome o;
   o.id = c.id;
+  // 注入有效性（N-23）：这条自检路径不起管线，注入只是 case 里的声明，没有可判的读数。
+  // 明确写"未判定"而不是补一个结论——观测是构造的，任何"生效/未生效"都会是假读数。
+  o.injection.fault_kind = c.fault_kind;
+  if (c.fault_kind != "none") {
+    o.injection.detail = "scripted 自检不起管线，没有注入读数（要判注入是否生效需 --record-tools 或 --producer）";
+  }
   std::vector<Observation> obs;
   Observation ob;
   ob.tool = "query_metrics";
@@ -1317,6 +1610,8 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   CaseOutcome o;
   o.id = c.id;
   o.final_stage = "n/a";
+  // 故障类先记下：run_error 早退时报告也要能列出"这条注入类 case 判没判"。
+  o.injection.fault_kind = c.fault_kind;
 
   const bool replay_tools = !cfg_.replay_tools_dir.empty();
   const bool record_tools = !cfg_.record_tools_dir.empty();
@@ -1411,6 +1706,25 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
       return o;
     }
   }
+  // 产帧源（N-23）：cued 起来之后再起采集端（与 scripts/run.sh 的顺序一致）。
+  // 起不来必须记 run_error：静默"无流"会让 SLA 变成恒真的假绿灯。
+  std::unique_ptr<Producer> producer;
+  {
+    std::string perr;
+    producer = start_producer_if_needed(cfg_, c, pcfg, !http && !replay_tools,
+                                        /*fps=*/30, run_dir_, perr);
+    if (producer == nullptr && !perr.empty()) {
+      o.error_kind = "producer_start_failed: " + perr;
+      return o;
+    }
+  }
+  // 析构顺序 = 声明的逆序：先收产帧源，再收管线（StopGuard 在上面、先声明，故后析构）。
+  struct ProducerGuard {
+    Producer* p;
+    ~ProducerGuard() {
+      if (p != nullptr) p->stop();
+    }
+  } prod_guard{producer.get()};
 
   // 等媒体流。终止条件只看 latest() 的返回值（不按墙上时间），回放时同一串录制值会
   // 走出一模一样的循环次数——这就是「同一份观测」的前提。
@@ -1507,6 +1821,16 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   // 故障窗口的端到端读数：注入后、修复前取一次探针快照。调用点是固定的（不按时间/
   // 不按数值决定是否调用），所以录制与回放消费同一条记录，窗口口径可复现。
   const ProbeSummary fault_probe = to_probe_summary(pipe->probe_latest());
+  // 「注入是否真的生效」（N-23）：同一时刻取一次 cued 侧计数快照，判 rate/drop/
+  // ingress_drop 的故障有没有真的发生。取在故障窗口内、修复动作之前，读数就是
+  // 该窗口的累计值（cued 每 case 重启，计数器从 0 起）。
+  {
+    const auto fm = pipe->latest();
+    o.injection = judge_injection(c.fault_kind, fm.budget_drops, fm.injected);
+    if (o.injection.checked) {
+      std::fprintf(stderr, "[eval][%s] %s\n", c.id.c_str(), o.injection.detail.c_str());
+    }
+  }
 
   // 观测：真调 query_metrics（content 是 "metrics={...}" 原文）
   const auto q = reg.call("query_metrics", json::object());
@@ -1714,6 +2038,8 @@ CaseOutcome Engine::run_real_case(const Case& c) const {
   CaseOutcome o;
   o.id = c.id;
   o.final_stage = "n/a";
+  // 故障类先记下：run_error 早退时报告也要能列出"这条注入类 case 判没判"。
+  o.injection.fault_kind = c.fault_kind;
   try {
     run_real_case_impl(c, o);
   } catch (const std::exception& e) {
@@ -1844,6 +2170,24 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     }
   }
   const int64_t t_inject_us = now_us();
+  // 产帧源（N-23）：cued 起来之后起采集端。Process 后端才有意义（--endpoint /
+  // 回放没有可推流的目标，CLI 也已在启动时拒绝这种组合）。
+  std::unique_ptr<Producer> producer;
+  {
+    std::string perr;
+    producer = start_producer_if_needed(cfg_, c, pcfg, cfg_.endpoint.empty() && !replay_tools,
+                                        /*fps=*/30, run_dir_, perr);
+    if (producer == nullptr && !perr.empty()) {
+      o.error_kind = "producer_start_failed: " + perr;
+      return;
+    }
+  }
+  struct ProducerGuard {
+    Producer* p;
+    ~ProducerGuard() {
+      if (p != nullptr) p->stop();
+    }
+  } prod_guard{producer.get()};
   std::unique_ptr<MetricMonitor> mon;
   if (!deterministic_tools) {
     mon = std::make_unique<MetricMonitor>(*pipe, 500);
@@ -1895,6 +2239,13 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     }
     std::fprintf(stderr, "[eval][%s] warmup 完成：samples=%llu fps=%.1f\n", c.id.c_str(),
                  static_cast<unsigned long long>(m.samples), m.fps);
+    // 「注入是否真的生效」（N-23）：故障窗口（注入后、修复前）的 cued 侧计数快照。
+    // 取在 warmup 之后、agent 动手之前：此时计数器已经覆盖了至少一个完整窗口，
+    // 又不会被 agent 的修复动作影响。rate 判 budget_drops、drop/ingress_drop 判 injected。
+    o.injection = judge_injection(c.fault_kind, m.budget_drops, m.injected);
+    if (o.injection.checked) {
+      std::fprintf(stderr, "[eval][%s] %s\n", c.id.c_str(), o.injection.detail.c_str());
+    }
   }
 
   // 3) 工具（每个返回都留痕，证据校验只认真实观测）
@@ -2303,6 +2654,13 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
     if (o.score.root) ++r.root_rate;
     if (o.score.evidence) ++r.evidence_rate;
     if (o.score.sla) ++r.sla_rate;
+    // 「注入未生效」（N-23）：单独计数，不进成功率分母、也不改 scored —— 故障有没有
+    // 发生与模型答得对不对是两件事。但它进 run_notes，并在报告里有独立小节：
+    // 这种 case 的 SLA 是恒真的，不能让它悄悄混进"100% 通过"。
+    if (o.injection.checked && !o.injection.effective) {
+      ++r.injection_ineffective;
+      r.run_notes.push_back("注入未生效：" + o.id + " — " + o.injection.detail);
+    }
     if (has_value(o.mttr_s)) {
       r.mttr_avg_s = has_value(r.mttr_avg_s) ? r.mttr_avg_s + o.mttr_s : o.mttr_s;
     }
@@ -2518,6 +2876,11 @@ std::string Engine::render_markdown(const RunReport& r) const {
     }
     o << "\n";
   }
+  if (cfg_.producer != "none" && !cfg_.producer.empty()) {
+    // 产帧源（N-23）：不写清楚是哪个源，rate 类 case 的 budget_drops 就看不出可不可信。
+    o << "- 产帧源: `" << cfg_.producer << "`（" << cfg_.capture_bin << " --backend " << cfg_.producer
+      << "，" << cfg_.producer_size << "@" << cfg_.producer_bitrate << " kbps，30 fps）\n";
+  }
   o << "- 用例: 计划 " << r.planned << "，执行 " << r.executed << "，计分 " << r.scored
     << "，运行失败 " << r.run_errors << "\n";
   o << "- 成本: ¥" << r.cost_yuan << "\n\n";
@@ -2650,6 +3013,47 @@ std::string Engine::render_markdown(const RunReport& r) const {
       << num_text(c.metrics.decode.p99) << " | " << num_text(c.metrics.op.p99) << " | "
       << c.metrics.samples << " |\n";
   }
+  // 注入有效性（N-23）：故障有没有真的发生。放在逐用例之后、失败模式之前——
+  // 它回答的是"这次 run 的证据链成不成立"，比"模型答错了哪一类"更靠前。
+  //
+  // 为什么单独一节而不是塞进逐用例表：一张表里同时有 ✓/✗/— 三种语义会读错；
+  // 而且"故障没发生"与"模型答错"是两件事，混在一起会让失败率失去含义。
+  {
+    std::vector<const CaseOutcome*> inj;
+    for (const auto& c : r.cases) {
+      if (!c.injection.fault_kind.empty() && c.injection.fault_kind != "none") inj.push_back(&c);
+    }
+    if (!inj.empty()) {
+      o << "\n## 注入有效性（故障有没有真的发生）\n\n";
+      o << "> 口径：`rate` 判 `budget_drops > 0`（令牌桶被抽干），`drop` / `ingress_drop` 判 "
+           "`injected > 0`（真的有包被注入吃掉）；`backlog` / `delay` / `jitter` 没有单一计数"
+           "判据，**未做自动判定**。注入未生效的 case 不改它的 scored 与三级判定（故障有没有"
+           "发生与模型答得对不对是两件事，不进成功率分母），但整轮 run 不会以退出码 0 收场："
+           "这种 case 的 SLA 是恒真的，给绿灯等于把假通过当结论。\n\n";
+      o << "| case | 故障类 | 判定 | 依据 |\n|---|---|---|---|\n";
+      for (const auto* c : inj) {
+        const auto& chk = c->injection;
+        const std::string verdict = chk.checked ? (chk.effective ? "生效" : "**未生效**")
+                                                : std::string("未判定");
+        std::string detail = chk.detail;
+        if (detail.empty()) {
+          detail = c->scored ? "该故障类没有单一计数判据"
+                             : "run_error（未取到故障窗口读数）: " + short_text(c->error_kind);
+        }
+        o << "| " << md_escape(c->id) << " | " << md_escape(chk.fault_kind) << " | " << verdict
+          << " | " << md_escape(detail) << " |\n";
+      }
+      if (r.injection_ineffective > 0) {
+        o << "\n**" << r.injection_ineffective
+          << " 条注入未生效**：这些 case 的故障窗口读数为 0，SLA（fps 等）因此恒真。"
+             "要么换一个有真实码率的产帧源（`--producer lavfi`），要么把注入档位调到"
+             "源码率能被打穿的水平——总之不能拿这份结果当通过。\n";
+      } else {
+        o << "\n本次所有可判定的注入类 case 都真的发生了故障。\n";
+      }
+    }
+  }
+
   // 失败模式 TOP3（§8.9 ③）：按 miss_count 降序取前三，每类附 examples 里的 1 个具体 case。
   // 运行状态（run_notes）在下面单独列：把"这次没跑完"混进失败分布，图会看起来像模型答错。
   o << "\n## 失败模式 TOP3\n\n";
@@ -2808,6 +3212,12 @@ std::string Engine::render_json(const RunReport& r) const {
       {"run_errors", r.run_errors},
       {"gated", r.gated},
       {"truncated", r.truncated},
+      // 注入未生效（N-23）：不进成功率分母，但 >0 的 run 不能给绿灯
+      {"injection_ineffective", r.injection_ineffective},
+      // 产帧源：默认 none（不起任何进程）；consumer 据此判断 rate 类的读数可不可信
+      {"producer", cfg_.producer},
+      {"producer_size", cfg_.producer_size},
+      {"producer_bitrate", cfg_.producer_bitrate},
       {"root_rate", r.root_rate},
       {"evidence_rate", r.evidence_rate},
       {"sla_rate", r.sla_rate},
@@ -2858,6 +3268,18 @@ std::string Engine::render_json(const RunReport& r) const {
         {"e2e_null_reason", c.e2e_null_reason.empty() ? json(nullptr) : json(c.e2e_null_reason)},
         // 注入 trace 的落点：没有 trace 的 case 写 null（"没有这个文件"不是空路径）
         {"inject_trace", c.inject_trace.empty() ? json(nullptr) : json(c.inject_trace)},
+        // 注入是否真的生效（N-23）：checked=false 的 case（backlog/delay/jitter 或没起管线）
+        // 写 null，不写 false——"没判"与"判了没生效"必须能分开。
+        {"injection", c.injection.fault_kind.empty()
+                          ? json(nullptr)
+                          : json{{"fault_kind", c.injection.fault_kind},
+                                 {"checked", c.injection.checked},
+                                 {"effective", c.injection.checked ? json(c.injection.effective)
+                                                                   : json(nullptr)},
+                                 {"budget_drops", c.injection.budget_drops},
+                                 {"injected", c.injection.injected},
+                                 {"detail", c.injection.detail.empty() ? json(nullptr)
+                                                                       : json(c.injection.detail)}}},
     };
     if (c.scored) {
       cj["score"] = json{{"root", c.score.root},
@@ -2915,6 +3337,10 @@ std::string Engine::render_terminal_summary(const RunReport& r) const {
   o << "模式    : " << cfg_.agent_mode;
   if (cfg_.agent_mode == "real") o << "（LLM=" << cfg_.llm_mode << "）";
   o << "，repeat=" << r.repeat << "\n";
+  if (cfg_.producer != "none" && !cfg_.producer.empty()) {
+    o << "产帧源  : " << cfg_.producer << "（" << cfg_.producer_size << "@"
+      << cfg_.producer_bitrate << " kbps）\n";
+  }
   if (!r.fatal_error.empty()) {
     // 没有产出结果时也走摘要：先让终端读者看到"这次没结果"，再给原因
     o << "结果    : **未产出**（" << r.fatal_error << "）\n";
@@ -2939,6 +3365,12 @@ std::string Engine::render_terminal_summary(const RunReport& r) const {
       << fmt(st.sla_rate.mean, 3) << "±" << fmt(st.sla_rate.stddev, 3) << "（总体标准差）";
   }
   o << "\n";
+  // 注入未生效（N-23）：默认（0 条）不打印，既有的摘要快照因此一字不变；
+  // 一旦出现就必须出现在摘要里——它让整轮 run 不是绿灯，读者得先知道原因。
+  if (r.injection_ineffective > 0) {
+    o << "注入    : **" << r.injection_ineffective
+      << " 条未生效**（故障没发生 → SLA 恒真；不计入成功率分母，但本次不能算通过）\n";
+  }
   o << "成本    : ¥" << fmt(r.cost_yuan, 4) << "（闸门 ¥" << fmt(cfg_.max_yuan, 2) << "，单价 ¥"
     << fmt(cfg_.yuan_per_mtok, 2) << "/Mtok 估算）\n";
   o << "MTTR    : " << (has_value(r.mttr_avg_s) ? fmt(r.mttr_avg_s, 2) + " s" : std::string("n/a"))

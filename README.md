@@ -208,6 +208,10 @@ REPEAT=3 ./scripts/test-real-faults.sh
 
 `run_error` 的 case 不计入成功率分母。`pass^k` 是 repeat=k 时 k 次全部通过的 case 占比。
 
+**产帧源（`--producer lavfi`）**：默认 `none` = 靠外部推流，行为与以前完全一致（不多起进程、命令行不多参数）。`lavfi` 让 `cue-eval` 自己起 `cue-capture`（`testsrc2` 合成画面，默认 640×360@1200 kbps，参数形式同 `scripts/run.sh`）：每个 case 在 `cued` 起来之后拉起，case 结束（成功/失败/run_error）连同它的 `ffmpeg` 子进程一起收掉，会话日志落在 `<run_dir>/producer.log`。需要它是因为 `rate` 类故障注入的是**发送速率上限**——令牌桶只有在源码率高于上限时才会耗尽；外部脚本推的是同一个 64×64 静止 IDR（约 677 B/帧），经 x264 后码率极低，30 fps 合计远低于 0.1 Mbps，于是 `budget_drops=0`、`fps 30`，故障根本没发生而 SLA（`fps_min=25`）恒真。起不来/找不到时该 case 记 `run_error=producer_start_failed`，不会静默变成「无流」；与 `--endpoint` / `--replay-tools` 同用会直接拒（那两个后端不起进程，没有可推流的目标）。
+
+**注入有效性**：`rate` 在故障窗口判 `budget_drops > 0`，`drop` / `ingress_drop` 判 `injected > 0`；读数为 0 记「注入未生效」——它不改该 case 的 scored 与三级判定（故障没发生不是模型答错，因此不进成功率分母），但本次 run 的退出码不会是 0，报告里有独立小节。`backlog` / `delay` / `jitter` 没有单一计数判据，报告注明「未做自动判定」。
+
 `suites/real-faults.json` 的五类故障都能被 `cued` 侧工具面诊断，每类的判据：
 
 | 故障 | 注入方式 | agent 靠什么区分 |
