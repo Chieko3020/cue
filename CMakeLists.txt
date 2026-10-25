@@ -365,6 +365,14 @@ add_executable(test_wire tests/test_wire.cpp)
 target_link_libraries(test_wire PRIVATE cue_proto)
 add_test(NAME wire COMMAND test_wire)
 
+# proto/frame_guard（技术设计文档 §13.1 的同名行，N-08）：幽灵帧守卫的两处调用点
+# （FEC 校验包 / 迟到的视频分片与 NACK 重传）抽成纯函数后，用单测钉住四条布尔入参的
+# 语义——已完成帧无槽位即丢、槽位还在不丢、未来帧不丢、首帧保护（别挡 IDR）、
+# 水位边界是闭区间、uint32_t 回绕时比较方向不反。纯头文件、无副作用，只编一个 TU。
+add_executable(test_frame_guard tests/test_frame_guard.cpp)
+target_link_libraries(test_frame_guard PRIVATE cue_proto)
+add_test(NAME frame_guard COMMAND test_frame_guard)
+
 add_executable(test_agent tests/test_agent.cpp)
 target_link_libraries(test_agent PRIVATE cue_agent)
 add_test(NAME agent COMMAND test_agent)
@@ -532,7 +540,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
-  test_token_bucket
+  test_token_bucket test_frame_guard
   test_control_channel test_tools test_delay_injector test_nack test_capture
   test_audio_decoder test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)

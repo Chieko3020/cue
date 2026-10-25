@@ -107,6 +107,7 @@ inline void probe_close_socket(probe_socket_t fd) { ::close(fd); }
 
 #include "probe_render.h"
 #include "cue/media/jitter_buffer.h"
+#include "cue/proto/frame_guard.h"
 #include "cue/proto/nack.h"
 #include "cue/proto/wire.h"
 
@@ -2480,7 +2481,10 @@ int main(int argc, char** argv) {
       // 静默丢弃 + 计数（N-02）：这条路径以前只是 continue，于是"守卫每帧都在命中"
       // 这件事没有任何账可查（实测零丢包 8 s / 241 帧 → 250 次）。它是**常态读数**，
       // 不是异常；真正的异常指示是 frag_ghost_discarded（零丢包 0）。
-      if (have_completed && base_fid <= max_completed && pending.find(base_fid) == pending.end()) {
+      // 守卫条件见 proto/frame_guard.h（抽成纯函数，单测 test_frame_guard）；
+      // 计数留在这里：这条是常态读数，与下面 frag 那条的判读不同。
+      if (cue::proto::would_rebuild_completed_frame(base_fid, max_completed, have_completed,
+                                                    pending.find(base_fid) != pending.end())) {
         ++fec_ghost_discarded;
         continue;
       }
@@ -2670,8 +2674,9 @@ int main(int argc, char** argv) {
     bytes += static_cast<std::size_t>(n);
     // 迟到的重传分片不得为已完成的帧重建槽位（M0 幽灵帧教训）。
     // 首帧（还没有任何已完成帧）不适用这条：frame_id 从 0 开始，初值 0 会把 IDR 挡掉。
-    if (have_completed && pending.find(h->frame_id) == pending.end() &&
-        h->frame_id <= max_completed) {
+    // 守卫条件见 proto/frame_guard.h：与 FEC 分支同一个纯函数，计数各自独立。
+    if (cue::proto::would_rebuild_completed_frame(h->frame_id, max_completed, have_completed,
+                                                 pending.find(h->frame_id) != pending.end())) {
       // 与 FEC 分支同一个幽灵帧守卫，但触发源是迟到的视频分片（含 NACK 重传）。
       // 这才是**异常**：正常链路不该出现（实测零丢包 = 0、5% 丢包 = 2~3）；
       // 与 fec 那条"每完成帧一次的常态"必须分开计，否则会被常态淹没
