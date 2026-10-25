@@ -679,12 +679,28 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # "ASan runtime does not come first"，也不会被 ASan 的 shadow 映射撞坏 RLIMIT_AS。
   # 这个改动同时修掉一个真实缺陷：之前 `run_shell(cmd="env")` 能读到 harness 的全部
   # 环境变量，包括 CUE_API_KEY。
+  # N-12：这份名单此前漏了 frame_guard / token_bucket / reassembly_budget —— 它们是
+  # N-08/N-07/N-10 新增的单测，守卫当时还没加上（守卫本身也是 N-12 前后才有的），
+  # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
+  # 现在名单 = 主构建全部 C++ 测试（31 项 = 32 − integration）。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
-                     jitter_buffer control_channel tools delay_injector nack capture config metrics
+                     jitter_buffer token_bucket frame_guard reassembly_budget
+                     control_channel tools delay_injector nack capture config metrics
                      session_registry generator report audio_decoder h264_decoder avc_level)
   foreach(_t ${_cue_san_tests})
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
+
+  # h264_decoder 有一条断言"连续解码不得让 RSS 线性增长"（防帧没被及时释放）。
+  # ASan 默认 quarantine_size_mb=256 会把**已释放**的块留在隔离区、不还给分配器，于是
+  # 这条断言在默认 ASan 下恒失败：实测 6000 帧后 RSS 增长 197796 kB（≈193 MB，正好落在
+  # 隔离区内）；把隔离区调到 8 MB 后同一条断言只剩 1872 kB 并通过。即它测到的是隔离区
+  # 大小，不是泄漏。真泄漏由 LeakSanitizer 单独报（下面仍保留 detect_leaks=1），所以这里
+  # 只调小这一个测试的隔离区，既不关泄漏检测，也不放宽断言阈值。
+  set(_cue_san_env_low_quarantine "${CUE_SAN_ENV}")
+  list(FILTER _cue_san_env_low_quarantine EXCLUDE REGEX "^ASAN_OPTIONS=")
+  set_tests_properties(h264_decoder PROPERTIES ENVIRONMENT
+    "${_cue_san_env_low_quarantine};ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:print_stacktrace=1:quarantine_size_mb=8")
 
   # 守卫：这份名单必须覆盖**所有**测试。
   # 漏一个的话，它只会在 CI 的 ASan job 里以 "ASan runtime does not come first
