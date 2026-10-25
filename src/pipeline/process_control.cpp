@@ -462,6 +462,13 @@ bool ProcessPipelineControl::spawn_cued_locked(std::string& err) {
     // 新会话的指标必须清零：否则重启后 1 s 内 latest() 返回上一个 cued 的数字（#25）
     metrics_ = PipelineMetrics{};
     metrics_.pid = cued.pid;
+    // 去重水位属于「这一代 cued」，换代必须一起清零：水位是"同一代之内响应单调
+    // 递增"的假设，跨代不成立。当前 cued 的 t_us 是同一台机器的 steady_clock，
+    // 换代后天然更大，所以不清零今天也不会误判；但一代一代地比下去，等于把
+    // "旧进程的数"当成新响应的下界——一旦 t_us 换成进程相对时钟（或 cued 挪到
+    // 另一台机器/容器里），新进程的 t_us 会从 0 重新开始，不清零就会把新一代的
+    // 每一份响应都判成"不新"，params 再次永远进不来。
+    uds_wm_.reset();
     push_log_locked("[supervisor] cued started pid=" + std::to_string(cued.pid));
   }
   pid_.store(cued.pid);
@@ -784,10 +791,16 @@ void ProcessPipelineControl::probe_reader_loop() { read_loop(probe_fd_, stop_pro
 // 是同一份 report() 的产物。
 //
 // from_uds=true 时额外做两件事：
-//  1) 只要不**比缓存新**就什么都不改（cued 与本进程在同一台机器上，steady_clock 可比；
-//     否则 refresh 会让 updated_us/age_ms 来回跳）；
+//  1) 用独立的去重水位 uds_wm_（只记 cued 自报的 t_us）判断「这份响应是不是更新」，
+//     不比上次采纳的新就整份丢弃；判断**不**碰 metrics_.updated_us——后者是本机时钟
+//     口径（age_ms = now_us() - updated_us），拿它当去重基准等于拿「数据产生时刻」
+//     和「我收到它的时刻」比大小：stdout 每秒那行已经把 updated_us 顶到"刚刚"，
+//     于是每一份 UDS 响应都"不比缓存新"，params（编码档位真值）永远进不了缓存——
+//     真管线下 encode_width/height 恒 null、m2 的 avc 证据不成立，就是这么来的。
 //  2) samples 不递增（那是"解析到几条 stdout METRICS 行"的计数），只在缓存为空时
 //     采纳 cued 自报的 samples。
+// 两条路径的 updated_us 一律写本机 now_us()（也顺带修掉了 stdout 路径把 t_us 混进
+// 时间戳的隐患）。
 bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   if (!j.is_object()) return false;
   PipelineMetrics m;  // 分位默认 NaN：cued 打 null 的段保持"无样本"
@@ -863,7 +876,9 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (from_uds) {
-      if (remote_t != 0 && remote_t <= metrics_.updated_us) return true;
+      // 去重只看「上一次采纳的 cued t_us」（与 metrics_ 同一临界区：判定 + 推进 +
+      // 写缓存必须原子）。判成不新就原样保留缓存——连 age_ms 都不刷新。
+      if (!uds_wm_.accept(remote_t)) return true;
       m.samples = metrics_.samples;
       if (m.samples == 0) {
         const auto s_it = j.find("samples");
@@ -875,7 +890,9 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
     } else {
       m.samples = metrics_.samples + 1;
     }
-    m.updated_us = std::max(now_us(), remote_t);
+    // 时间戳只写本机时钟：age_ms 是 now_us() - updated_us，写 cued 的 t_us 会让它
+    // 变成负几十万小时（两个数语义不同）。去重与时间戳是两件事，别合并。
+    m.updated_us = now_us();
     metrics_ = m;
   }
   return true;

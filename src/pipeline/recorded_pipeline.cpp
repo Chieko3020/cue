@@ -342,6 +342,10 @@ PipelineMetrics RecordingPipeline::latest() const {
   return m;
 }
 
+// 透传，不落盘（见头文件注释）：这是控制面的一次推送，不是工具观测；
+// 回放靠随后那条 latest() 的录制值复现同一份快照，回放侧因此不需要新的 op。
+bool RecordingPipeline::refresh_metrics(std::string& err) { return inner_->refresh_metrics(err); }
+
 ProbeMetrics RecordingPipeline::probe_latest() const {
   const ProbeMetrics p = inner_->probe_latest();
   std::lock_guard<std::mutex> lk(write_mu_);

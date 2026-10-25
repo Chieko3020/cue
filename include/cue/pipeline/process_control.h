@@ -28,6 +28,7 @@
 #include <nlohmann/json.hpp>
 
 #include "cue/pipeline/control_channel.h"
+#include "cue/pipeline/metrics_freshness.h"
 #include "cue/common/metrics.h"
 #include "cue/common/service_pipeline.h"
 
@@ -132,7 +133,9 @@ class ProcessPipelineControl : public IServicePipeline {
   bool control_call(const char* op, const nlohmann::json& args, nlohmann::json& result,
                     std::string& err) const;
   // METRICS 行与 UDS metrics.query 共用同一份解析（两处口径必须一致）。
-  // from_uds=true 时只在"比缓存新"时写入，且不递增 samples（见 .cpp 的注释）。
+  // from_uds=true 时先用 uds_wm_ 判去重、且不递增 samples（见 .cpp 的注释）；
+  // 「新不新」只看 cued 自报的 t_us 与上一次采纳的水位，**不**跟本机时间戳比：
+  // 两者语义不同（数据产生时刻 vs 本机接收时刻），见 metrics_freshness.h。
   bool apply_metrics_json(const nlohmann::json& j, bool from_uds);
   // 控制通道不可用时的本地观测（数据源仍是 stdout 解析出来的缓存）
   std::string local_observation(const std::string& source, int tail) const;
@@ -140,9 +143,14 @@ class ProcessPipelineControl : public IServicePipeline {
 
   mutable std::mutex cfg_mu_;    // 保护 cfg_（控制面会改它，spawn 时读它）
   Config cfg_;
-  mutable std::mutex mu_;        // 保护 metrics_ / log_tail_
+  mutable std::mutex mu_;        // 保护 metrics_ / log_tail_ / uds_wm_
   mutable std::mutex spawn_mu_;  // 串行化 spawn/stop（工具调用 vs 监督线程重启）
   PipelineMetrics metrics_;
+  // UDS metrics.query 的去重水位（受 mu_ 保护，与 metrics_ 同一个临界区）。
+  // 它和 metrics_.updated_us 是**两件事**：后者是本机时钟口径（age_ms 用它算），
+  // 前者只记「上一次采纳的 cued t_us」。混在一起就是历史上 encode_* 恒 null 的根因，
+  // 见 metrics_freshness.h。cued 换代时清零（spawn_cued_locked）。
+  UdsMetricsWatermark uds_wm_;
   std::deque<std::string> log_tail_;  // #28：deque 头删 O(1)
   std::deque<PipelineEvent> events_;   // 最近 kEventMax 条事件（observation/SSE 用）
   std::function<void(const PipelineEvent&)> on_event_;  // 受 mu_ 保护

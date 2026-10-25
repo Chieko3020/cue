@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "cue/pipeline/metrics_freshness.h"
 #include "cue/tool/tools.h"
 #include "cue/tool/tool.h"
 
@@ -373,8 +374,41 @@ int main() {
           "没有采样时 query_metrics 报错（不返回一份空观测）");
   }
 
+  // ---------- 9) UDS 响应的去重水位：编码档位曾因跨时钟域比较被整份丢弃 ----------
+  // 这 5 条钉的是 apply_metrics_json(from_uds=true) 的判定语义：判据只能是 cued
+  // 自报的 t_us 与「上一次采纳的水位」，绝不能拿本机 metrics_.updated_us 当基准——
+  // stdout 每秒那行会把 updated_us 顶到"刚刚"，于是每一份 UDS 响应都"不比缓存新"，
+  // params（编码档位真值）永远进不了缓存，真管线下 encode_width/height 恒 null。
+  {
+    // 1) 旧版 cued 不带 t_us：没有可比的水位，一律接受（也不因水位非零而被拒）
+    check(pipeline::uds_metrics_is_newer(0, 0), "t_us=0（旧 cued）被接受");
+    check(pipeline::uds_metrics_is_newer(0, 12'345), "t_us=0 不因水位非零而被拒");
+
+    // 2) 比上次采纳的新 → 接受，且水位推进（推进由水位对象负责：忘了推进就会让同一
+    //    份响应反复通过，age_ms 永远显示"刚刚"）
+    pipeline::UdsMetricsWatermark wm;
+    check(wm.accept(1'000'000), "首份响应（t_us>0、水位 0）被接受");
+    check(wm.last() == 1'000'000, "接受后水位推进到该 t_us");
+    // 3) 同一份响应重复应用 → 拒绝，水位不动
+    check(!wm.accept(1'000'000), "t_us 与水位的相等 → 拒绝（重复应用不刷新 age）");
+    check(wm.last() == 1'000'000, "被拒绝时水位不动");
+    // 4) 更旧的响应 → 拒绝；之后更新的响应仍能通过（水位没有倒退）
+    check(!wm.accept(999'999), "t_us 小于水位 → 拒绝");
+    check(wm.accept(1'000'001), "更新的 t_us → 接受");
+    check(wm.last() == 1'000'001, "水位继续推进");
+
+    // 5) cued 换代 → 水位清零 → 更小的 t_us 必须被接受。
+    //    当前 t_us 是同一台机器的 steady_clock，换代后只会更大，所以这条现在测的是
+    //    "不变量"本身；t_us 一旦换成进程相对时钟（从 0 重新起算，或 cued 挪到别的
+    //    机器/容器），不清零就会把新一代的每一份响应都判成"不新"。
+    wm.reset();
+    check(wm.last() == 0, "reset 后水位归零");
+    check(wm.accept(500), "换代后更小的 t_us 被接受（重启清零）");
+    check(wm.last() == 500, "换代后的水位从新进程的 t_us 重新起算");
+  }
+
   if (failures == 0) {
-    std::printf("test_tools: OK (7 groups)\n");
+    std::printf("test_tools: OK (9 groups)\n");
     return 0;
   }
   std::printf("test_tools: %d failure(s)\n", failures);

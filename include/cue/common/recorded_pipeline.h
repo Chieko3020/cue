@@ -72,6 +72,14 @@ class RecordingPipeline : public IServicePipeline {
   void stop() override;
   bool running() const override;
   PipelineMetrics latest() const override;
+  // 主动查询必须透传到 inner_：默认实现（"该后端不支持主动查询指标"）会把
+  // query_metrics 的「先 refresh 再 latest」变成只读 1 Hz 缓存，而**只有 UDS 的
+  // metrics.query 响应带 params**（编码档位真值）→ 录制模式下观测面 encode_* 恒 null，
+  // 所有编码/分辨率类 case 的证据层恒 ✗。录制模式本来是"能产出证据"的那条路，
+  // 这个洞让证据面也瞎了（N-02b 实测：runs/n05-p95 的 avc 证据就是 ✗）。
+  // 不写进录制格式：refresh 本身不是一条工具观测（工具输出是紧接着的 latest()），
+  // 那份 latest 的录制值已经包含 refresh 之后的快照；回放重放一次 refresh 只是噪声。
+  bool refresh_metrics(std::string& err) override;
   // 端到端指标也进录制：否则回放时 probe_latest() 恒为空，AC-6 的
   // 「同一份观测必然得到同一判定」在端到端 SLA 上就不成立。
   ProbeMetrics probe_latest() const override;
