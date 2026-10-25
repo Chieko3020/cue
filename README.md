@@ -160,7 +160,7 @@ ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0 \
 
 `cue demo` 的变体：`--http URL [--record DIR]` 走 OpenAI 兼容端点并录制 cassette；`--replay DIR` 从 cassette 回放。`cue run` 的 `--approval ask|auto|deny`、`--allow-dangerous NAMES|none` 控制审批；`CUE_RECORD=1` 把成功调用录进 `CUE_CASSETTE_DIR`。
 
-`run.sh` 不带参数（或 `demo-min`）会起「`cue-probe` + `cued` + 采集源 + 静态页」，在终端打印 `http://127.0.0.1:8080/?ws_port=9000`。采集源默认是 `cue-capture --backend lavfi`（`testsrc2` 画面 + `sine` 音频，零采购真实源；走与浏览器同一套上行协议）；没有该二进制时回退到 `scripts/test-client.mjs`（Node 模拟浏览器）。`CUE_PRODUCER=page` 则不自动产帧，改由页面点「开始推流」——`cued` 一次只接一个客户端，采集端跑着时页面连不上，这是预期行为。`cued` 默认只监听 `127.0.0.1`；跨机演示用 `BIND=0.0.0.0` 并自行限制 9000/TCP 与 9001/UDP。改过 `WS_PORT` 也能对上。
+`run.sh` 不带参数（或 `demo-min`）会起「`cue-probe` + `cued` + 采集源 + 静态页」，在终端打印 `http://127.0.0.1:8080/?ws_port=9000`。采集源默认是 `cue-capture --backend lavfi`（`testsrc2` 画面 + `sine` 音频，零采购真实源；走与浏览器同一套上行协议）；没有该二进制时回退到 `scripts/test-client.mjs`（Node 模拟浏览器）。`CUE_PRODUCER=page` 则不自动产帧，改由页面点「开始推流」——`cued` 一次只接一个客户端，采集端跑着时页面连不上，这是预期行为。`cued` 默认只监听 `127.0.0.1`；跨机演示用 `BIND=0.0.0.0` 并自行限制 9000/TCP 与 9001/UDP。 若接收端在 NAT 后面，`cue-probe --hello-to HOST:PORT` 会周期性发 `CUEHELLO`，`cued` 据此学会把下行发回来源地址——**这只是让公网测试能跑起来的脚手架，不是 NAT 穿透方案**（没有 ICE/STUN/TURN），生产部署仍要固定端口或做端口映射。改过 `WS_PORT` 也能对上。
 
 控制台（可选）：`./scripts/serve.sh` 会先构建 `web/console`（首次需要 Node 与 npm，会联网装前端依赖），再起 `cue-serve`，默认 `http://127.0.0.1:8080/`、审批模式 `ask`。
 
