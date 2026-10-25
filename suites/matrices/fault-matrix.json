@@ -163,7 +163,7 @@
       }
     },
     {
-      "note": "管线参数类：4K 输出（op 段 >1.5 ms 的区分点），修复靠 repair 降到 1280x720",
+      "note": "管线参数类：4K 输出（op 段 >1.5 ms 的区分点），修复靠 repair 降到 1280x720 并把 preset 降到 ultrafast（2 vCPU 上 720p@medium/slow 修复态只有 21.5~27.5 fps，达不到 fps_min=25；依据见 base suite 的 note）",
       "axes": {
         "fault.kind": [
           "none"

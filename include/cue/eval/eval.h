@@ -161,6 +161,9 @@ struct Score {
   bool root = false;
   bool evidence = false;
   bool sla = false;
+  // 证据不成立时的一句原因（N-22）：写明是"不是逐字引用"还是"哪个候选的什么谓词没被
+  // 满足"。没有它，报告里只看到一个 ✗，读者分不清是引用造假还是取值不支持结论。
+  std::string evidence_reason;
   bool all() const { return root && evidence && sla; }
 };
 
@@ -197,6 +200,51 @@ InjectionCheck judge_injection(const std::string& fault_kind, uint64_t budget_dr
 // 证据校验：证据必须（a）是某条真实观测里逐字摘抄的 key=value 片段，
 // （b）除引用、工具名与单位外不含解释性文字。见 review-eval.md 的伪造构造表。
 bool evidence_matches(const std::string& evidence, const std::vector<Observation>& obs);
+
+// ---- 证据候选的取值谓词（N-22）----
+//
+// 为什么需要：旧判分只要求"候选键在证据里出现"，不看**取值能不能支持结论**。
+// 实测踩过两次伪证：`encode_width=0`（0 = 沿用解码尺寸 follow，不是 1080p）被当成
+// 1080p 尺寸证据；`budget_drops=0`（没限速、令牌桶没被抽干）被当成"带宽不足"证据。
+// 两个字段都真实存在、都在观测里，旧口径下都算成立。
+//
+// 语法：候选串 = "key" 或 "key OP value"，OP ∈ {> >= < <= == !=}，运算符两侧允许空格。
+// 例：`budget_drops>0`、`e2e_fec_recovered>=1`、`encode_width==1920`、
+//     `encode_transcode==on`（字符串比较）。
+//
+// 语义（判分时逐条应用）：
+//  1) 引用的证据仍然必须是某条真实观测里的**逐字引用**（evidence_matches，未改动）；
+//  2) 证据文本里必须出现候选的 key（`==`/`!=` 也先按键命中）；
+//  3) 带谓词时，还要用**承载这条引用的那条观测**里该 key 的实际取值去满足谓词。
+//     取值优先来自 Observation::data（JSON 对象；数值/字符串/布尔都是标量）；
+//     data 不是对象、或对象里没有该键时，退回从 text 里解析 `key=VALUE`
+//     （旧录制与纯文本观测只有 text）。
+//  4) 两侧都能解析成 double 时按数值比较（含负数、小数，`==` 是精确相等而非 ±2%
+//     容差——容差只用于"引用值是否与观测相符"，不能用来模糊判决条件）；
+//     否则 `==`/`!=` 按**原样字符串**比较，`> < >= <=` 判不满足，并把
+//     "非数值无法比较"写进原因（fail-closed：不猜、不把字符串当 0）。
+//  5) **不带谓词的候选与旧行为逐字节一致**（仍然只做归一化子串匹配），
+//     既有 suite 的 33 + 2 个 case 不会因为这次改动变味。
+//
+// 解析规则：从**最后一个**比较运算符处切分（值里不会出现运算符，key 里不能有）；
+// key 允许 `_` 与 `.`。没有运算符、运算符不在上面六个之内（例如单个 `=`）、或运算符
+// 右侧为空时，整串当 key（= 无谓词）——这样旧候选串即使恰好含运算符字符，也仍是
+// 过去的字面匹配，不会突然变成永远不成立的谓词。
+struct EvidenceCandidate {
+  std::string key;    // 归一化后的键（小写、去首尾空格）
+  std::string op;     // "", ">", ">=", "<", "<=", "==", "!="
+  std::string value;  // 谓词右值原文（去首尾空格）
+  bool has_predicate() const { return !op.empty(); }
+};
+
+// 解析（纯函数，可单测）。
+EvidenceCandidate parse_evidence_candidate(const std::string& raw);
+
+// 单条观测上的「键在证据里出现 + 谓词成立」判定（纯函数，可单测）。
+// 不检查证据本身是否为逐字引用——那是 evidence_matches 的职责；judge_case 只在
+// 能承载该引用的观测上调用它。why 写不成立的原因（中文，可直接进日志/报告）。
+bool evidence_candidate_matches(const std::string& evidence, const Observation& obs,
+                                const EvidenceCandidate& cand, std::string& why);
 
 Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<Observation>& obs,
                  const Metrics& final_metrics);

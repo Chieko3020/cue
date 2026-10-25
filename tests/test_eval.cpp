@@ -484,8 +484,122 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     check(!none.checked && none.detail.empty(), "case12 none 类没有判定也无说明");
   }
 
+  // 13) 证据候选的取值谓词（N-22）
+  // 核心回归锁：`budget_drops=0` 是真实观测里的真实字段，但取值支持不了 "带宽不足"，
+  // 带 `>0` 谓词后必须判不成立——这正是旧口径放过两次的伪证。
+  {
+    // 13a) 解析：key OP value，容忍 key 里的 _ 与 .、容忍两侧空格
+    {
+      const auto a = eval::parse_evidence_candidate("budget_drops>0");
+      check(a.key == "budget_drops" && a.op == ">" && a.value == "0" && a.has_predicate(),
+            "case13a 解析 budget_drops>0");
+      const auto b = eval::parse_evidence_candidate("encode_width==1920");
+      check(b.key == "encode_width" && b.op == "==" && b.value == "1920", "case13a 解析 ==");
+      const auto c = eval::parse_evidence_candidate("e2e_fec_recovered>=1");
+      check(c.key == "e2e_fec_recovered" && c.op == ">=" && c.value == "1", "case13a 解析 >=");
+      const auto d = eval::parse_evidence_candidate("key!=off");
+      check(d.key == "key" && d.op == "!=" && d.value == "off", "case13a 解析 !=");
+      const auto e = eval::parse_evidence_candidate("send_p99_ms <= 233.0");
+      check(e.key == "send_p99_ms" && e.op == "<=" && e.value == "233.0",
+            "case13a 解析带空格且 key 含 _");
+      const auto f = eval::parse_evidence_candidate("metrics.fps>0");
+      check(f.key == "metrics.fps" && f.op == ">" && f.value == "0", "case13a key 含 .");
+      // 无谓词（回归）：整串就是 key，行为与旧候选一致
+      const auto g = eval::parse_evidence_candidate("injected");
+      check(g.key == "injected" && !g.has_predicate(), "case13a 无谓词候选解析");
+      // 单个 '=' 不是合法运算符：按无谓词处理，旧的"字面 key"匹配行为不变
+      const auto h = eval::parse_evidence_candidate("encode_width=1920");
+      check(!h.has_predicate() && h.key == "encode_width=1920",
+            "case13a 单个 = 不构成谓词（旧候选串仍是字面匹配）");
+    }
+
+    const auto pred_case = [](std::vector<std::string> cands) {
+      eval::Case c;
+      c.id = "pred";
+      c.expect_root_cause = "bandwidth_insufficient";
+      c.evidence_candidates = std::move(cands);
+      return c;
+    };
+    const auto budget_obs = [](int budget_drops) {
+      eval::Observation o;
+      o.tool = "query_metrics";
+      o.data = nlohmann::json{{"fps", 30.3}, {"budget_drops", budget_drops}};
+      o.text = "metrics=" + o.data.dump();
+      return std::vector<eval::Observation>{o};
+    };
+    const auto pred_evidence = [&](const std::vector<std::string>& cands,
+                                   const std::vector<eval::Observation>& obs,
+                                   const std::string& ev) {
+      auto r = good_result();
+      r.diagnosis.evidence = {ev};
+      return eval::judge_case(pred_case(cands), r, obs, good_metrics()).evidence;
+    };
+
+    // 13b) 判定：取值不支持结论 → 证据不成立；真故障读数 → 成立
+    check(!pred_evidence({"budget_drops>0"}, budget_obs(0), "budget_drops=0"),
+          "case13b budget_drops=0 不满足 budget_drops>0（伪证回归锁）");
+    check(pred_evidence({"budget_drops>0"}, budget_obs(82), "budget_drops=82"),
+          "case13b budget_drops=82 满足 budget_drops>0");
+    // 同一类伪证的另一个形态：encode_width=0（0 = 沿用解码尺寸）不是 1080p 尺寸证据
+    {
+      eval::Observation o;
+      o.text = "metrics={\"encode_width\":0,\"fps\":30.3}";
+      o.data = nlohmann::json{{"encode_width", 0}, {"fps", 30.3}};
+      check(!pred_evidence({"encode_width==1920"}, {o}, "encode_width=0"),
+            "case13b encode_width=0 不满足 ==1920");
+    }
+    // data 不是对象/没有该键时回退 text 解析（旧录制、纯文本观测）
+    {
+      eval::Observation o;  // data 保持空对象，只有 text
+      o.text = "metrics: budget_drops=82, fps=30.3";
+      check(pred_evidence({"budget_drops>0"}, {o}, "budget_drops=82"),
+            "case13b 取值回退 text 的 key=VALUE");
+    }
+
+    // 13c) 字符串比较：== / != 按原样
+    {
+      const auto cand = eval::parse_evidence_candidate("encode_transcode==on");
+      eval::Observation on_obs;
+      on_obs.data = nlohmann::json{{"encode_transcode", "on"}, {"fps", 30.3}};
+      on_obs.text = "metrics=" + on_obs.data.dump();
+      eval::Observation off_obs;
+      off_obs.data = nlohmann::json{{"encode_transcode", "off"}, {"fps", 30.3}};
+      off_obs.text = "metrics=" + off_obs.data.dump();
+      std::string why;
+      check(eval::evidence_candidate_matches("encode_transcode=on", on_obs, cand, why),
+            "case13c encode_transcode==on 在 on 时成立");
+      check(!eval::evidence_candidate_matches("encode_transcode=on", off_obs, cand, why),
+            "case13c encode_transcode==on 在 off 时不成立");
+      const auto neq = eval::parse_evidence_candidate("encode_transcode!=off");
+      check(eval::evidence_candidate_matches("encode_transcode=on", on_obs, neq, why),
+            "case13c encode_transcode!=off 在 on 时成立");
+      check(!eval::evidence_candidate_matches("encode_transcode=on", off_obs, neq, why),
+            "case13c encode_transcode!=off 在 off 时不成立");
+    }
+
+    // 13d) 非数值无法比较：不成立、不崩，且原因写明
+    {
+      const auto gt = eval::parse_evidence_candidate("encode_transcode>0");
+      eval::Observation on_obs;
+      on_obs.data = nlohmann::json{{"encode_transcode", "on"}};
+      on_obs.text = "metrics=" + on_obs.data.dump();
+      std::string why;
+      check(!eval::evidence_candidate_matches("encode_transcode=on", on_obs, gt, why),
+            "case13d encode_transcode>0 对字符串判不成立");
+      check(why.find("非数值") != std::string::npos, "case13d 原因写明非数值无法比较");
+    }
+
+    // 13e) 无谓词候选行为与之前一致：键出现即成立（值不在判据里）
+    check(pred_evidence({"budget_drops"}, budget_obs(0), "budget_drops=0"),
+          "case13e 无谓词候选 budget_drops 仍按键命中");
+    check(pred_evidence({"injected"}, make_obs(), "injected=59"),
+          "case13e 旧候选字符串（injected）行为不变");
+    check(!pred_evidence({"injected"}, make_obs(), "send_p50_ms=0.09"),
+          "case13e 无关字段仍不满足候选");
+  }
+
   if (failures == 0) {
-    std::printf("test_eval: OK (12 groups)\n");
+    std::printf("test_eval: OK (13 groups)\n");
     return 0;
   }
   std::printf("test_eval: %d failure(s)\n", failures);

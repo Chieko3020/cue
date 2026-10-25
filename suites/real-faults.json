@@ -1,7 +1,7 @@
 {
   "suite": "real-faults",
   "version": 1,
-  "note": "T-07：6 类根因 × 3 档严重度 = 18 个 case（FR-EVAL.13），全部落在 SPEC §7.6 的 8 类枚举内、全部可从 cued 侧工具面（query_metrics / fetch_observation）诊断，不含任何前雇主代码/日志/数据/指标原值。测量环境：2 vCPU、g++-14 RelWithDebInfo、30 fps 合成推流（scripts/test-client.mjs 的 64x64 单分片帧）；每 case 单独跑「故障态→修复态」，故障态取假 agent 的真 query_metrics 读数、修复态取 harness 重测的 final_fps。下列数字为 2026-10-22 本机实测：REPEAT=1 与 REPEAT=3 各一轮，REPEAT=3 的 18/18 全过（503 s）。fps 读数是 cued 的 1 s 窗口，低帧率时窗口本身会抖（每类后标注了 repeat 间离散度）。 | network_loss（fps_min=25）：上行丢包 45% / 55%（720p 转码档）/ 65% → 故障态 fps 17.0~18.0 / 15.0~15.9 / 11.6~11.7（REPEAT=3 中位 17.44/15.54/11.64、REPEAT=1 复跑 17.98/15.92/11.69；repeat 间 3%/3%/6%），injected 逐秒增长、dropped=0、budget_drops=0、frames_in==frames_out；inject_fault value=0 后 30.0~30.1。为什么不用出向丢包（drop）：它的丢弃发生在 frames_out 结算之后，只涨 injected、不改 fps，以 fps 为判据的 case 在故障态就提前达标（生成器也拒绝这种组合）。 | bandwidth_insufficient（fps_min=25）：发送上限 0.10 / 0.105 / 0.11 Mbps（720p@4000kbps、veryfast）→ 13.6~15.0 / 15.6~16.5 / 17.5（REPEAT=3 中位 13.63/15.56/17.53、REPEAT=1 复跑 14.98/16.50/17.51；repeat 间 7%/2%/6%），budget_drops=dropped（13~16 个）、injected=0、encode_p50≈6.4 ms 正常；清除注入后 29.4~30.1。可判带窄的原因：cued 的 --send-mbps 下限是 0.1 （更小的值进程直接退出 2，实测 0.05/0.06 Mbps 会 crash-loop、拿不到媒体流）；而 0.12 Mbps 时故障态 fps 已到 21.4、0.13 Mbps 回到 25.9（阈值以上），只有 0.10~0.11 能稳定跌破 25 且每档留 ≥3 fps 余量。合成源实际码率只有约 0.17 Mbps，这是窄带的根因，不是把阈值拍脑袋定低。 | queue_backlog（fps_min=25 + lat_p99_ms=100 + lat_p50_ms=60）：发送节奏 8 / 12（720p 转码档）/ 18 帧每秒 → 7.8~8.0 / 11.9~12.0 / 17.5~18.0（中位 7.76/11.87/17.95、复跑 7.98/11.99/17.50；repeat 间 3%/9%/2%），frames_in−frames_out 49~87、dropped=budget_drops=injected=0；清除注入后 30.0~30.2。p50 用 60 而不是旧版的 30：修复后探针 p99 残余来自抖动缓冲降档前的驻留，实测 0.9~105 ms（随降档时机变化），写成 30 ms 等于把「降档快慢」当 SLA；60 ms 仍远小于排队故障的故障窗口 p99（1.59~2.87 s），不影响判分意义。 | encoder_too_slow（fps_min=25，这一类 SLA 只判 fps）：placebo @1360x768 / 1600x900 / 1920x1080 → 12.3~13.3 / 8.7~9.0 / 5.8~6.1（中位 12.25/8.75/6.08、复跑 13.34/8.99/5.96；repeat 间 10%/1%/23%）；encode_p50 94.7~110.5 / 110.5 / 155.0 ms（帧预算 33 ms 的 2.9~4.7 倍）、op_p50 0.46~0.59 ms（缩放不是瓶颈，这是与 resolution_too_high 的区分点）、dropped=budget_drops=0；改 preset=ultrafast 后 29.9~30.1。为什么这类不写 lat_p99：修复后 e2e p99 仍会因编码器重启/缓冲降档出现 103~105 ms 的瞬态（p50 只有 3~75 ms），它不是「编码慢」的稳定属性；这一类的判据是 fps 与 encode 段指纹。 | resolution_too_high（fps_min=25）：4K × veryfast / medium / slow → 13.3~16.3 / 8.6~11.9 / 9.0~12.1（REPEAT=3 中位 16.32/8.63/12.06、REPEAT=1 复跑 13.28/9.62/8.96；repeat 间 4%/43%/30%——1 s 窗口在个位数 fps 时的抖动）；encode_p50 56.2 / 109.4 / 81.4 ms、op_p50 2.17 / 2.31 / 2.17 ms（op>1.5 ms 是这一类的判别点：缩放开销随输出像素线性增长，而 encoder_too_slow 的 op 恒 <1 ms）、dropped=budget_drops=0；repair 降到 1280x720 后 29.8~30.2。4K 下 medium 与 slow 的 encode_p50 非单调（109 vs 81 ms，本机实测），三档的区分点因此是 op_p50 与 preset，fps 都远低于阈值。 | network_delay（唯一不降 fps 的一类；fps_min=25 + 每档 lat_p99_ms）：固定延迟 200 / 300 / 400 ms → 故障窗口 e2e p99 233.3~233.8 / 333.9 / 433.7~434.0 ms，send_p50/p99 232/233、302/333、432/434 ms，delayed_pkts≈119~122、injected=dropped=budget_drops=0、ingress_late=0、fps 30.0~30.9（不降，这正是它与丢包的区分点）；清除注入后 e2e p99 0.7~33.9 / 0.8~0.9 / 1.2 ms、fps 29.9~30.2。SLA 阈值按档位设为 150 / 220 / 300 ms：必须让故障窗口越过（余量 ≥84 ms）、修复后回落（余量 ≥116 ms），同时给探针抖动缓冲的降档残余（实测 0.9~105 ms）留余量；只写 fps 的话故障窗口本来就达标，这个 case 会变成「修不修都过」。 | 被淘汰的候选类（实测口径）：keyframe_storm —— 本机 x264 走 ABR+VBV，GOP 不改变平均码率，I 帧又不比 P 帧贵：gop=1 与 gop=60 的 encode_p50 相差 <10%（1080p 15.2 vs 14.4、1440p 26.5 vs 25.4、4K 60.8 vs 54.8 ms），budget_drops 恒为 0，没有可校准的 SLA 信号，因此不硬造（用 network_delay 补位是已有决定）。clock_drift —— 仍没有对应可观测量：上行 PTS 只被透传给下游，不参与 cued 的任何计时。另：queue_backlog 与 bandwidth_insufficient 的区分点是「积压（frames_in−frames_out 增长，dropped/budget_drops 均为 0）」与「令牌桶丢帧（budget_drops 增长）」——不是同一类故障换名字。 | 验证：scripts/test-real-faults.sh 按类别断言指纹（case id 不参与判断），全量模式还断言 ≥5 类、每类 ≥3 个 case；REPEAT=1 18/18（168 s）、REPEAT=3 18/18（503 s，2 vCPU）。FR-EVAL.5 的生成器见 suites/matrices/fault-matrix.json → suites/generated/fault-matrix.json（33 个 case，合法性规则写在生成物 note 里）。",
+  "note": "T-07：6 类根因 × 3 档严重度 = 18 个 case（FR-EVAL.13），全部落在 SPEC §7.6 的 8 类枚举内、全部可从 cued 侧工具面（query_metrics / fetch_observation）诊断，不含任何前雇主代码/日志/数据/指标原值。测量环境：2 vCPU、g++-14 RelWithDebInfo、30 fps 合成推流（scripts/test-client.mjs 的 64x64 单分片帧）；每 case 单独跑「故障态→修复态」，故障态取假 agent 的真 query_metrics 读数、修复态取 harness 重测的 final_fps。下列数字为 2026-10-22 本机实测：REPEAT=1 与 REPEAT=3 各一轮，REPEAT=3 的 18/18 全过（503 s）。fps 读数是 cued 的 1 s 窗口，低帧率时窗口本身会抖（每类后标注了 repeat 间离散度）。 | network_loss（fps_min=25）：上行丢包 45% / 55%（720p 转码档）/ 65% → 故障态 fps 17.0~18.0 / 15.0~15.9 / 11.6~11.7（REPEAT=3 中位 17.44/15.54/11.64、REPEAT=1 复跑 17.98/15.92/11.69；repeat 间 3%/3%/6%），injected 逐秒增长、dropped=0、budget_drops=0、frames_in==frames_out；inject_fault value=0 后 30.0~30.1。为什么不用出向丢包（drop）：它的丢弃发生在 frames_out 结算之后，只涨 injected、不改 fps，以 fps 为判据的 case 在故障态就提前达标（生成器也拒绝这种组合）。 | bandwidth_insufficient（fps_min=25）：发送上限 0.10 / 0.105 / 0.11 Mbps（720p@4000kbps、veryfast）→ 13.6~15.0 / 15.6~16.5 / 17.5（REPEAT=3 中位 13.63/15.56/17.53、REPEAT=1 复跑 14.98/16.50/17.51；repeat 间 7%/2%/6%），budget_drops=dropped（13~16 个）、injected=0、encode_p50≈6.4 ms 正常；清除注入后 29.4~30.1。可判带窄的原因：cued 的 --send-mbps 下限是 0.1 （更小的值进程直接退出 2，实测 0.05/0.06 Mbps 会 crash-loop、拿不到媒体流）；而 0.12 Mbps 时故障态 fps 已到 21.4、0.13 Mbps 回到 25.9（阈值以上），只有 0.10~0.11 能稳定跌破 25 且每档留 ≥3 fps 余量。合成源实际码率只有约 0.17 Mbps，这是窄带的根因，不是把阈值拍脑袋定低。 | queue_backlog（fps_min=25 + lat_p99_ms=100 + lat_p50_ms=60）：发送节奏 8 / 12（720p 转码档）/ 18 帧每秒 → 7.8~8.0 / 11.9~12.0 / 17.5~18.0（中位 7.76/11.87/17.95、复跑 7.98/11.99/17.50；repeat 间 3%/9%/2%），frames_in−frames_out 49~87、dropped=budget_drops=injected=0；清除注入后 30.0~30.2。p50 用 60 而不是旧版的 30：修复后探针 p99 残余来自抖动缓冲降档前的驻留，实测 0.9~105 ms（随降档时机变化），写成 30 ms 等于把「降档快慢」当 SLA；60 ms 仍远小于排队故障的故障窗口 p99（1.59~2.87 s），不影响判分意义。 | encoder_too_slow（fps_min=25，这一类 SLA 只判 fps）：placebo @1360x768 / 1600x900 / 1920x1080 → 12.3~13.3 / 8.7~9.0 / 5.8~6.1（中位 12.25/8.75/6.08、复跑 13.34/8.99/5.96；repeat 间 10%/1%/23%）；encode_p50 94.7~110.5 / 110.5 / 155.0 ms（帧预算 33 ms 的 2.9~4.7 倍）、op_p50 0.46~0.59 ms（缩放不是瓶颈，这是与 resolution_too_high 的区分点）、dropped=budget_drops=0；改 preset=ultrafast 后 29.9~30.1。为什么这类不写 lat_p99：修复后 e2e p99 仍会因编码器重启/缓冲降档出现 103~105 ms 的瞬态（p50 只有 3~75 ms），它不是「编码慢」的稳定属性；这一类的判据是 fps 与 encode 段指纹。 | resolution_too_high（fps_min=25）：4K × veryfast / medium / slow → 13.3~16.3 / 8.6~11.9 / 9.0~12.1（REPEAT=3 中位 16.32/8.63/12.06、REPEAT=1 复跑 13.28/9.62/8.96；repeat 间 4%/43%/30%——1 s 窗口在个位数 fps 时的抖动）；encode_p50 56.2 / 109.4 / 81.4 ms、op_p50 2.17 / 2.31 / 2.17 ms（op>1.5 ms 是这一类的判别点：缩放开销随输出像素线性增长，而 encoder_too_slow 的 op 恒 <1 ms）、dropped=budget_drops=0；repair 降到 1280x720 后 29.8~30.2。4K 下 medium 与 slow 的 encode_p50 非单调（109 vs 81 ms，本机实测），三档的区分点因此是 op_p50 与 preset，fps 都远低于阈值。 | network_delay（唯一不降 fps 的一类；fps_min=25 + 每档 lat_p99_ms）：固定延迟 200 / 300 / 400 ms → 故障窗口 e2e p99 233.3~233.8 / 333.9 / 433.7~434.0 ms，send_p50/p99 232/233、302/333、432/434 ms，delayed_pkts≈119~122、injected=dropped=budget_drops=0、ingress_late=0、fps 30.0~30.9（不降，这正是它与丢包的区分点）；清除注入后 e2e p99 0.7~33.9 / 0.8~0.9 / 1.2 ms、fps 29.9~30.2。SLA 阈值按档位设为 150 / 220 / 300 ms：必须让故障窗口越过（余量 ≥84 ms）、修复后回落（余量 ≥116 ms），同时给探针抖动缓冲的降档残余（实测 0.9~105 ms）留余量；只写 fps 的话故障窗口本来就达标，这个 case 会变成「修不修都过」。 | 被淘汰的候选类（实测口径）：keyframe_storm —— 本机 x264 走 ABR+VBV，GOP 不改变平均码率，I 帧又不比 P 帧贵：gop=1 与 gop=60 的 encode_p50 相差 <10%（1080p 15.2 vs 14.4、1440p 26.5 vs 25.4、4K 60.8 vs 54.8 ms），budget_drops 恒为 0，没有可校准的 SLA 信号，因此不硬造（用 network_delay 补位是已有决定）。clock_drift —— 仍没有对应可观测量：上行 PTS 只被透传给下游，不参与 cued 的任何计时。另：queue_backlog 与 bandwidth_insufficient 的区分点是「积压（frames_in−frames_out 增长，dropped/budget_drops 均为 0）」与「令牌桶丢帧（budget_drops 增长）」——不是同一类故障换名字。 | 验证：scripts/test-real-faults.sh 按类别断言指纹（case id 不参与判断），全量模式还断言 ≥5 类、每类 ≥3 个 case；REPEAT=1 18/18（168 s）、REPEAT=3 18/18（503 s，2 vCPU）。FR-EVAL.5 的生成器见 suites/matrices/fault-matrix.json → suites/generated/fault-matrix.json（33 个 case，合法性规则写在生成物 note 里）。 | N-22（证据取值谓词）：network_loss 的候选改为 injected>0、bandwidth_insufficient 改为 budget_drops>0——引用一个真实存在但取值为 0 的字段（未注入 / 令牌桶没被抽干）不再算证据；后者正是 N-23 之前 budget_drops=0 被当成“带宽不足”证据的伪证路径。 | N-22（res-4k-* 的修复）：repair 在降到 1280x720 的同时补 preset=ultrafast。依据：`--producer lavfi` 真源下 2 vCPU 用 medium/slow 编 720p 只有 21.5~27.5 fps（fps_min=25 判不过），补档后对照实测 30.01 fps。encoder_too_slow 的 repair 本来就是 preset=ultrafast，不需要改；resolution_too_high 的故障窗口仍是 4K（区分点 op_p50>1.5 ms），修复动作多降一档 preset 不改变该类的诊断面。",
   "cases": [
     {
       "id": "netloss-uplink-45pct",
@@ -20,7 +20,7 @@
       "expect": {
         "root_cause": "network_loss",
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "allowed_actions": [
@@ -60,7 +60,7 @@
       "expect": {
         "root_cause": "network_loss",
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "allowed_actions": [
@@ -96,7 +96,7 @@
       "expect": {
         "root_cause": "network_loss",
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "allowed_actions": [
@@ -136,8 +136,7 @@
       "expect": {
         "root_cause": "bandwidth_insufficient",
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "allowed_actions": [
@@ -177,8 +176,7 @@
       "expect": {
         "root_cause": "bandwidth_insufficient",
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "allowed_actions": [
@@ -218,8 +216,7 @@
       "expect": {
         "root_cause": "bandwidth_insufficient",
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "allowed_actions": [
@@ -495,7 +492,8 @@
       },
       "repair": {
         "width": 1280,
-        "height": 720
+        "height": 720,
+        "preset": "ultrafast"
       },
       "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
       "expect": {
@@ -536,7 +534,8 @@
       },
       "repair": {
         "width": 1280,
-        "height": 720
+        "height": 720,
+        "preset": "ultrafast"
       },
       "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
       "expect": {
@@ -577,7 +576,8 @@
       },
       "repair": {
         "width": 1280,
-        "height": 720
+        "height": 720,
+        "preset": "ultrafast"
       },
       "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
       "expect": {

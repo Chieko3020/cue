@@ -14,7 +14,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -51,7 +51,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -88,7 +88,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -125,7 +125,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -163,7 +163,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -201,7 +201,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -239,7 +239,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -277,7 +277,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -315,7 +315,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected",
+          "injected>0",
           "fps"
         ],
         "root_cause": "network_loss",
@@ -353,8 +353,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "root_cause": "bandwidth_insufficient",
@@ -394,8 +393,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "root_cause": "bandwidth_insufficient",
@@ -435,8 +433,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "root_cause": "bandwidth_insufficient",
@@ -476,8 +473,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "root_cause": "bandwidth_insufficient",
@@ -517,8 +513,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "root_cause": "bandwidth_insufficient",
@@ -558,8 +553,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops",
-          "dropped",
+          "budget_drops>0",
           "fps"
         ],
         "root_cause": "bandwidth_insufficient",
@@ -1225,6 +1219,7 @@
       "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
       "repair": {
         "height": 720,
+        "preset": "ultrafast",
         "width": 1280
       },
       "seed": 75
@@ -1266,6 +1261,7 @@
       "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
       "repair": {
         "height": 720,
+        "preset": "ultrafast",
         "width": 1280
       },
       "seed": 76
@@ -1307,6 +1303,7 @@
       "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
       "repair": {
         "height": 720,
+        "preset": "ultrafast",
         "width": 1280
       },
       "seed": 77

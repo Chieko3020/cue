@@ -320,6 +320,147 @@ double median(std::vector<double> v) {
   return 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
+// ------------------------------------------------- N-22：候选的取值谓词
+//
+// 语法与语义写在 eval.h 的 EvidenceCandidate 注释里（那里是给后人的规范）。这里只放
+// 实现，并把两处"容易写错"的口径固定在代码旁边：
+//  · 键只比较归一化形态（大小写、空格、标点都归一）；值**不**归一，`==`/`!=` 按原样比；
+//  · 取值优先取结构化 data，data 里没有才回退 text——两套取值不能混着用，否则同一个
+//    键在 data 与 text 里不同步时，谓词会按"哪套更好通过"来判。
+
+std::string lower_copy(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char ch : s) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  return out;
+}
+
+std::string trim_copy(const std::string& s) {
+  std::size_t b = 0;
+  std::size_t e = s.size();
+  while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+  return s.substr(b, e - b);
+}
+
+// 整串必须是一个数（stod 默认接受前缀，这里要求用完所有字符）。
+bool parse_number(const std::string& s, double& out) {
+  if (s.empty()) return false;
+  std::size_t used = 0;
+  try {
+    out = std::stod(s, &used);
+  } catch (const std::exception&) {
+    return false;
+  }
+  return used == s.size() && std::isfinite(out);
+}
+
+// 观测里某个键的实际取值。found=false = 取不到（键不存在 / 不是标量）。
+struct ObservedScalar {
+  bool found = false;
+  bool numeric = false;
+  double number = 0.0;
+  std::string text;  // 非数值取值的原文；数值也留一份 dump，供字符串回退比较用
+};
+
+ObservedScalar observed_scalar(const Observation& o, const std::string& key) {
+  ObservedScalar v;
+  if (key.empty()) return v;
+  if (o.data.is_object()) {
+    for (auto it = o.data.begin(); it != o.data.end(); ++it) {
+      if (lower_copy(it.key()) != key) continue;
+      const json& val = it.value();
+      if (val.is_number()) {
+        v.found = true;
+        v.numeric = true;
+        v.number = val.get<double>();
+        v.text = val.dump();
+      } else if (val.is_string()) {
+        v.found = true;
+        v.text = val.get<std::string>();
+      } else if (val.is_boolean()) {
+        v.found = true;
+        v.text = val.get<bool>() ? "true" : "false";
+      }
+      // 键在 data 里但值是 null/数组/对象：没有可比较的标量，按"取不到"处理。
+      // 不回退 text：同一个键在两侧不一致时，回退只会让谓词挑更好过的那份取值。
+      return v;
+    }
+  }
+  // data 不是对象 / 对象里没有该键：从 text 里解析 key=VALUE（旧录制、纯文本观测）。
+  // 键边界必须严格：`query_metrics(5000ms)` 里的 metrics 不算一个字段。
+  const std::string low = lower_copy(o.text);
+  const auto boundary_char = [](char ch) {
+    return !(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '.');
+  };
+  for (std::size_t i = 0; i + key.size() <= low.size(); ++i) {
+    if (low.compare(i, key.size(), key) != 0) continue;
+    if (i > 0 && !boundary_char(low[i - 1])) continue;
+    std::size_t j = i + key.size();
+    while (j < low.size() &&
+           (std::isspace(static_cast<unsigned char>(low[j])) || low[j] == '"' || low[j] == '\'')) {
+      ++j;
+    }
+    if (j >= low.size() || (low[j] != '=' && low[j] != ':')) continue;
+    ++j;
+    while (j < low.size() &&
+           (std::isspace(static_cast<unsigned char>(low[j])) || low[j] == '"' || low[j] == '\'')) {
+      ++j;
+    }
+    const std::size_t v0 = j;
+    while (j < low.size()) {
+      const unsigned char u = static_cast<unsigned char>(low[j]);
+      if (std::isalnum(u) || low[j] == '.' || low[j] == '-' || low[j] == '+' || low[j] == '_') {
+        ++j;
+      } else {
+        break;
+      }
+    }
+    if (j == v0) continue;
+    v.found = true;
+    v.text = o.text.substr(v0, j - v0);
+    v.numeric = parse_number(v.text, v.number);
+    return v;
+  }
+  return v;
+}
+
+bool predicate_holds(const EvidenceCandidate& cand, const ObservedScalar& v, std::string& why) {
+  if (!v.found) {
+    why = "观测里没有 " + cand.key + " 的取值（无法验证 " + cand.key + cand.op + cand.value + "）";
+    return false;
+  }
+  double lhs = v.number;
+  double rhs = 0.0;
+  bool lhs_num = v.numeric;
+  if (!lhs_num) lhs_num = parse_number(v.text, lhs);
+  const bool rhs_num = parse_number(cand.value, rhs);
+  if (lhs_num && rhs_num) {
+    bool ok = false;
+    if (cand.op == ">") ok = lhs > rhs;
+    else if (cand.op == ">=") ok = lhs >= rhs;
+    else if (cand.op == "<") ok = lhs < rhs;
+    else if (cand.op == "<=") ok = lhs <= rhs;
+    else if (cand.op == "==") ok = lhs == rhs;
+    else if (cand.op == "!=") ok = lhs != rhs;
+    if (!ok) {
+      // 不成立也要写原因：否则上层只能报出"候选键没出现"这类误导性结论。
+      why = "取值为 " + v.text + "，不满足 " + cand.key + cand.op + cand.value;
+    }
+    return ok;
+  }
+  if (cand.op == "==" || cand.op == "!=") {
+    // 字符串比较按原样（不做大小写折叠）：谓词里写的就是观测里该出现的字面量。
+    const bool eq = v.text == cand.value;
+    const bool ok = cand.op == "==" ? eq : !eq;
+    if (!ok) why = "取值为 " + v.text + "，不满足 " + cand.key + cand.op + cand.value;
+    return ok;
+  }
+  // 大小比较遇到非数值：不猜、不当 0——明确判不满足并把原因带出去。
+  why = "非数值无法比较：" + cand.key + "=" + v.text + " " + cand.op + " " + cand.value;
+  return false;
+}
+
 }  // namespace
 
 bool evidence_matches(const std::string& evidence, const std::vector<Observation>& obs) {
@@ -335,6 +476,97 @@ bool evidence_matches(const std::string& evidence, const std::vector<Observation
   return false;
 }
 
+EvidenceCandidate parse_evidence_candidate(const std::string& raw) {
+  EvidenceCandidate c;
+  const std::string s = trim_copy(raw);
+  // 从右往左找**最后一个**比较运算符：值里不会出现运算符，key 里不能有。
+  // 从右切是为了让 `key` 里可能出现的 `.`/`_` 全部留在左边（例如 metrics.fps>0）。
+  for (std::size_t i = s.size(); i-- > 0;) {
+    const char ch = s[i];
+    if (ch != '>' && ch != '<' && ch != '=' && ch != '!') continue;
+    if (ch == '!') continue;  // 单独的 '!' 不是比较运算符（`!=` 由后面的 '=' 位置处理）
+    std::size_t op_begin = i;
+    std::string op(1, ch);
+    if (i > 0) {
+      const char prev = s[i - 1];
+      const bool maybe_two = (ch == '=' && (prev == '>' || prev == '<' || prev == '=' || prev == '!'));
+      if (maybe_two) {
+        const std::string two = s.substr(i - 1, 2);
+        if (two == ">=" || two == "<=" || two == "==" || two == "!=") {
+          op = two;
+          op_begin = i - 1;
+        } else {
+          continue;  // "=!"、">" 之类的畸形两字符组合：不是运算符
+        }
+      } else if (ch == '>' && prev == '>') {
+        continue;
+      }
+    }
+    // 只认规范里的六个运算符。单个 '=' 之类的写法不合法：按"无谓词"处理（整串当 key），
+    // 保住旧行为——旧的候选串若恰好含 '='，过去是按字面 key 匹配的，不能突然变成
+    // 一个永远不成立的谓词。
+    if (op != ">" && op != ">=" && op != "<" && op != "<=" && op != "==" && op != "!=") continue;
+    const std::string key = trim_copy(s.substr(0, op_begin));
+    const std::string value = trim_copy(s.substr(i + 1));
+    if (key.empty() || value.empty()) continue;  // 畸形：继续往左找一个完整的 key OP value
+    c.key = lower_copy(key);
+    c.op = op;
+    c.value = value;
+    return c;
+  }
+  // 没有可用的运算符：整串就是 key（= 旧的无谓词候选）。
+  c.key = lower_copy(s);
+  return c;
+}
+
+bool evidence_candidate_matches(const std::string& evidence, const Observation& obs,
+                                const EvidenceCandidate& cand, std::string& why) {
+  if (normalize(evidence).find(normalize(cand.key)) == std::string::npos) {
+    why = "证据里没有候选键 " + cand.key;
+    return false;
+  }
+  if (!cand.has_predicate()) return true;  // 旧行为：键出现即命中（逐字节一致）
+  return predicate_holds(cand, observed_scalar(obs, cand.key), why);
+}
+
+namespace {
+
+// 一条证据是否命中 case 的候选指标（N-22 之后的完整口径）。
+// 无谓词：仍是「归一化子串命中 key 即成立」（旧行为）。
+// 有谓词：必须先找到**能承载这条引用**的观测（matches_observation），再用该观测里
+// 该键的实际取值判谓词——不能拿另一条观测的取值来凑，否则"引用 A、取值看 B"又成了
+// 新的钻空子方式。
+bool evidence_hits_candidates(const std::string& evidence, const std::vector<Observation>& obs,
+                              const std::vector<std::string>& cands, std::string& why) {
+  const std::string n = normalize(evidence);
+  const auto cites = find_citations(evidence);
+  std::string first_why;
+  for (const auto& raw : cands) {
+    const EvidenceCandidate cand = parse_evidence_candidate(raw);
+    if (n.find(normalize(cand.key)) == std::string::npos) {
+      if (first_why.empty()) first_why = "证据里没有候选键 " + cand.key;
+      continue;
+    }
+    if (!cand.has_predicate()) return true;
+    bool checked = false;  // 是否有观测既承载该引用、又给出了该键的取值
+    for (const auto& o : obs) {
+      if (o.text.empty() && !o.data.is_object()) continue;
+      if (!matches_observation(n, cites, o)) continue;
+      checked = true;
+      std::string r;
+      if (evidence_candidate_matches(evidence, o, cand, r)) return true;
+      if (first_why.empty()) first_why = r;
+    }
+    if (!checked && first_why.empty()) {
+      first_why = "承载该证据的观测里没有 " + cand.key + " 的取值";
+    }
+  }
+  why = first_why.empty() ? std::string("证据没有命中 case 声明的候选指标") : first_why;
+  return false;
+}
+
+}  // namespace
+
 Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<Observation>& obs,
                  const Metrics& m) {
   Score s;
@@ -345,20 +577,16 @@ Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<O
     for (const auto& ev : res.diagnosis.evidence) {
       if (!evidence_matches(ev, obs)) {
         s.evidence = false;
+        s.evidence_reason = "证据不是真实观测里的逐字引用: " + short_text(ev);
         break;
       }
-      // 还必须命中 case 声明的候选指标：否则"引用观测里出现过的无关数字"也算成立
+      // 还必须命中 case 声明的候选指标：否则"引用观测里出现过的无关数字"也算成立。
+      // N-22 起候选可带取值谓词：键出现只是第一层，"取值能不能支持结论"是第二层。
       if (!c.evidence_candidates.empty()) {
-        const std::string n = normalize(ev);
-        bool hit = false;
-        for (const auto& cand : c.evidence_candidates) {
-          if (n.find(normalize(cand)) != std::string::npos) {
-            hit = true;
-            break;
-          }
-        }
-        if (!hit) {
+        std::string why;
+        if (!evidence_hits_candidates(ev, obs, c.evidence_candidates, why)) {
           s.evidence = false;
+          s.evidence_reason = why;
           break;
         }
       }
@@ -1545,9 +1773,14 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   // 与 injected=59 同性质，不是实测值；真管线路径的读数才是证据。
   // 注意 e2e_fec_ghost_discarded 要按**常态**给（FEC 校验包每帧一次），
   // 不能写成 0——那会让"零丢包也非零"的真实口径在自检路径上失真。
+  //
+  // N-22：rate 类的候选现在是 `budget_drops>0`。这条自检路径给的是"该类故障会看到的
+  // 那组数"，而 rate 故障真的发生时令牌桶被抽干（N-23 真源实测 78~82），所以这里给 82；
+  // 若仍写死 0，rate 类 case 的自检证据会因谓词恒假而变红，那是把判分器测成红的。
+  const int fake_budget_drops = c.fault_kind == "rate" ? 82 : 0;
   ob.data = json{{"fps", 30.3},        {"frames_in", 247},   {"frames_out", 247},
                  {"dropped", 0},       {"injected", 59},     {"decoded", 247},
-                 {"decode_errors", 0}, {"budget_drops", 0},  {"encode_p50_ms", 6.4},
+                 {"decode_errors", 0}, {"budget_drops", fake_budget_drops},  {"encode_p50_ms", 6.4},
                  {"encode_p99_ms", 9.1}, {"op_p50_ms", 0.3}, {"samples", 1},
                  {"send_p50_ms", 201.2}, {"send_p99_ms", 233.0},
                  {"delayed_pkts", 120},  {"delayed_max_us", 233000}, {"ingress_late", 0},
@@ -1570,8 +1803,9 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   fake.diagnosis.root_cause = c.expect_root_cause;
   // 证据同样按 case 的候选指标构造（否则非丢包类的 case 会在这条自检路径里恒假）：
   // 逐字从假观测里摘 key=value，和真管线路径的口径一致。
+  // N-22：候选可能带取值谓词（budget_drops>0），取片段时只传 key 部分，否则永远摘不到。
   for (const auto& cand : c.evidence_candidates) {
-    const std::string frag = observation_fragment(ob.text, cand);
+    const std::string frag = observation_fragment(ob.text, parse_evidence_candidate(cand).key);
     if (frag.empty()) continue;
     fake.diagnosis.evidence.push_back(frag);
     if (fake.diagnosis.evidence.size() >= 2) break;
@@ -1588,6 +1822,11 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   m.decoded = 247;
   m.probe = simulated_probe(c);
   o.score = judge_case(c, fake, obs, m);
+  if (!o.score.evidence && !o.score.evidence_reason.empty()) {
+    // N-22：证据 ✗ 必须能自解释——是引用造假，还是"字段真实但取值不支持结论"。
+    std::fprintf(stderr, "[eval][%s] 证据不成立：%s\n", c.id.c_str(),
+                 o.score.evidence_reason.c_str());
+  }
   o.scored = true;
   o.turns = fake.turns;
   o.cost_yuan = fake.cost_yuan;
@@ -1839,10 +2078,11 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
                    " / " + q.error().message;
     return o;
   }
-  // 假 agent 的证据 = 从这次真实观测里逐字摘抄 case 声明的候选指标（不编造、不改写）
+  // 假 agent 的证据 = 从这次真实观测里逐字摘抄 case 声明的候选指标（不编造、不改写）。
+  // N-22：候选可带取值谓词，取片段只传 key 部分（`budget_drops>0` → 摘 `budget_drops=82`）。
   std::vector<std::string> evidence;
   for (const auto& cand : c.evidence_candidates) {
-    const std::string frag = observation_fragment(q->content, cand);
+    const std::string frag = observation_fragment(q->content, parse_evidence_candidate(cand).key);
     if (frag.empty()) continue;
     evidence.push_back(frag);
     if (evidence.size() >= 2) break;
@@ -2006,6 +2246,10 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   for (const auto& t : trace) obs.push_back(Observation{t.tool, t.text, t.data});
 
   o.score = judge_case(c, fake, obs, m);
+  if (!o.score.evidence && !o.score.evidence_reason.empty()) {
+    std::fprintf(stderr, "[eval][%s] 证据不成立：%s\n", c.id.c_str(),
+                 o.score.evidence_reason.c_str());
+  }
   o.scored = true;
   o.turns = fake.turns;
   o.cost_yuan = fake.cost_yuan;
@@ -2513,6 +2757,10 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   } else {
     o.scored = true;
     o.score = judge_case(c, res, obs, m);
+    if (!o.score.evidence && !o.score.evidence_reason.empty()) {
+      std::fprintf(stderr, "[eval][%s] 证据不成立：%s\n", c.id.c_str(),
+                   o.score.evidence_reason.c_str());
+    }
   }
   pipe->stop();  // 每个 case 独占一条管线；StopGuard 兜底
 }
