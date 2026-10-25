@@ -186,8 +186,10 @@ target_include_directories(cue_proto INTERFACE ${CUE_PROTO_INCLUDE})
 # media/jitter_buffer：cued 与 probe 共用同一份实现（两侧的「buffer」段口径必须一致，
 # 否则两张图上的抖动缓冲延迟没法互相对照）。
 # media/audio_decoder：上行音频（type=0x02）的 Opus 解码，PCM 只用来算指标、不下行。
+# media/token_bucket：SPEC §7.2 / FR-PIPE.8 的下行限速。实际在 apps/cued.cpp 里内联过，
+# N-07 抽到 media 层（纯组件、时间从参数进来），单测见 tests/test_token_bucket.cpp。
 add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp
-  src/media/jitter_buffer.cpp src/media/audio_decoder.cpp)
+  src/media/jitter_buffer.cpp src/media/audio_decoder.cpp src/media/token_bucket.cpp)
 target_link_libraries(cued PRIVATE cue_proto cue_control cue_headers_all ${CUE_BOOST_SYSTEM_LIB}
   Threads::Threads PkgConfig::FFMPEG PkgConfig::OPUS)
 target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
@@ -450,6 +452,14 @@ add_executable(test_jitter_buffer tests/test_jitter_buffer.cpp src/media/jitter_
 target_link_libraries(test_jitter_buffer PRIVATE cue_proto)
 add_test(NAME jitter_buffer COMMAND test_jitter_buffer)
 
+# media/token_bucket（技术设计文档 §13.1 的同名行，N-07）：速率生效 / 非关键帧不足即丢
+# （且失败不扣令牌）/ 关键帧透支上限 −burst / 先丢非关键帧 / 时间回拨不产生负增长 /
+# 首次调用不按 0→now 补令牌 / set_rate 立刻生效且不重置突发、不丢令牌。
+# 同样是纯组件：不读时钟、不起线程，假时钟显式传入，毫秒级跑完。
+add_executable(test_token_bucket tests/test_token_bucket.cpp src/media/token_bucket.cpp)
+target_link_libraries(test_token_bucket PRIVATE cue_proto)
+add_test(NAME token_bucket COMMAND test_token_bucket)
+
 # T-05 UDS 控制通道：两种 socket 类型的往返/id 回填、坏请求不带走服务端、
 # set_param 不重建编码器、超长消息被拒但连接保留、重连后 id 从 1 重新开始。
 # 只链 cue_control：不需要 cued/FFmpeg，所以 ctest 里毫秒级跑完。
@@ -522,6 +532,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
+  test_token_bucket
   test_control_channel test_tools test_delay_injector test_nack test_capture
   test_audio_decoder test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)

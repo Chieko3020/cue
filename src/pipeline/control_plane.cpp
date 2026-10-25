@@ -265,7 +265,7 @@ bool apply_fault(const std::string& kind, double value, RuntimeParams& draft, st
   if (value <= 0.0) {
     next.inject_drop = 0.0;
     next.inject_ingress_drop = 0.0;
-    next.send_mbps = 10.0;  // SPEC §7.2 的默认链路：10 Mbps / 64 包突发
+    next.send_mbps = 10.0;  // SPEC §7.2 的默认链路：10 Mbps / 512 包突发
     next.queue_fps = 0.0;
     next.inject_delay_ms = 0.0;
     next.inject_jitter_ms = 0.0;

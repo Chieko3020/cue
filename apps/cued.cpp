@@ -56,6 +56,7 @@ extern "C" {
 #include "cue/media/encoder.h"
 #include "cue/media/h264_decoder.h"
 #include "cue/media/jitter_buffer.h"
+#include "cue/media/token_bucket.h"
 #include "cue/pipeline/control_plane.h"
 #include "cue/pipeline/session_registry.h"
 #include "cue/proto/wire.h"
@@ -286,65 +287,8 @@ class RetransmitCache {
   std::deque<std::pair<uint32_t, std::vector<std::vector<uint8_t>>>> frames_;
 };
 
-// 令牌桶：SPEC §7.2「10 Mbps 速率 + 关键帧透支上限 512 包」。
-// 口径按**包**计费（包大小按 kMaxUdpPayload + 24 B 头折算成包速率），这样 24 B/包的
-// 头开销不会被漏算；突发是一个常量包数，而不是"5% 窗口字节数"。
-// 不足时先丢非关键帧：关键帧允许透支，但透支上限仍是有限的，关键帧风暴不能无限超发。
-//
-// 突发量为什么是 512 而不是规格最初写的 64：64 包 ≈ 76 KB，隐含假设"一帧的分片数
-// 不超过 64"，而 1080p 的 IDR 有 100~200 个分片 —— 令牌一空整帧关键帧被丢，
-// 每个 GOP 边界断一次参考链（实测 budget_drops 6 Mbps 时 11 次、12 Mbps 时 41 次，
-// 码率越高丢得越多，因为 IDR 更大）。突发量是**容忍度**不是速率，取 512 仍是有界的。
-// 为什么不按"码率 × 时长"推导：要覆盖的是**单个关键帧的大小**，而它与平均码率不是
-// 线性关系（同一码率下 Keyframe 大小随场景剧烈变化），按时间算反而算不准。
-class TokenBucket {
- public:
-  // 关键帧允许透支的包数上限。
-  //
-  // 512 包 ≈ 600 KB，足以覆盖 1080p/4K 的单个 IDR；真正的限速靠 refill()，
-  // 不是这个上限。上限本身的取值理由见类上方注释（那里也写了被丢的关键帧会造成什么）。
-  static constexpr double kBurstPackets = 512.0;
-  static constexpr double kPacketBytes =
-      double(cue::proto::kMaxUdpPayload + cue::proto::kDatagramHeaderSize);
-
-  explicit TokenBucket(double bits_per_sec) { set_rate(bits_per_sec); }
-
-  // 运行期改速率上限（fault.set kind=rate）：速率是令牌桶唯一的可变量，
-  // 原地改不会丢令牌、也不打乱突发——所以这一步不需要重建任何东西。
-  void set_rate(double bits_per_sec) {
-    rate_pkts_.store(bits_per_sec / 8.0 / kPacketBytes, std::memory_order_relaxed);
-  }
-
-  // 非关键帧：令牌不够就丢（不排队）
-  bool take_nonkey(std::size_t pkts, int64_t now_us) {
-    refill(now_us);
-    if (tokens_ < double(pkts)) return false;
-    tokens_ -= double(pkts);
-    return true;
-  }
-  // 关键帧：允许透支到 -burst，保证"先丢非关键帧"这条语义真的成立
-  bool take_key(std::size_t pkts, int64_t now_us) {
-    refill(now_us);
-    if (tokens_ - double(pkts) < -kBurstPackets) return false;
-    tokens_ -= double(pkts);
-    return true;
-  }
-
- private:
-  void refill(int64_t now_us) {
-    if (last_us_ == 0) last_us_ = now_us;
-    // 时间回拨（NTP/CLOCK_MONOTONIC 不会，但参数注入的假时钟可能）不能让 dt 变负
-    const double dt = now_us > last_us_ ? double(now_us - last_us_) / 1e6 : 0.0;
-    last_us_ = now_us;
-    tokens_ = std::min(kBurstPackets, tokens_ + dt * rate_pkts_.load(std::memory_order_relaxed));
-  }
-
-  // 控制线程写、媒体线程读：atomic<double> 在 x86-64 上无锁，读到的要么是旧速率
-  // 要么是新速率，不会出现"半个 double"（那会让令牌桶按乱码速率灌令牌）。
-  std::atomic<double> rate_pkts_{0.0};
-  double tokens_ = kBurstPackets;
-  int64_t last_us_ = 0;
-};
+// 令牌桶实现在 media/token_bucket.h（cue::media::TokenBucket）：突发量为什么取 512、
+// 为什么按包计费、为什么不按「码率×时长」推导，取值理由都写在那里。
 
 // 限流日志：同一类错误 1 s 内只打一行（弱网/配置错误不能把 stderr 刷爆）
 struct RateLimitedLog {
@@ -1106,7 +1050,7 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   // （上一帧的尾巴参与下一帧的重叠相加），跨会话共用会把上一路的余音串到下一路。
   // 懒打开：只推视频的会话不付创建解码器的代价。
   cue::media::OpusAudioDecoder audio_dec;
-  TokenBucket bucket(params.snapshot().params.send_mbps * 1e6);
+  cue::media::TokenBucket bucket(params.snapshot().params.send_mbps * 1e6);
   CodecConfig codec_cfg;
   uint32_t upstream_stream_id = 0;  // 客户端自报的流号，只作记录（下行用服务端会话号）
 
@@ -1513,7 +1457,8 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
       datagrams = cue::proto::split_into_datagrams(payload, session_id, frame_id, pts_us,
                                                    keyframe, &split_err, out_codec);
       if (!datagrams.empty()) {
-        // SPEC §7.2 令牌桶：按包计费（含 24 B 头）、64 包突发、不足时先丢非关键帧
+        // SPEC §7.2 令牌桶：按包计费（含 24 B 头）、512 包突发、不足时先丢非关键帧
+        //（实现与取值理由见 media/token_bucket.h）
         budget_ok = keyframe ? bucket.take_key(datagrams.size(), t_send0)
                              : bucket.take_nonkey(datagrams.size(), t_send0);
       }
