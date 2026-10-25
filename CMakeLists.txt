@@ -491,6 +491,16 @@ add_executable(test_tools tests/test_tools.cpp)
 target_link_libraries(test_tools PRIVATE cue_pipeline cue_agent)
 add_test(NAME tools COMMAND test_tools)
 
+# N-14：tool/schema 一致性。schema() 是**发给模型**的契约，而工具的真实声明在 ToolSpec 里；
+# 此前 tests/ 中没有任何一处调用 .schema()，"声明的参数"与"发给模型的 schema"可以静默漂移
+# （漏 desc、enum 写错、required 与 has_range 矛盾），模型侧只会拿到坏 schema。
+# 这里用真实注册表（build_real_tools）造 Registry，把 schema() 与 reg.specs() 逐项比对，
+# 期望值全部取自 ToolSpec 本身（不另抄一份，否则就是自证）。
+# 与 test_tools 同一口径：只链 cue_pipeline + cue_agent，不起 cued/FFmpeg。
+add_executable(test_tool_schema tests/test_tool_schema.cpp)
+target_link_libraries(test_tool_schema PRIVATE cue_pipeline cue_agent)
+add_test(NAME tool_schema COMMAND test_tool_schema)
+
 # T-10：延迟注入的决策序列（同一 seed 可复现、单侧均匀、注入值变化即重置）。
 # 纯算术，不起 cued。
 add_executable(test_delay_injector tests/test_delay_injector.cpp)
@@ -559,7 +569,7 @@ set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget
-  test_control_channel test_tools test_delay_injector test_nack test_capture
+  test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
   test_audio_decoder test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
   target_link_libraries(${_t} PRIVATE cue_headers_all)
@@ -682,10 +692,10 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # N-12：这份名单此前漏了 frame_guard / token_bucket / reassembly_budget —— 它们是
   # N-08/N-07/N-10 新增的单测，守卫当时还没加上（守卫本身也是 N-12 前后才有的），
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
-  # 现在名单 = 主构建全部 C++ 测试（31 项 = 32 − integration）。
+  # 现在名单 = 主构建全部 C++ 测试（32 项 = 33 − integration）。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
                      jitter_buffer token_bucket frame_guard reassembly_budget
-                     control_channel tools delay_injector nack capture config metrics
+                     control_channel tools tool_schema delay_injector nack capture config metrics
                      session_registry generator report audio_decoder h264_decoder avc_level)
   foreach(_t ${_cue_san_tests})
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")

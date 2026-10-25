@@ -1,6 +1,10 @@
 // proto 编解码往返与边界校验（M1 最小测试；不依赖测试框架，用 ctest 的退出码）
+// N-14 起还包含"多字节字段的线上字节序（golden bytes）"一组：见文件末尾那段注释。
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <initializer_list>
+#include <string>
 #include <vector>
 
 #include "cue/proto/wire.h"
@@ -14,6 +18,30 @@ void check(bool cond, const char* what) {
     std::printf("FAIL: %s\n", what);
     ++failures;
   }
+}
+
+// 一串字节的十六进制表示（大写、空格分隔），失败信息里打出来给人看。
+std::string hex_range(const uint8_t* p, std::size_t n) {
+  std::string s;
+  char buf[4];
+  for (std::size_t i = 0; i < n; ++i) {
+    std::snprintf(buf, sizeof buf, "%02X", p[i]);
+    if (i != 0) s.push_back(' ');
+    s += buf;
+  }
+  return s;
+}
+
+// 逐字节比对：失败时打出「期望字节 / 实际字节」两行。
+// 比 `a == b` 那种断言多出来的价值就在这里——线格式错的时候，"差在哪个字节、
+// 变成了什么"是唯一能立刻定位问题的信息（端序反了会整段倒过来，位置挪了只差几项）。
+void check_bytes(const std::string& what, const uint8_t* got,
+                 std::initializer_list<uint8_t> want) {
+  const std::vector<uint8_t> w(want);
+  if (std::equal(w.begin(), w.end(), got)) return;
+  std::printf("FAIL: %s\n  期望字节: %s\n  实际字节: %s\n", what.c_str(),
+              hex_range(w.data(), w.size()).c_str(), hex_range(got, w.size()).c_str());
+  ++failures;
 }
 
 }  // namespace
@@ -263,6 +291,153 @@ int main() {
     fh.type = static_cast<uint8_t>(DownType::Feedback);
     const auto fhd = encode(fh);
     check(fhd[1] == 0x06, "feedback 的 DownType=0x06");
+  }
+
+  // ---- N-14：多字节字段的**线上字节序**（golden bytes）----
+  //
+  // 这条测试锁定的是**线上字节序**，不是宿主字节序：wire.h 的 detail::put_u16/u32/u64 是
+  // 显式移位拼装（p[i] = v >> (8*i)），与宿主端序无关——换到一台大端机器上，这段代码
+  // 发出的字节仍然和这里写的一模一样，所以这些断言在大端机器上也成立，它们描述的是"发
+  // 出去的字节永远长这样"，而不是"本机是小端"。反过来，任何把 put_* 改成
+  // memcpy/强转指针、或把移位方向改反的改动，都会被这几行以「期望字节 / 实际字节」抓住。
+  //
+  // 取值刻意选成各字节互不相同的模式（0x01020304、0x11223344、0xA1B2…）：
+  // 用 0x00000001 这类值，大部分端序错法会"碰巧通过"；只有每个字节都不同，反序、位移、
+  // 高字节被吞这几种错法才都会被区分出来。
+  {
+    // ---- 上行媒体头：u32 若干 + u64 一个 ----
+    MediaHeader h;
+    h.type = static_cast<uint8_t>(MediaType::Video);
+    h.codec = static_cast<uint8_t>(Codec::H264);
+    h.flags = kUpFlagKeyframe;
+    h.stream_id = 0x01020304u;
+    h.frame_id = 0x11223344u;
+    h.frag_index = 0x000001B2u;  // 434：既要各字节互不相同，又要是合法分片（< frag_count）
+    h.frag_count = 0x000001B3u;  // 435
+    h.pts_us = 0x1122334455667788ull;
+    h.payload_len = 16;
+    const auto hb = encode(h);
+    check_bytes("media: magic/type/codec/flags 位于 0..3", hb.data(), {0xC1, 0x01, 0x01, 0x01});
+    check_bytes("media: stream_id(u32)=0x01020304 → LE 04 03 02 01", &hb[4],
+                {0x04, 0x03, 0x02, 0x01});
+    check_bytes("media: frame_id(u32)=0x11223344 → LE 44 33 22 11", &hb[8],
+                {0x44, 0x33, 0x22, 0x11});
+    check_bytes("media: frag_index(u32)=0x000001B2 → LE B2 01 00 00", &hb[12],
+                {0xB2, 0x01, 0x00, 0x00});
+    check_bytes("media: frag_count(u32)=0x000001B3 → LE B3 01 00 00", &hb[16],
+                {0xB3, 0x01, 0x00, 0x00});
+    check_bytes("media: pts_us(u64)=0x1122334455667788 → LE 88 77 66 55 44 33 22 11", &hb[20],
+                {0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11});
+    check_bytes("media: payload_len(u32)=16 → LE 10 00 00 00", &hb[28], {0x10, 0x00, 0x00, 0x00});
+    // 字节对了还要能解回来（只对一半的实现——比如写对了读反了——在这里会暴露）
+    {
+      std::vector<uint8_t> pkt(hb.begin(), hb.end());
+      pkt.resize(kMediaHeaderSize + 16, 0x5A);
+      const auto m = decode_media({pkt.data(), pkt.size()});
+      check(m.has_value(), "media: golden 字节可解");
+      if (m) {
+        check(m->stream_id == 0x01020304u, "media: stream_id 往返");
+        check(m->frame_id == 0x11223344u, "media: frame_id 往返");
+        check(m->frag_index == 0x000001B2u, "media: frag_index 往返");
+        check(m->frag_count == 0x000001B3u, "media: frag_count 往返");
+        check(m->pts_us == 0x1122334455667788ull, "media: pts_us 往返");
+      }
+    }
+
+    // ---- 下行数据报头：u16 两个 + u32 两个 + u64 一个 ----
+    DatagramHeader d;
+    d.type = static_cast<uint8_t>(DownType::Video);
+    d.flags = kDownFlagKeyframe;
+    d.codec = static_cast<uint8_t>(Codec::H264);
+    d.session_id = 0x0A0B0C0Du;
+    d.frame_id = 0x11223344u;
+    d.frag_index = 0x1234u;
+    d.frag_count = 0xABCDu;
+    d.pts_us = 0x0102030405060708ull;
+    const auto db = encode(d);
+    check_bytes("datagram: magic/type/flags/codec 位于 0..3", db.data(),
+                {0xD1, 0x01, 0x01, 0x01});
+    check_bytes("datagram: session_id(u32)=0x0A0B0C0D → LE 0D 0C 0B 0A", &db[4],
+                {0x0D, 0x0C, 0x0B, 0x0A});
+    check_bytes("datagram: frame_id(u32)=0x11223344 → LE 44 33 22 11", &db[8],
+                {0x44, 0x33, 0x22, 0x11});
+    check_bytes("datagram: frag_index(u16)=0x1234 → LE 34 12", &db[12], {0x34, 0x12});
+    check_bytes("datagram: frag_count(u16)=0xABCD → LE CD AB", &db[14], {0xCD, 0xAB});
+    check_bytes("datagram: pts_us(u64)=0x0102030405060708 → LE 08 07 06 05 04 03 02 01",
+                &db[16], {0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01});
+    {
+      const auto back = decode_datagram({db.data(), db.size()});
+      check(back.has_value(), "datagram: golden 字节可解");
+      if (back) {
+        check(back->session_id == 0x0A0B0C0Du, "datagram: session_id 往返");
+        check(back->frame_id == 0x11223344u, "datagram: frame_id 往返");
+        check(back->frag_index == 0x1234u, "datagram: frag_index 往返");
+        check(back->frag_count == 0xABCDu, "datagram: frag_count 往返");
+        check(back->pts_us == 0x0102030405060708ull, "datagram: pts_us 往返");
+      }
+    }
+
+    // ---- FEC 载荷头：u32 + u16 + u16（SPEC §7.2 的 8 字节）----
+    FecPayloadHeader f;
+    f.base_frame_id = 0xCAFEBABEu;
+    f.group_index = 0x00FFu;
+    f.member_count = 0x0800u;
+    const auto fb = encode(f);
+    check(fb.size() == kFecPayloadHeaderSize && kFecPayloadHeaderSize == 8,
+          "fec: 载荷头 8 字节");
+    check_bytes("fec: base_frame_id(u32)=0xCAFEBABE → LE BE BA FE CA", &fb[0],
+                {0xBE, 0xBA, 0xFE, 0xCA});
+    check_bytes("fec: group_index(u16)=0x00FF → LE FF 00", &fb[4], {0xFF, 0x00});
+    check_bytes("fec: member_count(u16)=0x0800 → LE 00 08", &fb[6], {0x00, 0x08});
+    {
+      const auto back = decode_fec_payload_header({fb.data(), fb.size()});
+      check(back.has_value(), "fec: golden 字节可解");
+      if (back) {
+        check(back->base_frame_id == 0xCAFEBABEu, "fec: base_frame_id 往返");
+        check(back->group_index == 0x00FFu, "fec: group_index 往返");
+        check(back->member_count == 0x0800u, "fec: member_count 往返");
+      }
+    }
+
+    // ---- feedback 载荷（wire.h 里叫 FeedbackPayload，没有 FeedbackHeader 这个类型）----
+    // 四个 f32 按位当作 u32 走 put_u32，所以字节序规则与整数完全一致；
+    // 位模式固定写出来，证的是"f32 的位模式也按小端摆"，而不是"这台机器的浮点布局"。
+    FeedbackPayload fbk;
+    fbk.loss_rate = 0.5f;           // 0x3F000000
+    fbk.recv_bitrate_mbps = -1.0f;  // 0xBF800000（"没有可靠值"）
+    fbk.jitter_ms = 12.5f;          // 0x41480000
+    fbk.rtt_ms = -1.0f;
+    const auto fbb = encode(fbk);
+    check(fbb.size() == kFeedbackPayloadSize && kFeedbackPayloadSize == 16,
+          "feedback: 载荷 16 字节");
+    check_bytes("feedback: loss_rate(f32)=0.5 → 0x3F000000 → LE 00 00 00 3F", &fbb[0],
+                {0x00, 0x00, 0x00, 0x3F});
+    check_bytes("feedback: recv_bitrate_mbps(f32)=-1 → 0xBF800000 → LE 00 00 80 BF", &fbb[4],
+                {0x00, 0x00, 0x80, 0xBF});
+    check_bytes("feedback: jitter_ms(f32)=12.5 → 0x41480000 → LE 00 00 48 41", &fbb[8],
+                {0x00, 0x00, 0x48, 0x41});
+    {
+      const auto back = decode_feedback({fbb.data(), fbb.size()});
+      check(back.has_value(), "feedback: golden 字节可解");
+      if (back) {
+        check(back->loss_rate == 0.5f, "feedback: loss_rate 往返");
+        check(back->recv_bitrate_mbps == -1.0f, "feedback: recv_bitrate_mbps 往返");
+        check(back->jitter_ms == 12.5f, "feedback: jitter_ms 往返");
+        check(back->rtt_ms == -1.0f, "feedback: rtt_ms 往返");
+      }
+    }
+
+    // ---- NACK 条目：u32 frame_id + u16 frag_index（变长载荷，逐条拼接）----
+    {
+      std::vector<uint8_t> entries;
+      append_nack_entry(entries, NackEntry{0x0A0B0C0Du, 0x1234u});
+      check(entries.size() == kNackEntrySize && kNackEntrySize == 6, "nack: 条目 6 字节");
+      check_bytes("nack: frame_id(u32)=0x0A0B0C0D | frag_index(u16)=0x1234 → LE 0D 0C 0B 0A 34 12",
+                  entries.data(), {0x0D, 0x0C, 0x0B, 0x0A, 0x34, 0x12});
+      const auto back = decode_nack_entries({entries.data(), entries.size()});
+      check(back.size() == 1 && back[0].frame_id == 0x0A0B0C0Du && back[0].frag_index == 0x1234u,
+            "nack: 条目往返");
+    }
   }
 
   if (failures == 0) {
