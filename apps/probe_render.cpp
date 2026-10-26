@@ -493,8 +493,9 @@ Renderer::Renderer() = default;
 Renderer::~Renderer() = default;
 bool Renderer::available() { return false; }
 const char* Renderer::backend_name() { return "none"; }
+std::vector<std::string> Renderer::audio_outputs() { return {}; }
 bool Renderer::open(const RenderConfig&, std::string& err) {
-  err = "本构建没有 SDL2 支持（配置时未找到 sdl2）：--render 不可用";
+  err = "本构建没有 SDL2 支持（配置时禁用或未找到 sdl2）：--render 不可用";
   return false;
 }
 void Renderer::draw_yuv(const void*) {}
@@ -506,13 +507,6 @@ int Renderer::queued_ms() const { return -1; }
 void Renderer::reset_audio() {}
 void Renderer::enable_snapshot(int, std::string) {}
 Renderer::AudioStats Renderer::audio_stats() const { return AudioStats{}; }
-void Renderer::enable_snapshot(int every_ms, std::string prefix) {
-  if (impl_ == nullptr) return;
-  impl_->snap_every_ms = every_ms > 0 ? every_ms : 0;
-  impl_->snap_prefix = std::move(prefix);
-  impl_->snap_last_ms = 0;
-  impl_->snap_count = 0;
-}
 
 bool Renderer::pump_events() { return false; }
 

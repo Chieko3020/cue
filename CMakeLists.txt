@@ -201,12 +201,15 @@ target_compile_options(cued PRIVATE -Wno-deprecated-declarations)
 # 所以连 audio_decoder.cpp 与 opus 一起链进来——之前 probe 不解音频，链接里没有这些。
 # 渲染/播放（"能看能听"）：SDL2 是**可选**依赖。无头环境（CI、服务器）没有它，
 # probe 照常工作，只是 --render 在运行期明确报错。
+option(CUE_ENABLE_SDL2 "探测 SDL2 并为 probe 启用渲染/播放（未找到时仅算指标）" ON)
 find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
+if(CUE_ENABLE_SDL2 AND PkgConfig_FOUND)
   pkg_check_modules(SDL2 QUIET sdl2)
 endif()
-if(SDL2_FOUND)
+if(CUE_ENABLE_SDL2 AND SDL2_FOUND)
   message(STATUS "SDL2 ${SDL2_VERSION}：probe 支持 --render（窗口 + 音频）")
+elseif(NOT CUE_ENABLE_SDL2)
+  message(STATUS "CUE_ENABLE_SDL2=OFF：probe 的 --render 不可用（只算指标）")
 else()
   message(STATUS "SDL2 未找到：probe 的 --render 不可用（只算指标）")
 endif()
@@ -216,7 +219,7 @@ add_executable(cue-probe apps/cue-probe.cpp apps/probe_render.cpp src/media/h264
   src/media/jitter_buffer.cpp)
 target_link_libraries(cue-probe PRIVATE cue_proto cue_headers_all Threads::Threads
   PkgConfig::FFMPEG PkgConfig::OPUS)
-if(SDL2_FOUND)
+if(CUE_ENABLE_SDL2 AND SDL2_FOUND)
   target_compile_definitions(cue-probe PRIVATE CUE_HAVE_SDL2=1)
   target_include_directories(cue-probe PRIVATE ${SDL2_INCLUDE_DIRS})
   target_link_libraries(cue-probe PRIVATE ${SDL2_LIBRARIES})
@@ -364,6 +367,11 @@ enable_testing()
 add_executable(test_wire tests/test_wire.cpp)
 target_link_libraries(test_wire PRIVATE cue_proto)
 add_test(NAME wire COMMAND test_wire)
+
+# 即使常规构建装有 SDL2，也编译并验证实际的无 SDL 分支。
+add_executable(test_probe_render_headless tests/test_probe_render_headless.cpp apps/probe_render.cpp)
+target_include_directories(test_probe_render_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+add_test(NAME probe_render_headless COMMAND test_probe_render_headless)
 
 # proto/frame_guard（技术设计文档 §13.1 的同名行，N-08）：幽灵帧守卫的两处调用点
 # （FEC 校验包 / 迟到的视频分片与 NACK 重传）抽成纯函数后，用单测钉住四条布尔入参的
@@ -692,8 +700,9 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # N-12：这份名单此前漏了 frame_guard / token_bucket / reassembly_budget —— 它们是
   # N-08/N-07/N-10 新增的单测，守卫当时还没加上（守卫本身也是 N-12 前后才有的），
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
-  # 现在名单 = 主构建全部 C++ 测试（32 项 = 33 − integration）。
+  # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
+                     probe_render_headless
                      jitter_buffer token_bucket frame_guard reassembly_budget
                      control_channel tools tool_schema delay_injector nack capture config metrics
                      session_registry generator report audio_decoder h264_decoder avc_level)

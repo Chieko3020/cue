@@ -101,9 +101,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++-1
 cmake --build build -j1
 ```
 
+SDL2 默认按可选依赖探测；仅需指标时可在配置命令追加 `-DCUE_ENABLE_SDL2=OFF`，即使已安装 SDL2 也不启用渲染/播放。此构建下 `cue-probe --render` 会明确报告不可用并继续指标模式。常规构建与 CTest 均包含 `probe_render_headless` 回归，始终编译实际无 SDL 分支并验证其公开接口。
+
 `-j1` 是这台机器的硬约束：2 vCPU / 1.9 GiB 上 `-j2` 同时编两个 libavcodec 相关 TU 会 OOM。默认 `CUE_WERROR=ON`，本仓库全量构建 0 warning；只看警告不愿被中断时重新 configure 加 `-DCUE_WERROR=OFF`。全量首次构建在 2 vCPU 上约 7 分钟。
 
-测试（22 项：20 个进程内单测 + 集成测试 + AC-13 静态检查；全量约 30 秒）：
+测试（实际注册清单可用 `ctest --test-dir build -N` 查看；包含无 SDL 接口回归 `probe_render_headless`）：
 
 ```bash
 ctest --test-dir build --output-on-failure
