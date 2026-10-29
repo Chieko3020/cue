@@ -374,6 +374,20 @@ add_executable(test_probe_render_headless tests/test_probe_render_headless.cpp a
 target_include_directories(test_probe_render_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
 add_test(NAME probe_render_headless COMMAND test_probe_render_headless)
 
+add_executable(test_audio_playback tests/test_audio_playback.cpp)
+target_include_directories(test_audio_playback PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+add_test(NAME audio_playback COMMAND test_audio_playback)
+if(CUE_ENABLE_SDL2 AND SDL2_FOUND)
+  add_executable(test_probe_render_sdl tests/test_probe_render_sdl.cpp apps/probe_render.cpp)
+  target_include_directories(test_probe_render_sdl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps
+    ${SDL2_INCLUDE_DIRS})
+  target_compile_definitions(test_probe_render_sdl PRIVATE CUE_HAVE_SDL2=1)
+  target_link_libraries(test_probe_render_sdl PRIVATE cue_headers_all PkgConfig::FFMPEG
+    ${SDL2_LIBRARIES})
+  add_test(NAME probe_render_sdl COMMAND test_probe_render_sdl)
+  set_tests_properties(probe_render_sdl PROPERTIES TIMEOUT 40)
+endif()
+
 add_executable(test_capture_process tests/test_capture_process.cpp)
 target_include_directories(test_capture_process PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
 target_link_libraries(test_capture_process PRIVATE cue_headers_all Threads::Threads)
@@ -599,7 +613,7 @@ set(CUE_TEST_TARGETS
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
-  test_audio_decoder test_audio_receiver test_h264_decoder test_config test_metrics)
+  test_audio_decoder test_audio_receiver test_audio_playback test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
   target_link_libraries(${_t} PRIVATE cue_headers_all)
 endforeach()
@@ -723,10 +737,13 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
-                     probe_render_headless capture_process probe_network
+                     probe_render_headless audio_playback capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget
                      control_channel tools tool_schema delay_injector nack capture config metrics
                      session_registry generator report audio_decoder audio_receiver h264_decoder avc_level)
+  if(TARGET test_probe_render_sdl)
+    list(APPEND _cue_san_tests probe_render_sdl)
+  endif()
   foreach(_t ${_cue_san_tests})
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
