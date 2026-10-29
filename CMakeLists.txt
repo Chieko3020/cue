@@ -216,6 +216,7 @@ endif()
 
 add_executable(cue-probe apps/cue-probe.cpp apps/probe_render.cpp src/media/h264_decoder.cpp
   src/media/audio_decoder.cpp
+  src/media/audio_receiver.cpp
   src/media/jitter_buffer.cpp)
 target_link_libraries(cue-probe PRIVATE cue_proto cue_headers_all Threads::Threads
   PkgConfig::FFMPEG PkgConfig::OPUS)
@@ -559,6 +560,12 @@ add_executable(test_audio_decoder tests/test_audio_decoder.cpp src/media/audio_d
 target_link_libraries(test_audio_decoder PRIVATE cue_capture)
 add_test(NAME audio_decoder COMMAND test_audio_decoder)
 
+add_executable(test_audio_receiver tests/test_audio_receiver.cpp src/media/audio_receiver.cpp
+  src/media/audio_decoder.cpp)
+target_link_libraries(test_audio_receiver PRIVATE cue_capture)
+add_test(NAME audio_receiver COMMAND test_audio_receiver)
+set_tests_properties(audio_receiver PROPERTIES TIMEOUT 30)
+
 # T-31：H.264 解码器的内存契约。这条测试是为一个真实事故加的——旧实现把上一张输出帧
 # 的引用留到下一次 drain 才放（而 avcodec_send_packet 在那之前就已经引用了它），于是每帧
 # 漏一整个帧缓冲：1080p ≈3.1 MB/帧，cued 与 probe 都涨到 GB 级后被 cgroup OOM 杀掉。
@@ -592,7 +599,7 @@ set(CUE_TEST_TARGETS
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
-  test_audio_decoder test_h264_decoder test_config test_metrics)
+  test_audio_decoder test_audio_receiver test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
   target_link_libraries(${_t} PRIVATE cue_headers_all)
 endforeach()
@@ -719,7 +726,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
                      probe_render_headless capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget
                      control_channel tools tool_schema delay_injector nack capture config metrics
-                     session_registry generator report audio_decoder h264_decoder avc_level)
+                     session_registry generator report audio_decoder audio_receiver h264_decoder avc_level)
   foreach(_t ${_cue_san_tests})
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${CUE_SAN_ENV}")
   endforeach()
