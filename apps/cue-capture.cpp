@@ -76,10 +76,6 @@ extern "C" {
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #endif
-#if defined(_WIN32)
-#include <io.h>  // _popen/_pclose/_setmode/_fileno（Windows 分支，未编译验证）
-#include <stdio.h>
-#endif
 
 #include "cue/common/clock.h"
 #include "cue/media/annexb.h"
@@ -90,6 +86,8 @@ extern "C" {
 #include "cue/media/opus_encoder.h"
 #include "cue/proto/upstream_pack.h"
 #include "cue/proto/wire.h"
+
+#include "capture_child_process.h"
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -453,174 +451,8 @@ HostPlatform host_platform() {
 
 // ---------------------------------------------------------------- 子进程
 
-enum class IoStatus : uint8_t { Ok = 0, Timeout, Eof, Error };
-
-// 视频/音频源子进程：只读 stdout（ffmpeg 的 stderr 直接继承，参数里已把 loglevel 压到 error）。
-class ChildProcess {
- public:
-  ChildProcess() = default;
-  ~ChildProcess() { stop(); }
-  ChildProcess(const ChildProcess&) = delete;
-  ChildProcess& operator=(const ChildProcess&) = delete;
-
-  // pipe_bytes：把读端管道容量压到指定值（0 = 默认 64 KiB）。
-  // 视频管道压到 4 KiB 是为了"最多只有一个帧在飞"：ffmpeg 的 -re 只是按帧率放行，
-  // 管道里堆 12 帧（64 KiB 的 h264 输出）会让采集端读到的是 0.4 s 前的帧，
-  // 而 Annex-B 裸流里没有时间戳可以还原采集时刻，pts 只能取"读到的时刻"——
-  // 积压越大，端到端延迟被低估得越多。小管道让生产者写阻塞，采集端成为节拍源。
-  bool start(const std::vector<std::string>& argv, std::string& err, int pipe_bytes = 0) {
-#if defined(_WIN32)
-    // Windows 分支：**未在 Windows 上编译或运行验证**（本仓库 CI 是 Linux，也没有
-    // mingw 交叉工具链）。argv 的拼装（build_windows_command_line）与 dshow 参数
-    // 在 Linux 单测里有断言，真正没验证的是 _popen/管道这一层。
-    // 为什么用 _popen 而不是 CreateProcess：dshow 后端只需要顺序读子进程 stdout，
-    // 设备/驱动/权限错误都从 ffmpeg 的 stderr（继承到本进程）看得到。
-    (void)pipe_bytes;
-    if (argv.empty()) {
-      err = "empty argv";
-      return false;
-    }
-    const std::string cmdline = cue::media::build_windows_command_line(argv);
-    FILE* f = _popen(cmdline.c_str(), "rb");
-    if (f == nullptr) {
-      err = "_popen 失败: " + cmdline;
-      return false;
-    }
-    _setmode(_fileno(f), _O_BINARY);
-    pipe_file_ = f;
-    argv_ = argv;
-    return true;
-#else
-    if (argv.empty()) {
-      err = "empty argv";
-      return false;
-    }
-    int fds[2];
-    if (::pipe2(fds, O_CLOEXEC) != 0) {
-      err = std::string("pipe2: ") + std::strerror(errno);
-      return false;
-    }
-    const pid_t pid = ::fork();
-    if (pid < 0) {
-      ::close(fds[0]);
-      ::close(fds[1]);
-      err = std::string("fork: ") + std::strerror(errno);
-      return false;
-    }
-    if (pid == 0) {
-      // 子进程只保留 stdout 管道；-nostdin 已在参数里，避免 ffmpeg 抢终端输入。
-      ::dup2(fds[1], STDOUT_FILENO);
-      ::close(fds[0]);
-      ::close(fds[1]);
-      std::vector<char*> cargv;
-      cargv.reserve(argv.size() + 1);
-      for (const auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
-      cargv.push_back(nullptr);
-      ::execvp(cargv[0], cargv.data());
-      std::fprintf(stderr, "[cue-capture] execvp(%s) 失败: %s\n", cargv[0], std::strerror(errno));
-      ::_exit(127);
-    }
-    ::close(fds[1]);
-    fd_ = fds[0];
-    if (pipe_bytes > 0) {
-      // 失败不致命（内核可能不允许该尺寸）：指标仍然可用，只是读侧多一点缓冲。
-      (void)::fcntl(fd_, F_SETPIPE_SZ, pipe_bytes);
-    }
-    pid_ = pid;
-    argv_ = argv;
-    return true;
-#endif
-  }
-
-  // 最多读 cap 字节；Timeout 表示这一轮没有数据（调用方据此检查退出条件）。
-  IoStatus read_some(uint8_t* dst, std::size_t cap, std::size_t& got, int timeout_ms) {
-    got = 0;
-#if defined(_WIN32)
-    (void)timeout_ms;
-    if (pipe_file_ == nullptr) return IoStatus::Eof;
-    const std::size_t n = std::fread(dst, 1, cap, pipe_file_);
-    if (n == 0) return std::feof(pipe_file_) ? IoStatus::Eof : IoStatus::Error;
-    got = n;
-    return IoStatus::Ok;
-#else
-    if (fd_ < 0) return IoStatus::Eof;
-    for (;;) {
-      pollfd p{fd_, POLLIN, 0};
-      const int pr = ::poll(&p, 1, timeout_ms);
-      if (pr == 0) return IoStatus::Timeout;
-      if (pr < 0) {
-        if (errno == EINTR) continue;
-        return IoStatus::Error;
-      }
-      const ssize_t r = ::read(fd_, dst, cap);
-      if (r == 0) return IoStatus::Eof;
-      if (r < 0) {
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN) continue;
-        return IoStatus::Error;
-      }
-      got = static_cast<std::size_t>(r);
-      return IoStatus::Ok;
-    }
-#endif
-  }
-
-  // 读满 n 字节（rawvideo 定长帧）。EOF 时 got < n，调用方必须按 got 判断。
-  IoStatus read_exact(uint8_t* dst, std::size_t n, std::size_t& got, int timeout_ms) {
-    got = 0;
-    while (got < n) {
-      std::size_t one = 0;
-      const IoStatus st = read_some(dst + got, n - got, one, timeout_ms);
-      if (st != IoStatus::Ok) return st;
-      got += one;
-    }
-    return IoStatus::Ok;
-  }
-
-  bool running() const { return pid_ > 0; }
-  const std::vector<std::string>& argv() const { return argv_; }
-
-  void stop() {
-#if defined(_WIN32)
-    if (pipe_file_ != nullptr) {
-      _pclose(pipe_file_);
-      pipe_file_ = nullptr;
-    }
-#else
-    // 先 SIGTERM 再关管道：先关读端会让正在写的 ffmpeg 打一串
-    // "Broken pipe / Error muxing a packet" 到 stderr，看起来像真实故障。
-    if (pid_ > 0) {
-      ::kill(pid_, SIGTERM);
-      int status = 0;
-      // 最多等 1 s：ffmpeg 收到 SIGTERM 会尽快退出；等不到就 SIGKILL，避免退出时挂住。
-      for (int i = 0; i < 20; ++i) {
-        const pid_t r = ::waitpid(pid_, &status, WNOHANG);
-        if (r == pid_ || (r < 0 && errno == ECHILD)) {
-          pid_ = -1;
-          return;
-        }
-        struct timespec ts { 0, 50 * 1000 * 1000 };
-        ::nanosleep(&ts, nullptr);
-      }
-      ::kill(pid_, SIGKILL);
-      ::waitpid(pid_, &status, 0);
-      pid_ = -1;
-    }
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
-    }
-#endif
-  }
-
- private:
-  pid_t pid_ = -1;
-  int fd_ = -1;
-#if defined(_WIN32)
-  FILE* pipe_file_ = nullptr;  // _popen 的 stdout（Windows 分支，未验证）
-#endif
-  std::vector<std::string> argv_;
-};
+using cue::capture::ChildProcess;
+using cue::capture::IoStatus;
 
 // ---------------------------------------------------------------- WS 客户端
 
@@ -1467,6 +1299,7 @@ int capture_inproc(ChildProcess& video_src, X264Encoder& enc, const Options& o,
   const std::size_t raw_size =
       static_cast<std::size_t>(o.width) * static_cast<std::size_t>(o.height) * 3 / 2;
   std::vector<uint8_t> raw(raw_size);
+  std::size_t raw_filled = 0;
   AVFrame* frame = av_frame_alloc();
   if (!frame) {
     log_line("av_frame_alloc 失败");
@@ -1485,7 +1318,8 @@ int capture_inproc(ChildProcess& video_src, X264Encoder& enc, const Options& o,
   while (g_stop == 0 && !window.elapsed()) {
     if (sink.pacer) sink.pacer->before_frame();
     std::size_t got = 0;
-    const IoStatus st = video_src.read_exact(raw.data(), raw_size, got, 500);
+    const IoStatus st = video_src.read_exact(raw.data() + raw_filled, raw_size - raw_filled, got, 500);
+    raw_filled += got;
     if (st == IoStatus::Timeout) continue;
     if (st == IoStatus::Error) {
       log_line("视频源读取失败");
@@ -1493,11 +1327,12 @@ int capture_inproc(ChildProcess& video_src, X264Encoder& enc, const Options& o,
       break;
     }
     if (st == IoStatus::Eof) {
-      if (got > 0) log_line("视频源 EOF（尾帧不完整：%lld/%lld 字节，丢弃）", static_cast<long long>(got),
+      if (raw_filled > 0) log_line("视频源 EOF（尾帧不完整：%lld/%lld 字节，丢弃）", static_cast<long long>(raw_filled),
                static_cast<long long>(raw_size));
       child_encode_done = true;
       break;
     }
+    raw_filled = 0;
     window.mark_started();
     if (sink.pacer) sink.pacer->note_frame_arrived(cue::now_us());
     // rawvideo 是紧密排列的 yuv420p；AVFrame 的 planes 可能带行对齐填充，逐行拷。
@@ -1961,8 +1796,8 @@ int run(const Options& o) {
   // 是退出路径自己丢的。
   g_stop = 1;
   video_src.stop();
-  audio_src.stop();
-  if (audio_thread.joinable()) audio_thread.join();
+  // read_some is bounded, so the sole reader can finish before its handle is closed.
+  audio_src.stop_after_reader(audio_thread);
   queue.stop();
   send_thread.join();
   stats_stop.store(true, std::memory_order_relaxed);

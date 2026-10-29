@@ -54,52 +54,8 @@ extern "C" {
 #include <libavutil/frame.h>
 }
 
-// ---------------------------------------------------------------- 平台包装
-//
-// probe 只用两件 POSIX 设施：poll 与 close(fd)。Windows 的同义物是 WSAPoll 与
-// closesocket，且两者的结构体名/参数类型都不同，所以在这里各收一个薄包装，
-// 而不是在调用点撒 #ifdef（六处 poll + 四处 close，很容易漏一处）。
-#if defined(_WIN32)
-using probe_pollfd = WSAPOLLFD;
-// Windows 的 SOCKET 是 UINT_PTR（64 位），用 int 装会截断句柄。
-using probe_socket_t = SOCKET;
-constexpr int kProbeSendFlags = 0;  // MSG_NOSIGNAL 是 Linux 的；Windows 的 send 不产生 SIGPIPE
-constexpr probe_socket_t kProbeInvalidSocket = INVALID_SOCKET;
-// 用 select 而不是 WSAPoll：实测 WSAPoll 对 UDP 的 POLLIN 在本机不触发
-// （bind 成功、发包端用 PowerShell 的 UdpClient 对照能收到，但 probe 的 pkts 恒 0、
-// 且不报任何错）。select 是 winsock 上最老的接口，语义与 POSIX 一致。
-inline int probe_poll(probe_pollfd* fds, std::size_t n, int timeout_ms) {
-  fd_set rs;
-  FD_ZERO(&rs);
-  probe_socket_t maxfd = 0;
-  for (std::size_t i = 0; i < n; ++i) {
-    if ((fds[i].events & POLLIN) != 0) {
-      FD_SET(fds[i].fd, &rs);
-      if (fds[i].fd > maxfd) maxfd = fds[i].fd;
-    }
-  }
-  timeval tv{};
-  tv.tv_sec = timeout_ms / 1000;
-  tv.tv_usec = (timeout_ms % 1000) * 1000;
-  const int r = ::select(static_cast<int>(maxfd + 1), &rs, nullptr, nullptr, &tv);
-  if (r > 0) {
-    for (std::size_t i = 0; i < n; ++i) {
-      fds[i].revents = FD_ISSET(fds[i].fd, &rs) ? POLLIN : 0;
-    }
-  }
-  return r;
-}
-inline void probe_close_socket(probe_socket_t fd) { ::closesocket(fd); }
-#else
-using probe_pollfd = struct pollfd;
-inline int probe_poll(probe_pollfd* fds, std::size_t n, int timeout_ms) {
-  return ::poll(fds, static_cast<nfds_t>(n), timeout_ms);
-}
-using probe_socket_t = int;
-constexpr int kProbeSendFlags = MSG_NOSIGNAL;
-constexpr probe_socket_t kProbeInvalidSocket = -1;
-inline void probe_close_socket(probe_socket_t fd) { ::close(fd); }
-#endif
+#include "probe_network.h"
+using namespace cue::probe;
 
 #include "cue/common/clock.h"
 #include "cue/media/audio_decoder.h"
@@ -554,158 +510,6 @@ struct ArrivalGapMeter {
 // harness 不在同一台机器上，所以额外提供 TCP + JSON-line 上报（一行一个事件对象）。
 // 约束：上报是**尽力而为**，不许影响收包主循环——连接非阻塞、失败只丢这一行并计数，
 // 断线后按 1 s 节流重连。丢掉的行数会进指标行（report_drops），不静默。
-class TcpReporters {
- public:
-  struct Addr {
-    std::string host;
-    uint16_t port = 0;
-  };
-
-  explicit TcpReporters(std::vector<Addr> addrs) {
-    for (auto& a : addrs) sinks_.push_back(Sink{std::move(a.host), a.port});
-  }
-  ~TcpReporters() {
-    for (auto& s : sinks_) {
-      if (s.fd != kProbeInvalidSocket) probe_close_socket(s.fd);
-    }
-  }
-  TcpReporters(const TcpReporters&) = delete;
-  TcpReporters& operator=(const TcpReporters&) = delete;
-
-  bool empty() const { return sinks_.empty(); }
-
-  // 尝试推进连接（非阻塞）；返回本轮新连上的地址（调用方据此记一条事件）。
-  std::vector<std::string> pump(int64_t now_us) {
-    std::vector<std::string> fresh;
-    for (auto& s : sinks_) {
-      if (s.up) continue;
-      if (s.fd == kProbeInvalidSocket) {
-        if (now_us < s.next_try_us) continue;
-        if (!begin_connect(s, now_us)) continue;
-        if (s.up) fresh.push_back(s.host + ":" + std::to_string(s.port));
-        continue;
-      }
-      // 连接进行中：用 poll(0) 看它是否已经完成
-      probe_pollfd pfd{static_cast<decltype(probe_pollfd::fd)>(s.fd), POLLOUT, 0};
-      const int pr = probe_poll(&pfd, 1, 0);
-      if (pr <= 0) continue;
-      int soerr = 0;
-      socklen_t len = sizeof(soerr);
-      if (::getsockopt(s.fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &len) != 0 ||
-          soerr != 0) {
-        drop(s, now_us);
-        continue;
-      }
-      s.up = true;
-      fresh.push_back(s.host + ":" + std::to_string(s.port));
-    }
-    return fresh;
-  }
-
-  void publish(std::string_view line, int64_t now_us) {
-    if (sinks_.empty()) return;
-    for (auto& s : sinks_) {
-      if (!s.up) {
-        ++s.dropped;  // 未连上期间的指标行确实没送到，必须计数
-        continue;
-      }
-      // MSG_NOSIGNAL：对端关闭时不能把整个 probe 用 SIGPIPE 打死
-      const auto n = ::send(s.fd, line.data(), static_cast<int>(line.size()), kProbeSendFlags);
-      if (n != static_cast<ssize_t>(line.size())) {
-        ++s.dropped;
-        drop(s, now_us);
-        continue;
-      }
-      ++s.sent;
-    }
-  }
-
-  uint64_t sent() const {
-    uint64_t n = 0;
-    for (const auto& s : sinks_) n += s.sent;
-    return n;
-  }
-  uint64_t dropped() const {
-    uint64_t n = 0;
-    for (const auto& s : sinks_) n += s.dropped;
-    return n;
-  }
-
- private:
-  struct Sink {
-    std::string host;
-    uint16_t port = 0;
-    probe_socket_t fd = kProbeInvalidSocket;
-    bool up = false;
-    int64_t next_try_us = 0;
-    uint64_t sent = 0;
-    uint64_t dropped = 0;
-  };
-
-  static constexpr int64_t kRetryUs = 1'000'000;
-  static constexpr int64_t kConnectBudgetUs = 200'000;
-
-  bool begin_connect(Sink& s, int64_t now_us) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(s.port);
-    if (::inet_pton(AF_INET, s.host.c_str(), &addr.sin_addr) != 1) {
-      s.next_try_us = now_us + kRetryUs;  // 解析不了就按域名失败处理，节流重试
-      return false;
-    }
-#if defined(_WIN32)
-    const probe_socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd != INVALID_SOCKET) {
-      u_long nb = 1;
-      ::ioctlsocket(fd, FIONBIO, &nb);  // Windows 没有 SOCK_NONBLOCK，要单独设
-    }
-#else
-    const probe_socket_t fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-#endif
-    if (fd == kProbeInvalidSocket) {
-      s.next_try_us = now_us + kRetryUs;
-      return false;
-    }
-    const int r = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (r == 0) {
-      s.fd = fd;
-      s.up = true;
-      return true;
-    }
-    if (errno != EINPROGRESS) {
-      probe_close_socket(fd);
-      s.next_try_us = now_us + kRetryUs;
-      return false;
-    }
-    // 给一点时间再判定：回环上通常立刻完成，跨机要等 SYN-ACK
-    pollfd pfd{fd, POLLOUT, 0};
-    if (probe_poll(&pfd, 1, static_cast<int>(kConnectBudgetUs / 1000)) > 0) {
-      int soerr = 0;
-      socklen_t len = sizeof(soerr);
-      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &len) == 0 &&
-          soerr == 0) {
-        s.fd = fd;
-        s.up = true;
-        return true;
-      }
-      probe_close_socket(fd);
-      s.next_try_us = now_us + kRetryUs;
-      return false;
-    }
-    s.fd = fd;  // 仍在进行中：保留 fd，下一轮用 poll(0) 收尾
-    return true;
-  }
-
-  void drop(Sink& s, int64_t now_us) {
-    if (s.fd != kProbeInvalidSocket) probe_close_socket(s.fd);
-    s.fd = -1;
-    s.up = false;
-    s.next_try_us = now_us + kRetryUs;
-  }
-
-  std::vector<Sink> sinks_;
-};
-
 // 解析 "host:port[,host:port]"；返回 false 表示有一项不合法（调用方按参数错误退出）
 bool parse_report_addrs(std::string_view spec, std::vector<TcpReporters::Addr>& out) {
   std::size_t i = 0;
@@ -848,6 +652,12 @@ struct AudioSeqTracker {
 }  // namespace
 
 int main(int argc, char** argv) {
+  SocketRuntime sockets;
+  if (!sockets.ok()) {
+    std::fprintf(stderr, "[probe] Winsock initialization failed\n");
+    return 1;
+  }
+
   uint16_t port = 9001;
   bool nack_enabled = true;
   long long nack_delay_ms = 15;
@@ -1963,10 +1773,10 @@ int main(int argc, char** argv) {
   std::array<uint8_t, 4096> buf{};
 
   // ---- NAT 注册（见 --hello-to）----
-  // hello_fd 与收下行用**同一个 socket**；-1 = 没配置，功能关闭。
+  // hello_fd 与收下行用同一个平台 socket；invalid sentinel 表示未配置。
   // 必须复用同一个 socket：换一个端口发出，NAT 会把映射建立在另一个外部端口上，
   // 服务器按那个地址回包时我们这边收不到（映射与 socket 是一对一的）。
-  int hello_fd = -1;
+  probe_socket_t hello_fd = kProbeInvalidSocket;
   sockaddr_in hello_addr{};
   int64_t last_hello_us = 0;
   if (!hello_host.empty() && hello_port != 0) {
@@ -2383,7 +2193,7 @@ int main(int argc, char** argv) {
     // NAT 注册心跳：每 500 ms 从**同一个 socket** 发一次 HELLO。
     // 必须用收下行的这个 socket 发，NAT 才会为它建立映射，服务器回包才能进来
     // （换个 socket 发出，映射落在另一个外部端口上，等于白做）。
-    if (hello_fd >= 0) {
+    if (hello_fd != kProbeInvalidSocket) {
       const int64_t now_us = cue::now_us();
       if (now_us - last_hello_us >= 500'000) {
         last_hello_us = now_us;

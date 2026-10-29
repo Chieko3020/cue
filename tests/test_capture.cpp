@@ -5,6 +5,7 @@
 // 断言口径与生产代码一致（proto::validate_media 反向校验），不给"为了让测试过"放宽。
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -322,7 +323,7 @@ void test_resampler() {
   const std::size_t in_frames = 4410;
   std::vector<int16_t> in(in_frames * 2);
   for (std::size_t i = 0; i < in_frames; ++i) {
-    const int16_t s = static_cast<int16_t>(10000 * std::sin(2.0 * M_PI * 441.0 *
+    const int16_t s = static_cast<int16_t>(10000 * std::sin(2.0 * std::numbers::pi * 441.0 *
                                                              static_cast<double>(i) / 44100.0));
     in[i * 2] = s;
     in[i * 2 + 1] = s;

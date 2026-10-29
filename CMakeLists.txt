@@ -373,6 +373,20 @@ add_executable(test_probe_render_headless tests/test_probe_render_headless.cpp a
 target_include_directories(test_probe_render_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
 add_test(NAME probe_render_headless COMMAND test_probe_render_headless)
 
+add_executable(test_capture_process tests/test_capture_process.cpp)
+target_include_directories(test_capture_process PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+target_link_libraries(test_capture_process PRIVATE cue_headers_all Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_capture_process PRIVATE shell32)
+endif()
+add_test(NAME capture_process COMMAND test_capture_process)
+
+add_executable(test_probe_network tests/test_probe_network.cpp)
+target_include_directories(test_probe_network PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+target_link_libraries(test_probe_network PRIVATE Threads::Threads)
+add_test(NAME probe_network COMMAND test_probe_network)
+set_tests_properties(probe_network capture_process PROPERTIES TIMEOUT 30)
+
 # proto/frame_guard（技术设计文档 §13.1 的同名行，N-08）：幽灵帧守卫的两处调用点
 # （FEC 校验包 / 迟到的视频分片与 NACK 重传）抽成纯函数后，用单测钉住四条布尔入参的
 # 语义——已完成帧无槽位即丢、槽位还在不丢、未来帧不丢、首帧保护（别挡 IDR）、
@@ -702,7 +716,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
-                     probe_render_headless
+                     probe_render_headless capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget
                      control_channel tools tool_schema delay_injector nack capture config metrics
                      session_registry generator report audio_decoder h264_decoder avc_level)

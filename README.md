@@ -103,6 +103,20 @@ cmake --build build -j1
 
 SDL2 默认按可选依赖探测；仅需指标时可在配置命令追加 `-DCUE_ENABLE_SDL2=OFF`，即使已安装 SDL2 也不启用渲染/播放。此构建下 `cue-probe --render` 会明确报告不可用并继续指标模式。常规构建与 CTest 均包含 `probe_render_headless` 回归，始终编译实际无 SDL 分支并验证其公开接口。
 
+Windows 原生接收/采集端可在 MSYS2 **MINGW64** shell 中单独构建，不复用 Linux 的 CMake 缓存。环境需有 GCC >=14、CMake、Ninja、pkg-config 以及仓库所需 Boost、nlohmann、FFmpeg/x264/Opus、curl、spdlog/fmt 开发包；运行时也需对应 DLL 所在目录。以下使用独立 `build-win-native` 目录，只构建 Windows 客户端和不使用设备的检查，不要求构建 Linux 服务端或 Harness：
+
+```bash
+export PATH=/mingw64/bin:$PATH
+cmake -S . -B build-win-native -G Ninja -DCMAKE_CXX_COMPILER=g++.exe \
+  -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O0 -DNDEBUG' -DCUE_ENABLE_SDL2=OFF
+cmake --build build-win-native --target cue-probe cue-capture \
+  test_capture_process test_probe_network test_capture test_probe_render_headless -j1
+ctest --test-dir build-win-native \
+  -R '^(capture_process|probe_network|capture|probe_render_headless)$' --output-on-failure
+```
+
+`probe_network` 使用实际 socket/上报实现检查读写就绪、拒绝连接及接收端恢复；`capture_process` 使用合成子进程检查超时、部分帧续读、先停止读线程再回收源，以及 Windows 的 Job 回收、路径与参数。采集源通过受控 `CreateProcessW` 启动，默认 `ffmpeg` 仍按 PATH 查找。Windows 子进程停产时读取会按期限返回，关闭时仅回收该实例创建的进程树。上述检查不使用摄像头、麦克风、声卡或桌面，也不能替代 dshow、实际播放或公网验收。
+
 `-j1` 是这台机器的硬约束：2 vCPU / 1.9 GiB 上 `-j2` 同时编两个 libavcodec 相关 TU 会 OOM。默认 `CUE_WERROR=ON`，本仓库全量构建 0 warning；只看警告不愿被中断时重新 configure 加 `-DCUE_WERROR=OFF`。全量首次构建在 2 vCPU 上约 7 分钟。
 
 测试（实际注册清单可用 `ctest --test-dir build -N` 查看；包含无 SDL 接口回归 `probe_render_headless`）：

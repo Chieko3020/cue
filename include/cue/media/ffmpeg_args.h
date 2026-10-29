@@ -199,7 +199,7 @@ inline std::vector<std::string> build_ffmpeg_argv(const FfmpegArgsSpec& s) {
   return a;
 }
 
-// Windows 的 spawn 走 _popen(命令串)，需要把 argv 拼成命令行；引号规则按 MSVC CRT：
+// Windows 的 CreateProcessW 接收命令串，需要把 argv 拼成命令行；引号规则按 MSVC CRT：
 // 含空格或引号的参数整体加双引号，内部的引号/反斜杠按 CRT 的解析规则转义。
 inline std::string build_windows_command_line(const std::vector<std::string>& argv) {
   std::string out;
