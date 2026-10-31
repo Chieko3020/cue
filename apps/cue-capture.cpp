@@ -88,6 +88,7 @@ extern "C" {
 #include "cue/proto/wire.h"
 
 #include "capture_child_process.h"
+#include "capture_pipe_budget.h"
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -1691,8 +1692,8 @@ int run(const Options& o) {
       log_line("无法为 backend=%s 构造 ffmpeg 命令行", o.backend.c_str());
       return 2;
     }
-    // 4 KiB：最多一帧在管道里（理由见 ChildProcess::start 的 pipe_bytes 注释）
-    if (!video_src.start(argv, err, 4096)) {
+    const int pipe_bytes = cue::capture::video_pipe_bytes(platform, vs.encode, vs.width, vs.height);
+    if (!video_src.start(argv, err, pipe_bytes)) {
       log_line("启动视频源失败：%s", err.c_str());
       return 1;
     }

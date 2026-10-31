@@ -1,5 +1,6 @@
 // Tests use the actual app-private producer wrapper, with synthetic child processes only.
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include <thread>
 #include <vector>
 #include "capture_child_process.h"
+#include "capture_pipe_budget.h"
 #if defined(_WIN32)
 #include <shellapi.h>
 #include <fcntl.h>
@@ -55,6 +57,15 @@ int main(int argc, char** argv) {
       output("ab"); std::this_thread::sleep_for(std::chrono::milliseconds(250)); output("cdef"); return 0;
     }
     if (args[2] == "eof") { output("done"); return 0; }
+    if (args[2] == "bulk") {
+      std::array<uint8_t, 65536> block{};
+      block.fill(0xA5);
+      for (int i = 0; i < 1280; ++i) {
+        if (std::fwrite(block.data(), 1, block.size(), stdout) != block.size()) return 3;
+      }
+      std::fflush(stdout);
+      return 0;
+    }
     if (args[2] == "args") {
       for (std::size_t i = 3; i < args.size(); ++i) output(std::to_string(args[i].size())+":"+args[i]+"\n");
       return 0;
@@ -84,6 +95,19 @@ int main(int argc, char** argv) {
   }
   if (args.empty()) return 2;
   const std::string self = args[0];
+  using cue::capture::video_pipe_bytes;
+  using cue::media::HostPlatform;
+  using cue::media::VideoEncodeMode;
+  check(video_pipe_bytes(HostPlatform::Windows,VideoEncodeMode::InProcess,640,360)==345600,
+        "small raw-video request is no larger than one YUV420 frame");
+  check(video_pipe_bytes(HostPlatform::Windows,VideoEncodeMode::InProcess,1920,1080)==3110400,
+        "1080p raw-video request can hold one complete YUV420 frame");
+  check(video_pipe_bytes(HostPlatform::Windows,VideoEncodeMode::InProcess,3840,2160)==4194304,
+        "larger raw-video requests are capped at four MiB");
+  check(video_pipe_bytes(HostPlatform::Linux,VideoEncodeMode::InProcess,1920,1080)==4096 &&
+        video_pipe_bytes(HostPlatform::macOS,VideoEncodeMode::InProcess,1920,1080)==4096 &&
+        video_pipe_bytes(HostPlatform::Windows,VideoEncodeMode::FfmpegChild,1920,1080)==4096,
+        "other platforms and encoded child video retain their pipe request");
   ChildProcess child;
   std::string error;
   uint8_t data[256]{}; std::size_t got = 0;
@@ -191,6 +215,40 @@ int main(int argc, char** argv) {
   for(int i=0;i<12;++i){check(child.start({self,"--helper","quiet"},error),"repeat start");child.stop();}
   ::GetProcessHandleCount(::GetCurrentProcess(),&handles_after);
   check(handles_after<=handles_before+1,"repeat start/stop does not leak handles");
+
+  // Use the same raw-video pipe request as cue-capture, with a real bounded producer.
+  // 80 MiB in four seconds catches the small-pipe polling bottleneck, not an FPS SLA.
+  constexpr uint64_t target_bytes = 80ULL * 1024 * 1024;
+  const int pipe_bytes = cue::capture::video_pipe_bytes(cue::media::HostPlatform::Windows,
+      cue::media::VideoEncodeMode::InProcess, 1920, 1080);
+  const bool bulk_started = child.start({self,"--helper","bulk"},error,pipe_bytes);
+  check(bulk_started,"raw-video throughput producer starts");
+  if (bulk_started) {
+    std::array<uint8_t,65536> block{};
+    uint64_t received = 0;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto deadline = begin + std::chrono::seconds(4);
+    bool payload_ok = true;
+    while (received < target_bytes && std::chrono::steady_clock::now() < deadline) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now()).count();
+      std::size_t count = 0;
+      const auto status = child.read_some(block.data(), block.size(), count,
+          static_cast<int>((std::clamp)(remaining, int64_t{0}, int64_t{100})));
+      if (status == IoStatus::Ok) {
+        received += count;
+        if (count && (block.front() != 0xA5 || block[count-1] != 0xA5)) payload_ok = false;
+      } else if (status != IoStatus::Timeout) break;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    child.stop();
+    std::printf("raw-video pipe=%d bytes=%llu elapsed_ms=%lld\n",pipe_bytes,
+        static_cast<unsigned long long>(received),
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+    check(payload_ok && received == target_bytes && elapsed <= std::chrono::seconds(4),
+          "actual raw-video pipe request delivers 80 MiB within four seconds");
+    check(!child.running(),"throughput producer reaped");
+  }
 #endif
   std::printf("capture process failures=%d\n",failures);
   return failures?1:0;
