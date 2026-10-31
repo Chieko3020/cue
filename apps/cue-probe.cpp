@@ -55,6 +55,7 @@ extern "C" {
 }
 
 #include "probe_network.h"
+#include "native_arguments.h"
 using namespace cue::probe;
 
 #include "cue/common/clock.h"
@@ -560,6 +561,13 @@ std::vector<uint8_t> assemble(const FrameAcc& fa) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  cue::app::NativeArguments arguments;
+  if (const auto result = arguments.initialize(argc, argv); !result) {
+    std::fprintf(stderr, "[probe] command line: %s\n", result.error().c_str());
+    return 2;
+  }
+  argc = arguments.argc();
+  argv = arguments.argv();
   SocketRuntime sockets;
   if (!sockets.ok()) {
     std::fprintf(stderr, "[probe] Winsock initialization failed\n");

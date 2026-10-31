@@ -89,6 +89,7 @@ extern "C" {
 
 #include "capture_child_process.h"
 #include "capture_pipe_budget.h"
+#include "native_arguments.h"
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -1834,6 +1835,13 @@ int run(const Options& o) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  cue::app::NativeArguments arguments;
+  if (const auto result = arguments.initialize(argc, argv); !result) {
+    std::fprintf(stderr, "[cue-capture] command line: %s\n", result.error().c_str());
+    return 2;
+  }
+  argc = arguments.argc();
+  argv = arguments.argv();
 #if defined(_WIN32)
   // Windows 没有 SIGPIPE（写已关闭的 socket 由异步错误而不是信号体现），
   // 也没有 SIGTERM；Ctrl-C 用 CRT 的 signal 处理就够了（SetConsoleCtrlHandler 更完整，

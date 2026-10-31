@@ -244,6 +244,10 @@ add_executable(cue-capture apps/cue-capture.cpp src/media/encoder.cpp)
 target_link_libraries(cue-capture PRIVATE cue_capture cue_headers_all ${CUE_BOOST_SYSTEM_LIB}
   Threads::Threads)
 target_compile_options(cue-capture PRIVATE -Wno-deprecated-declarations)
+if(WIN32)
+  target_link_libraries(cue-probe PRIVATE shell32)
+  target_link_libraries(cue-capture PRIVATE shell32)
+endif()
 
 # ---- 静态资源目录（供本地 http server 使用）----
 add_custom_target(web ALL SOURCES web/index.html web/app.js)

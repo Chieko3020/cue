@@ -197,6 +197,16 @@ class ChildProcess {
     }
     // KILL_ON_JOB_CLOSE is also the failure/destructor safety net.
     job_.reset();
+    // Job accounting may reach zero before the main process is signaled.
+    if (process_.get()) {
+      const DWORD result = ::WaitForSingleObject(process_.get(), 2000);
+      if (result != WAIT_OBJECT_0) {
+        const DWORD error = result == WAIT_FAILED ? ::GetLastError() : ERROR_SUCCESS;
+        std::fprintf(stderr, "[cue-capture] child stop: process exit unconfirmed "
+                             "(wait=%lu, error=%lu)\n",
+                     static_cast<unsigned long>(result), static_cast<unsigned long>(error));
+      }
+    }
     process_.reset();
     read_.reset();
 #else

@@ -10,8 +10,8 @@
 #include <vector>
 #include "capture_child_process.h"
 #include "capture_pipe_budget.h"
+#include "native_arguments.h"
 #if defined(_WIN32)
-#include <shellapi.h>
 #include <fcntl.h>
 #include <io.h>
 #endif
@@ -27,26 +27,16 @@ void output(const std::string& text) {
   std::fflush(stdout);
 }
 std::vector<std::string> arguments(int argc, char** argv) {
-#if defined(_WIN32)
-  (void)argc; (void)argv;
-  int count = 0;
-  LPWSTR* wide = ::CommandLineToArgvW(::GetCommandLineW(), &count);
-  std::vector<std::string> out;
-  for (int i = 0; i < count; ++i) {
-    const int n = ::WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
-    std::string text(static_cast<std::size_t>(n), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, text.data(), n, nullptr, nullptr);
-    text.pop_back(); out.push_back(std::move(text));
-  }
-  ::LocalFree(wide);
-  return out;
-#else
-  return {argv, argv + argc};
-#endif
+  cue::app::NativeArguments native;
+  const auto result = native.initialize(argc, argv);
+  check(result.has_value(), "native command line decodes");
+  if (!result) return {};
+  return {native.argv(), native.argv() + native.argc()};
 }
 }
 int main(int argc, char** argv) {
   const auto args = arguments(argc, argv);
+  if (args.empty()) return 1;
   if (args.size() > 2 && args[1] == "--helper") {
 #if defined(_WIN32)
     // Model ffmpeg binary stdout, not CRT newline translation in this test helper.
@@ -93,8 +83,13 @@ int main(int argc, char** argv) {
 #endif
     return 2;
   }
-  if (args.empty()) return 2;
   const std::string self = args[0];
+  cue::app::NativeArguments once;
+  check(once.argc() == 0 && once.argv() == nullptr, "native arguments start empty");
+  check(once.initialize(argc, argv).has_value(), "native arguments initialize once");
+  char** original = once.argv();
+  check(!once.initialize(argc, argv) && once.argv() == original,
+        "reinitialization is rejected without invalidating borrowed arguments");
   using cue::capture::video_pipe_bytes;
   using cue::media::HostPlatform;
   using cue::media::VideoEncodeMode;
@@ -177,14 +172,17 @@ int main(int argc, char** argv) {
       (L"cue capture 测试-" + std::to_wstring(::GetCurrentProcessId()));
   const auto copied_exe = copied_dir / L"helper 测试.exe";
   std::filesystem::create_directory(copied_dir);
-  std::filesystem::copy_file(std::filesystem::path(cue::capture::utf8_to_wide(self)), copied_exe);
   const auto copied_u8 = copied_exe.u8string();
   const std::string copied_name(reinterpret_cast<const char*>(copied_u8.data()), copied_u8.size());
-  check(child.start({copied_name, "--helper", "eof"}, error), "space/Unicode executable path starts");
-  check(child.read_exact(data, 4, got, 1000) == IoStatus::Ok && got == 4 &&
-            std::memcmp(data, "done", 4) == 0, "space/Unicode executable output");
-  child.stop();
-  std::filesystem::remove(copied_exe);
+  // Repeat the observed stop/image-release race without sleeps or delete retries.
+  for (int iteration = 0; iteration < 24; ++iteration) {
+    std::filesystem::copy_file(std::filesystem::path(cue::capture::utf8_to_wide(self)), copied_exe);
+    check(child.start({copied_name, "--helper", "eof"}, error), "space/Unicode executable path starts");
+    check(child.read_exact(data, 4, got, 1000) == IoStatus::Ok && got == 4 &&
+              std::memcmp(data, "done", 4) == 0, "space/Unicode executable output");
+    child.stop();
+    std::filesystem::remove(copied_exe);
+  }
   std::filesystem::remove(copied_dir);
   // Bare executable names must retain PATH lookup after switching away from _popen.
   const auto slash=self.find_last_of("/\\");
