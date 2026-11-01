@@ -1663,8 +1663,15 @@ int main(int argc, char** argv) {
   const auto& audio_unconcealed_frames = audio_stats.unconcealed;
   const auto& audio_first_error = audio_receiver.first_error();
   cue::media::AudioRmsWindow audio_rms;
+  uint64_t audio_playback_resyncs = audio_stats.resyncs;
   const cue::media::AudioReceiver::Emit emit_audio =
       [&](uint32_t, cue::media::AudioOutputKind kind, std::span<const int16_t> pcm) {
+        if (audio_playback_resyncs != audio_stats.resyncs) {
+          // Re-anchor an exhausted device before its first new PCM. Preserve
+          // queued audio and consume the resync watermark even without a device.
+          audio_playback_resyncs = audio_stats.resyncs;
+          if (render_live && renderer.queued_ms() == 0) renderer.reset_audio();
+        }
         // PLC is extrapolation: queue it, but never call its energy a received signal.
         if (kind != cue::media::AudioOutputKind::Plc) audio_rms.push(pcm.data(), pcm.size());
         if (render_live) renderer.queue_audio(pcm.data(), static_cast<int>(pcm.size()));

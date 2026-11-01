@@ -638,6 +638,15 @@ add_test(NAME layer_isolation
 # 直接把 configure 打挂更符合"CI 稳定性优先"，但会明确打印缺了什么。
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+  if(CUE_ENABLE_SDL2 AND SDL2_FOUND AND CUE_SANITIZE STREQUAL "none")
+    add_test(NAME probe_audio_recovery
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_probe_audio_recovery.py
+        --probe $<TARGET_FILE:cue-probe>)
+    set_tests_properties(probe_audio_recovery PROPERTIES TIMEOUT 90)
+  elseif(CUE_ENABLE_SDL2 AND SDL2_FOUND)
+    message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}: probe_audio_recovery runs only in regular builds")
+  endif()
   # AC-13 的可执行证据：前端源码与产物里不得出现外部 URL（不依赖浏览器/网络，秒级）。
   # 与 e2e-console 的关系：e2e 缺 web/dist 或 playwright 时会跳过，这条永远在跑。
   add_test(NAME no_external_cdn
@@ -661,6 +670,9 @@ if(Python3_Interpreter_FOUND)
   endif()
 else()
   message(WARNING "找不到 python3：不注册 integration / no_external_cdn 测试（scripts/*.py 也需要它）")
+  if(CUE_ENABLE_SDL2 AND SDL2_FOUND)
+    message(WARNING "Python3 interpreter missing: probe_audio_recovery is not registered")
+  endif()
 endif()
 
 # ---- Node 驱动的一致性检查（N-09）----
