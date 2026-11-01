@@ -175,6 +175,29 @@ int main() {
     check(agg.is_object(), "aggregate 返回对象（设备页汇总用）");
   }
 
+  // Upstream pending gauges and refused-packet counters add across live sessions.
+  {
+    pipeline::SessionRegistry reg(opts(2));
+    auto a = reg.register_session(req("budget-a"), 0);
+    auto b = reg.register_session(req("budget-b"), 0);
+    reg.publish_stats(a->session_id, {{"upstream_pending_frames", 3},
+                                    {"upstream_pending_bytes", 1000},
+                                    {"upstream_budget_rejected", 7}});
+    reg.publish_stats(b->session_id, {{"upstream_pending_frames", 2},
+                                    {"upstream_pending_bytes", 2000},
+                                    {"upstream_budget_rejected", 11}});
+    auto agg = reg.aggregate(0);
+    check(agg["counters"]["upstream_pending_frames"] == 5 &&
+              agg["counters"]["upstream_pending_bytes"] == 3000 &&
+              agg["counters"]["upstream_budget_rejected"] == 18,
+          "upstream live-session gauges/counters sum exactly");
+    reg.unregister(a->session_id);
+    agg = reg.aggregate(0);
+    check(agg["counters"]["upstream_pending_frames"] == 2 &&
+              agg["counters"]["upstream_budget_rejected"] == 11,
+          "closed sessions leave live aggregate; process lifetime counters are separate");
+  }
+
   // ---------------------------------------------------------------- 7) sessions_json 的接口约定
   //
   // 三个「没有会话表」的后端必须返回空表**并且**在 err 里说明原因：

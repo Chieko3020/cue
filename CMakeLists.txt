@@ -423,6 +423,10 @@ add_executable(test_reassembly_budget tests/test_reassembly_budget.cpp)
 target_link_libraries(test_reassembly_budget PRIVATE cue_proto)
 add_test(NAME reassembly_budget COMMAND test_reassembly_budget)
 
+add_executable(test_upstream_reassembly tests/test_upstream_reassembly.cpp)
+target_link_libraries(test_upstream_reassembly PRIVATE cue_proto Threads::Threads)
+add_test(NAME upstream_reassembly COMMAND test_upstream_reassembly)
+
 add_executable(test_agent tests/test_agent.cpp)
 target_link_libraries(test_agent PRIVATE cue_agent)
 add_test(NAME agent COMMAND test_agent)
@@ -615,7 +619,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 set(CUE_TEST_TARGETS
   test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
-  test_token_bucket test_frame_guard test_avc_level test_reassembly_budget
+  test_token_bucket test_frame_guard test_avc_level test_reassembly_budget test_upstream_reassembly
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
   test_audio_decoder test_audio_receiver test_audio_playback test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
@@ -659,6 +663,10 @@ if(Python3_Interpreter_FOUND)
     # 所有子进程，2 vCPU 上再叠加 ASan 的 shadow 映射与 TSan 的内存开销，跑一条 27 s 的
     # 多进程测试只会得到不稳定结果，而它测的不是内存安全（那是 unit test 的职责）。
     # ASan/TSan job 仍跑全部单测，AC-12 的证据不受影响。
+    add_test(NAME cued_reassembly
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_reassembly.py
+        --cued $<TARGET_FILE:cued>)
+    set_tests_properties(cued_reassembly PROPERTIES TIMEOUT 60)
     add_test(NAME integration
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_integration.py)
     set_tests_properties(integration PROPERTIES
@@ -754,7 +762,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
   set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
                      probe_render_headless audio_playback capture_process probe_network
-                     jitter_buffer token_bucket frame_guard reassembly_budget
+                     jitter_buffer token_bucket frame_guard reassembly_budget upstream_reassembly
                      control_channel tools tool_schema delay_injector nack capture config metrics
                      session_registry generator report audio_decoder audio_receiver h264_decoder avc_level)
   if(TARGET test_probe_render_sdl)

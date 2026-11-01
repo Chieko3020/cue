@@ -91,7 +91,8 @@ const char* const kAdditiveCounters[] = {
     // 多路求和天然成立——"整条管线解出了多少样本"就是各路之和。
     "audio_decoded_frames", "audio_pcm_frames", "audio_decode_errors",
     "jb_depth",        "jb_skipped",      "jb_late",         "jb_switches",
-    "fb_rx",           "fb_recv_mbps"};
+    "fb_rx",           "fb_recv_mbps",
+    "upstream_pending_frames", "upstream_pending_bytes", "upstream_budget_rejected"};
 // 取 max 的读数：最坏链路不能被另一台的好数字平均掉。
 // audio_decode_p99_us 取最慢的一路（性能问题自然是取最坏）；
 // audio_rms_dbfs 取最响的一路——聚合后的含义是"至少有一路在这个电平上"，

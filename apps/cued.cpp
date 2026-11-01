@@ -60,6 +60,7 @@ extern "C" {
 #include "cue/pipeline/control_plane.h"
 #include "cue/pipeline/session_registry.h"
 #include "cue/proto/wire.h"
+#include "cue/proto/upstream_reassembly.h"
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -302,14 +303,6 @@ struct RateLimitedLog {
   std::string last;
 };
 
-struct FrameAcc {
-  uint32_t count = 0;
-  uint64_t pts_us = 0;
-  bool keyframe = false;
-  int64_t first_seen_us = 0;
-  std::vector<std::vector<uint8_t>> parts;
-};
-
 // 首个错误原因的截断长度：一帧一个 Opus 包的失败原因是固定短句，
 // 但协议拒绝会带上尺寸数字；500 字节足够读，又不至于把 METRICS 行撑爆。
 constexpr std::size_t kMaxAudioErrorLen = 500;
@@ -370,19 +363,6 @@ struct Counters {
   Ring audio_decode_us;      // 单帧解码耗时（µs），audio_decode_p99_us 的样本源
   AudioRmsWindow audio_rms;  // 最近 1 s 的 RMS 窗口
 };
-
-void cleanup_stale(std::map<uint32_t, FrameAcc>& pending, int64_t now_us, Counters& c) {
-  for (auto it = pending.begin(); it != pending.end();) {
-    if (now_us - it->second.first_seen_us > 2'000'000) {
-      ++c.frames_in;  // 帧在"完成或超时"处结算，重复首片/缺首片都不会再算错
-      g_frames_in_total.fetch_add(1, std::memory_order_relaxed);
-      ++c.frames_dropped;
-      it = pending.erase(it);
-    } else {
-      ++it;
-    }
-  }
-}
 
 const char* kStageNames[6] = {"recv", "buffer", "decode", "op", "encode", "send"};
 
@@ -639,7 +619,8 @@ struct CuedSessionShared final : cue::pipeline::SessionPayload {
 // 一个会话的每秒读数（会话线程算、报告线程读；键名与 METRICS 行一致）。
 json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, int64_t t_last,
                       uint64_t frames_prev, const cue::media::JitterBufferStats& jb,
-                      const FeedbackStats& fb, uint32_t upstream_stream_id) {
+                      const FeedbackStats& fb, uint32_t upstream_stream_id,
+                      const cue::proto::UpstreamReassembly& pending) {
   const double dt = t_last > 0 ? double(now_us - t_last) / 1e6 : 0.0;
   const uint64_t df = c.frames_out >= frames_prev ? c.frames_out - frames_prev : 0;
   const bool have_fb = fb.rx.load(std::memory_order_relaxed) > 0;
@@ -658,7 +639,14 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
     audio_reason = c.audio_multi_frag > 0 ? "audio_multi_frag_not_reassembled"
                                           : "no_audio_stream";
   }
-  json m{{"fps", dt > 0.0 ? double(df) / dt : 0.0},
+  const auto reassembly = pending.usage();
+  const auto limits = pending.limits();
+  json m{{"upstream_pending_frames", reassembly.frames},
+         {"upstream_pending_bytes", reassembly.bytes},
+         {"upstream_budget_rejected", reassembly.budget_rejected},
+         {"upstream_max_pending_frames", limits.frames},
+         {"upstream_max_pending_bytes", limits.bytes},
+         {"fps", dt > 0.0 ? double(df) / dt : 0.0},
          {"frames_in", c.frames_in},
          {"frames_out", c.frames_out},
          {"dropped", c.frames_dropped},
@@ -726,7 +714,8 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
 // 顶层读数 = 各活会话的聚合（计数器求和、链路读数取最坏），per_session 里是每路的同一批
 // 键——单路时顶层与 per_session[0] 的数字完全相同，多路时能从同一行里分清是哪一路。
 void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRings& shared,
-                 MetricsView& view, int64_t now_us) {
+                 MetricsView& view, const cue::proto::UpstreamProcessBudget& upstream_budget,
+                 int64_t now_us) {
   const json agg = registry.aggregate(now_us);
   const json& cs = agg["counters"];
   const auto u64 = [&cs](const char* key) -> uint64_t {
@@ -854,6 +843,18 @@ void report_once(const cue::pipeline::SessionRegistry& registry, const SharedRin
   const auto* ctl = g_control.load(std::memory_order_acquire);
   m["control_channel"] = ctl != nullptr ? ctl->channel_tag() : "stdout";
   m["control_ops"] = ctl != nullptr ? ctl->ops() : 0;
+  // Process gauges are read once, never summed once per session. Per-session
+  // gauges above are published at each session's report tick and can be older.
+  const auto upstream = upstream_budget.usage();
+  const auto upstream_limits = upstream_budget.limits();
+  m["upstream_pending_frames"] = u64("upstream_pending_frames");
+  m["upstream_pending_bytes"] = u64("upstream_pending_bytes");
+  m["upstream_budget_rejected"] = u64("upstream_budget_rejected");
+  m["upstream_process_pending_frames"] = upstream.frames;
+  m["upstream_process_pending_bytes"] = upstream.bytes;
+  m["upstream_process_budget_rejected"] = upstream.budget_rejected;
+  m["upstream_process_max_frames"] = upstream_limits.frames;
+  m["upstream_process_max_bytes"] = upstream_limits.bytes;
   const std::string line = "METRICS " + m.dump();
   std::fwrite(line.data(), 1, line.size(), stdout);
   std::fputc('\n', stdout);
@@ -922,6 +923,7 @@ struct SessionEnv {
   int max_ingress_lag_ms = 300;
   FILE* trace_fp = nullptr;
   std::string probe_host;
+  cue::proto::UpstreamProcessBudget* upstream_budget = nullptr;
 };
 
 // CLI 解析：不用 std::stoi/std::stod —— 非法值抛出的异常会穿透 main（SPEC §9 禁止
@@ -1054,7 +1056,7 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   CodecConfig codec_cfg;
   uint32_t upstream_stream_id = 0;  // 客户端自报的流号，只作记录（下行用服务端会话号）
 
-  std::map<uint32_t, FrameAcc> pending;
+  cue::proto::UpstreamReassembly pending(*env.upstream_budget);
   Counters c;
   Ring rings[6];
   // 六段采样同时进本会话的环（per_session 用）和进程级合并环（顶层 METRICS 用）。
@@ -1659,7 +1661,10 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
         // 抖动缓冲的到期帧必须由时间驱动放行：只靠 push 驱动的话，缺帧把前端挡住时
         // 要等到下一个包才动，"等待预算"就变成了"等下一个包"（弱网下可能是几百 ms）。
         for (auto& ready : jb.poll(now_tick)) process_frame(std::move(ready));
-        cleanup_stale(pending, now_tick, c);
+        const auto expired = pending.expire(now_tick);
+        c.frames_in += expired;
+        c.frames_dropped += expired;
+        g_frames_in_total.fetch_add(expired, std::memory_order_relaxed);
         t_last_cleanup = now_tick;
       }
       // 报告同样不能挂在「帧完成」上：整帧持续丢尾片时 fps/丢帧仍要可见
@@ -1676,7 +1681,7 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
         registry.publish_stats(session_id,
                                session_snapshot(rings, c, now_tick, t_last_report,
                                                 frames_prev, jb.stats(), shared->fb,
-                                                upstream_stream_id));
+                                                upstream_stream_id, pending));
         frames_prev = c.frames_out;
         t_last_report = now_tick;
       }
@@ -1918,7 +1923,7 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
     upstream_stream_id = h->stream_id;
     // 上行丢包注入：包在进入重组之前就丢了。单分片帧（本项目合成推流就是）整帧消失，
     // frames_in/frames_out 都不计它，于是只有 fps 掉下来——dropped 保持 0；
-    // 多分片帧丢失非首片时会留在 pending 里，2 s 后由 cleanup_stale 结算成 dropped。
+    // 多分片帧丢失非首片时会留在 pending 里，2 s 后由 expire 结算成 dropped。
     // 两种形状都只涨 injected，与出向注入（fps 不动）正好可以区分开。
     // 上行注入：每包现取一次快照（30 fps 的帧数级开销；换来"改注入立刻生效"）。
     // 用同一个 seed 派生值：两条链路的丢弃序列互不相关，但同一 (seed, pct) 可复现。
@@ -1933,54 +1938,26 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
     // 改成「帧完成或超时」时结算（review #35），与 probe 侧的 frames 口径一致。
 
     const int64_t now = cue::now_us();
-    auto& fa = pending[h->frame_id];
-    if (fa.count == 0) {
-      fa.count = h->frag_count;
-      fa.pts_us = h->pts_us;
-      fa.keyframe = (h->flags & cue::proto::kUpFlagKeyframe) != 0;
-      fa.first_seen_us = now;
-      fa.parts.resize(fa.count);
+    auto assembled = pending.push(*h, {p + cue::proto::kMediaHeaderSize, h->payload_len}, now);
+    if (!assembled) {
+      // Budget counters count refused packets, not completed/dropped frames.
+      if (assembled.error() != cue::proto::UpstreamReject::SessionBudget &&
+          assembled.error() != cue::proto::UpstreamReject::ProcessBudget) ++c.rejected;
+      continue;
     }
-    if (h->frag_index < fa.count) {
-      // 只吃 payload_len 字节：整段剩余字节可能带尾随垃圾（review #17）；
-      // validate_media 已保证 payload_len <= n - 32
-      const uint8_t* frag = p + cue::proto::kMediaHeaderSize;
-      fa.parts[h->frag_index].assign(frag, frag + h->payload_len);
-      if (h->flags & cue::proto::kUpFlagKeyframe) fa.keyframe = true;
-    }
-
-    bool complete = true;
-    for (const auto& part : fa.parts) {
-      if (part.empty()) {
-        complete = false;
-        break;
-      }
-    }
-    if (!complete) continue;
-    ++c.frames_in;  // 帧在「完成或超时」处结算（#35）
+    if (!*assembled) continue;
+    auto& frame = **assembled;
+    ++c.frames_in;
     g_frames_in_total.fetch_add(1, std::memory_order_relaxed);
-
     const int64_t t_reasm_done = cue::now_us();
-    // recv 段：数据报到达 → 本帧重组完成。段意保持原样，**不再**把重组耗时灌进 buffer：
-    // 那是「帧齐了」的开销，抖动缓冲的等待是另一个物理量（见 process_frame）。
-    stage_push(0, t_reasm_done - fa.first_seen_us);
-
-    std::vector<uint8_t> frame;
-    std::size_t total = 0;
-    for (const auto& part : fa.parts) total += part.size();
-    frame.reserve(total);
-    for (const auto& part : fa.parts) frame.insert(frame.end(), part.begin(), part.end());
-
-    // 重组之后、解码之前：进抖动缓冲。fa 是 pending 里的引用，erase 之后不可再用，
-    // 所以先把元信息搬进 JitterFrame，再 erase，最后 push。
+    stage_push(0, t_reasm_done - frame.first_seen_us);
     cue::media::JitterFrame jf;
-    jf.pts_us = fa.pts_us;
-    jf.frame_id = h->frame_id;
-    jf.frag_count = fa.count;
-    jf.keyframe = fa.keyframe;
-    jf.codec = h->codec;
-    jf.payload = std::move(frame);
-    pending.erase(h->frame_id);
+    jf.pts_us = frame.pts_us;
+    jf.frame_id = frame.frame_id;
+    jf.frag_count = frame.frag_count;
+    jf.keyframe = frame.keyframe;
+    jf.codec = frame.codec;
+    jf.payload = std::move(frame.payload);
 
     for (auto& ready : jb.push(std::move(jf), t_reasm_done)) {
       process_frame(std::move(ready));
@@ -2433,12 +2410,14 @@ int main(int argc, char** argv) {
            bind_addr.c_str(), ws_port, probe_host.c_str(), probe_port,
            static_cast<unsigned>(probe_port + max_sessions - 1), max_sessions, lease_ms);
   SharedRings shared_rings;
+  cue::proto::UpstreamProcessBudget upstream_budget;
 
   // 会话线程要用的启动期配置（运行期可变的参数一律走 ParamStore 快照，不在这里）。
   SessionEnv env;
   env.params = &params;
   env.registry = &registry;
   env.rings = &shared_rings;
+  env.upstream_budget = &upstream_budget;
   env.jb_cfg = jb_cfg;
   env.usock = usock;
   env.fec_enabled = fec_enabled;
@@ -2691,7 +2670,7 @@ int main(int argc, char** argv) {
         continue;
       }
       if (now - t_last >= 1'000'000) {
-        report_once(registry, shared_rings, view, now);
+        report_once(registry, shared_rings, view, upstream_budget, now);
         t_last = now;
       }
     }
