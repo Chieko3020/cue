@@ -359,6 +359,27 @@ int main() {
   }
 
   fs::remove_all(tmp, ec);
+  // C05: persistence retains raw scores; eligibility is derived on read.
+  {
+    auto raw = make_outcome("excluded", true, true, true);
+    raw.injection = eval::judge_injection("rate", 0, 0);
+    const auto encoded = eval::outcome_to_json(raw);
+    const auto read = eval::outcome_from_json(encoded);
+    check(read && read->scored && read->score.all() && !eval::rate_eligible(*read) &&
+              read->injection.checked && !read->injection.effective,
+          "C05 roundtrip retains judgement and injection exclusion");
+    auto old = encoded;
+    old.erase("injection");
+    const auto legacy = eval::outcome_from_json(old);
+    check(legacy && legacy->scored && !legacy->injection.checked && eval::rate_eligible(*legacy),
+          "C05 legacy missing injection remains unknown and compatible");
+    eval::RunReport report;
+    report.cases = {*read};
+    eval::summarize_scores(report);
+    check(report.raw_scored == 1 && report.scored == 0 && report.injection_ineffective == 1,
+          "C05 reloaded cached outcome keeps denominator exclusion");
+  }
+
   if (failures == 0) {
     std::printf("test_state: OK\n");
     return 0;

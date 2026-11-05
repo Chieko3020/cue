@@ -20,9 +20,10 @@ struct CaseAgg {
   int attempts = 0;
   int passes = 0;       // 三级判分全过
   int run_errors = 0;   // 不计入分母
+  int injection_excluded = 0; // known ineffective injection, not a model failure
   std::string root_cause;
-  int scored() const { return attempts - run_errors; }
-  bool pass() const { return scored() > 0 && run_errors == 0 && passes == scored(); }
+  int scored() const { return attempts - run_errors - injection_excluded; }
+  bool pass() const { return scored() > 0 && run_errors == 0 && injection_excluded == 0 && passes == scored(); }
 };
 
 std::map<std::string, CaseAgg> aggregate(const StateMap& state);

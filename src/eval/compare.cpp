@@ -24,6 +24,10 @@ std::map<std::string, CaseAgg> aggregate(const StateMap& state) {
     const auto& o = cached.outcome;
     auto& agg = out[o.id];
     ++agg.attempts;
+    if (injection_excluded(o)) {
+      ++agg.injection_excluded;
+      continue;
+    }
     if (!o.scored) {
       ++agg.run_errors;
       continue;
@@ -61,7 +65,8 @@ DiffReport diff_runs(const RunInfo& a, const StateMap& a_state, const RunInfo& b
   const auto bb = aggregate(b_state);
   // run_error 不等于失败：任一侧有 run_error 时这条 case 只是"没结论"
   auto classify = [](const CaseAgg& pa, const CaseAgg& pb) {
-    if (pa.run_errors > 0 || pb.run_errors > 0) return DiffClass::Inconclusive;
+    if (pa.run_errors > 0 || pb.run_errors > 0 ||
+        pa.injection_excluded > 0 || pb.injection_excluded > 0) return DiffClass::Inconclusive;
     if (pa.pass() && pb.pass()) return DiffClass::StillPassing;
     if (pa.pass() && !pb.pass()) return DiffClass::NewFailure;
     if (!pa.pass() && pb.pass()) return DiffClass::Fixed;
@@ -99,6 +104,7 @@ std::string render_diff_markdown(const DiffReport& d) {
     if (g.attempts == 0) return std::string("—");
     std::ostringstream os;
     os << g.passes << "/" << g.attempts << " 过";
+    if (g.injection_excluded > 0) os << "，注入排除=" << g.injection_excluded << "（不可判定）";
     if (g.run_errors > 0) os << "，run_error=" << g.run_errors << "（不计分母）";
     if (!g.root_cause.empty()) os << "，root=" << g.root_cause;
     return os.str();

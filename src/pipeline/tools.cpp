@@ -28,7 +28,7 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"frames_in", m.frames_in},
               {"frames_out", m.frames_out},
               {"dropped", m.dropped},
-              {"injected", m.injected},
+              {"injected", m.injected_observed ? json(m.injected) : json(nullptr)},
               {"decoded", m.decoded},
               {"decode_errors", m.decode_errors},
               // 六段分位（ms）：每段 p50/p95/p99 一律输出；值为 null = 该位没有样本。
@@ -62,7 +62,7 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"send_errors", m.send_errors},
               {"encode_errors", m.encode_errors},
               {"decode_drops", m.decode_drops},
-              {"budget_drops", m.budget_drops},
+              {"budget_drops", m.budget_drops_observed ? json(m.budget_drops) : json(nullptr)},
               {"queue_dropped", m.queue_dropped},
               // 延迟注入的两个计数：被压住的数据报数 + 最长压住时长（微秒）。
               // 「延迟而非丢包」的判据就在这一对与 injected/budget_drops 的对照上。

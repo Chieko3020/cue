@@ -102,14 +102,14 @@ void parse_metrics(const json& j, PipelineMetrics& m, int64_t now) {
   cnt("frames_in", m.frames_in);
   cnt("frames_out", m.frames_out);
   cnt("dropped", m.dropped);
-  cnt("injected", m.injected);
+  m.injected_observed = read_observed_counter(j, "injected", m.injected);
   cnt("decoded", m.decoded);
   cnt("decode_errors", m.decode_errors);
   cnt("rejected", m.rejected);
   cnt("send_errors", m.send_errors);
   cnt("encode_errors", m.encode_errors);
   cnt("decode_drops", m.decode_drops);
-  cnt("budget_drops", m.budget_drops);
+  m.budget_drops_observed = read_observed_counter(j, "budget_drops", m.budget_drops);
   // 六段分位（N-05）：REST 后端的 /api/state 若带 p95/p99 就照读；缺失保持 NaN。
   pct("recv_p50_ms", m.recv_p50);
   pct("recv_p95_ms", m.recv_p95);

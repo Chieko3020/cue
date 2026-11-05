@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include "cue/agent/agent.h"
+#include "cue/common/metrics.h"
 
 namespace cue::eval {
 
@@ -196,6 +197,9 @@ struct InjectionCheck {
 // 纯函数（可单测）：按故障类与故障窗口读数给出「注入是否生效」判定。
 InjectionCheck judge_injection(const std::string& fault_kind, uint64_t budget_drops,
                                uint64_t injected);
+// Backend-aware boundary: absent counters or samples are unknown, not zero.
+InjectionCheck judge_injection(const std::string& fault_kind,
+                               const pipeline::PipelineMetrics& metrics);
 
 // 证据校验：证据必须（a）是某条真实观测里逐字摘抄的 key=value 片段，
 // （b）除引用、工具名与单位外不含解释性文字。见 review-eval.md 的伪造构造表。
@@ -327,6 +331,14 @@ struct CaseOutcome {
   // 但会让整轮 run 不能以退出码 0 收场，见 RunReport::injection_ineffective。
   InjectionCheck injection;
 };
+
+// One eligibility rule for run rates, repeats, persistence consumers and diff.
+[[nodiscard]] inline bool injection_excluded(const CaseOutcome& o) {
+  return o.injection.checked && !o.injection.effective;
+}
+[[nodiscard]] inline bool rate_eligible(const CaseOutcome& o) {
+  return o.scored && !injection_excluded(o);
+}
 
 struct RunConfig {
   std::string suite_path;
@@ -468,7 +480,11 @@ struct RunReport {
   int total = 0;      // 计划数 = cases × repeat
   int planned = 0;    // 同上（截断时与 executed 对照）
   int executed = 0;   // 实际执行（含复用缓存）的 case 次数
-  int scored = 0;
+  int scored = 0;       // eligible rate denominator, not raw CaseOutcome.scored
+  int raw_scored = 0;   // judged outcomes, including ineffective injection
+  int injection_unchecked = 0; // injection attempts without an automatic verdict
+  int pass_k_cases = 0; // case groups eligible for the run-level repeat metric
+  int pass_k_excluded = 0;
   int run_errors = 0;
   // 「注入未生效」的 case 尝试数（N-23）。它与 run_error 是两件事，因此单独计数：
   //  · 不进成功率分母，也不改该 case 的 scored/score（模型答得对不对与故障有没有发生无关）；
@@ -513,6 +529,10 @@ struct RunReport {
   std::string report_path;
   std::string report_json_path;
 };
+
+// Summarize judged outcomes without altering per-case scores. Engine and tests
+// share this seam; call on a fresh RunReport (other run metadata is preserved).
+void summarize_scores(RunReport& report);
 
 // 失败模式分布（纯函数，可单测）：按 expect.root_cause 分组，一次 case 尝试里
 // root/evidence/sla 任一未命中就计 1 次 miss（三维全中不计、不做三维分别计数——

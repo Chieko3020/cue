@@ -74,6 +74,18 @@ InjectionCheck judge_injection(const std::string& fault_kind, uint64_t budget_dr
   return out;
 }
 
+InjectionCheck judge_injection(const std::string& kind, const pipeline::PipelineMetrics& m) {
+  const bool supported = kind == "rate" || kind == "drop" || kind == "ingress_drop";
+  const bool observed = kind == "rate" ? m.budget_drops_observed : m.injected_observed;
+  if (supported && (m.samples == 0 || !observed)) {
+    InjectionCheck out;
+    out.fault_kind = kind;
+    out.detail = "故障窗口缺少实际采样或有效计数字段，未做自动判定";
+    return out;
+  }
+  return judge_injection(kind, m.budget_drops, m.injected);
+}
+
 namespace {
 
 // ---------------------------------------------------------------- 证据匹配
@@ -1123,6 +1135,7 @@ class Producer {
   bool start(const RunConfig& cfg, int ws_port, int fps, const std::string& case_id,
              const std::string& run_dir, std::string& err);
   void stop();
+  bool running();
   const std::string& command() const { return command_; }
 
  private:
@@ -1216,6 +1229,8 @@ bool Producer::start(const RunConfig& cfg, int ws_port, int fps, const std::stri
     (void)ignored;
     _exit(127);
   }
+  pid_ = pid; // retain group ownership even when the leader exits during startup
+  (void)::setpgid(pid, pid);
   ::close(hs[1]);
   if (out_fd >= 0) ::close(out_fd);
 
@@ -1238,6 +1253,10 @@ bool Producer::start(const RunConfig& cfg, int ws_port, int fps, const std::stri
   // 起来就退（典型：ffmpeg 不在、lavfi 参数被拒）也算起不来。1.5 s 覆盖 ffmpeg
   // 进程创建 + 编码器初始化（实测 0.3–0.5 s）与首次 WS 连接。
   for (int i = 0; i < 15; ++i) {
+    if (cfg.cancel != nullptr && cfg.cancel->load()) {
+      err = "cancelled during producer startup";
+      return false;
+    }
     int status = 0;
     const pid_t w = ::waitpid(pid, &status, WNOHANG);
     if (w == pid) {
@@ -1256,6 +1275,13 @@ bool Producer::start(const RunConfig& cfg, int ws_port, int fps, const std::stri
   }
   pid_ = pid;
   return true;
+}
+
+bool Producer::running() {
+  if (pid_ <= 0) return false;
+  int status = 0;
+  const auto result = ::waitpid(pid_, &status, WNOHANG);
+  return result == 0 || (result < 0 && errno == EINTR);
 }
 
 void Producer::stop() {
@@ -1281,6 +1307,9 @@ void Producer::stop() {
     while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
     }
   }
+  // The leader may have exited while a child ignored TERM. The owned group
+  // still needs its final cleanup even after waitpid has reaped the leader.
+  ::kill(-pid_, SIGKILL);
   pid_ = -1;
 }
 
@@ -1342,7 +1371,7 @@ std::string Engine::config_hash() const {
   return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
                          "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
                          fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s) +
-                         llm_hash + ep_hash + tools_hash + producer_hash);
+                         llm_hash + ep_hash + tools_hash + producer_hash + "|aggregation=c05-v1");
 }
 
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg, const std::string& run_dir) {
@@ -1753,6 +1782,7 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   }
   CaseOutcome o;
   o.id = c.id;
+  o.injection.fault_kind = c.fault_kind;
   // 注入有效性（N-23）：这条自检路径不起管线，注入只是 case 里的声明，没有可判的读数。
   // 明确写"未判定"而不是补一个结论——观测是构造的，任何"生效/未生效"都会是假读数。
   o.injection.fault_kind = c.fault_kind;
@@ -1963,9 +1993,7 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   // 析构顺序 = 声明的逆序：先收产帧源，再收管线（StopGuard 在上面、先声明，故后析构）。
   struct ProducerGuard {
     Producer* p;
-    ~ProducerGuard() {
-      if (p != nullptr) p->stop();
-    }
+    ~ProducerGuard() { if (p != nullptr) p->stop(); }
   } prod_guard{producer.get()};
 
   // 等媒体流。终止条件只看 latest() 的返回值（不按墙上时间），回放时同一串录制值会
@@ -1975,6 +2003,10 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   for (int i = 0; i < kWaitAttempts; ++i) {
     if (cancelled()) {
       o.error_kind = "cancelled";
+      return o;
+    }
+    if (producer != nullptr && !producer->running()) {
+      o.error_kind = "producer_exited: capture stopped before media stream";
       return o;
     }
     const auto pm = pipe->latest();
@@ -2068,7 +2100,7 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   // 该窗口的累计值（cued 每 case 重启，计数器从 0 起）。
   {
     const auto fm = pipe->latest();
-    o.injection = judge_injection(c.fault_kind, fm.budget_drops, fm.injected);
+    o.injection = judge_injection(c.fault_kind, fm);
     if (o.injection.checked) {
       std::fprintf(stderr, "[eval][%s] %s\n", c.id.c_str(), o.injection.detail.c_str());
     }
@@ -2253,6 +2285,10 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
     std::fprintf(stderr, "[eval][%s] 证据不成立：%s\n", c.id.c_str(),
                  o.score.evidence_reason.c_str());
   }
+  if (producer != nullptr && !producer->running()) {
+    o.error_kind = "producer_exited: capture stopped before case completion";
+    return o;
+  }
   o.scored = true;
   o.turns = fake.turns;
   o.cost_yuan = fake.cost_yuan;
@@ -2431,9 +2467,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   }
   struct ProducerGuard {
     Producer* p;
-    ~ProducerGuard() {
-      if (p != nullptr) p->stop();
-    }
+    ~ProducerGuard() { if (p != nullptr) p->stop(); }
   } prod_guard{producer.get()};
   std::unique_ptr<MetricMonitor> mon;
   if (!deterministic_tools) {
@@ -2475,7 +2509,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
       // 这里按「值」继续消费到第一条有样本的记录，不按时间（回放不 sleep）。
       for (int i = 0; i < 20 && m.samples == 0; ++i) m = pipe->latest();
     }
-    if (m.samples == 0) {
+    if (m.samples == 0 || m.fps <= 0.0) {
       // 没有媒体流就别启动 agent：白烧钱，而且会把环境问题算成 agent 能力问题（P1#13）
       std::fprintf(stderr, "[eval][%s] %s\n", c.id.c_str(),
                    cfg_.endpoint.empty()
@@ -2489,7 +2523,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     // 「注入是否真的生效」（N-23）：故障窗口（注入后、修复前）的 cued 侧计数快照。
     // 取在 warmup 之后、agent 动手之前：此时计数器已经覆盖了至少一个完整窗口，
     // 又不会被 agent 的修复动作影响。rate 判 budget_drops、drop/ingress_drop 判 injected。
-    o.injection = judge_injection(c.fault_kind, m.budget_drops, m.injected);
+    o.injection = judge_injection(c.fault_kind, m);
     if (o.injection.checked) {
       std::fprintf(stderr, "[eval][%s] %s\n", c.id.c_str(), o.injection.detail.c_str());
     }
@@ -2758,6 +2792,10 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
     // run_error 不计入成功率分母：agent 没跑完，不是"答错"
     o.error_kind = res.error.empty() ? ek : (ek + ": " + res.error);
   } else {
+    if (producer != nullptr && !producer->running()) {
+      o.error_kind = "producer_exited: capture stopped before case completion";
+      return;
+    }
     o.scored = true;
     o.score = judge_case(c, res, obs, m);
     if (!o.score.evidence && !o.score.evidence_reason.empty()) {
@@ -2825,8 +2863,6 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   std::printf("[eval] run_id=%s state=%s fingerprint=%s\n", r.run_id.c_str(), state_path.c_str(),
               r.fingerprint.c_str());
 
-  std::map<std::string, int> pass_count;   // case_id -> 全成功次数
-  std::map<std::string, int> attempt_count;
   bool stop = false;
   int skipped_manual = 0;
 
@@ -2876,8 +2912,6 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
       r.cassette_misses += o.cassette_misses;
       r.tool_hits += o.tool_hits;
       r.tool_misses += o.tool_misses;
-      ++attempt_count[c.id];
-      if (o.scored && o.score.all()) ++pass_count[c.id];
       r.cases.push_back(std::move(o));
 
       if (r.cost_yuan > cfg_.max_yuan) {
@@ -2895,61 +2929,16 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
                           std::to_string(r.executed) + " 次");
   }
 
-  // 汇总
-  for (const auto& o : r.cases) {
-    if (!o.scored) {
-      ++r.run_errors;
-      continue;
-    }
-    ++r.scored;
-    if (o.score.root) ++r.root_rate;
-    if (o.score.evidence) ++r.evidence_rate;
-    if (o.score.sla) ++r.sla_rate;
-    // 「注入未生效」（N-23）：单独计数，不进成功率分母、也不改 scored —— 故障有没有
-    // 发生与模型答得对不对是两件事。但它进 run_notes，并在报告里有独立小节：
-    // 这种 case 的 SLA 是恒真的，不能让它悄悄混进"100% 通过"。
-    if (o.injection.checked && !o.injection.effective) {
-      ++r.injection_ineffective;
-      r.run_notes.push_back("注入未生效：" + o.id + " — " + o.injection.detail);
-    }
-    if (has_value(o.mttr_s)) {
-      r.mttr_avg_s = has_value(r.mttr_avg_s) ? r.mttr_avg_s + o.mttr_s : o.mttr_s;
-    }
-  }
-  if (r.scored > 0) {
-    r.root_rate /= r.scored;
-    r.evidence_rate /= r.scored;
-    r.sla_rate /= r.scored;
-  }
-  if (has_value(r.mttr_avg_s) && r.scored > 0) {
-    int n = 0;
-    for (const auto& o : r.cases) {
-      if (o.scored && has_value(o.mttr_s)) ++n;
-    }
-    r.mttr_avg_s = n > 0 ? r.mttr_avg_s / double(n) : kNoValue;
-  }
-  // pass^k：每个 case 的 k 次都成功才算 pass，整体取比例
-  if (!attempt_count.empty()) {
-    int pass_cases = 0;
-    for (const auto& [id, attempts] : attempt_count) {
-      if (pass_count[id] == attempts && attempts == cfg_.repeat) ++pass_cases;
-    }
-    r.pass_k = double(pass_cases) / double(attempt_count.size());
-  }
+  summarize_scores(r);
 
   // 端到端 p99 的 run 级对比：各 case 的中位（只统计真正有探针样本的 case）。
   // 没有任何样本时写 NaN + 原因，报告里渲染成 null——不用 0 冒充。
   {
-    std::vector<double> before, after;
     bool any_probe = false;
     for (const auto& o : r.cases) {
-      if (!o.scored) continue;
+      if (!rate_eligible(o)) continue;
       if (o.metrics.probe.samples > 0) any_probe = true;
-      if (has_value(o.p99_ms_before)) before.push_back(o.p99_ms_before);
-      if (has_value(o.p99_ms_after)) after.push_back(o.p99_ms_after);
     }
-    r.p99_ms_before = median(before);
-    r.p99_ms_after = median(after);
     if (!cfg_.replay_tools_dir.empty()) {
       r.probe_source = "probe 指标来自工具录制（--replay-tools）";
     } else if (!cfg_.endpoint.empty()) {
@@ -2974,6 +2963,57 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   r.stability = compute_stability(r.cases, cfg_.repeat);
 }
 
+void summarize_scores(RunReport& r) {
+  r.scored = r.raw_scored = r.run_errors = r.injection_ineffective = 0;
+  r.injection_unchecked = r.pass_k_cases = r.pass_k_excluded = 0;
+  r.root_rate = r.evidence_rate = r.sla_rate = r.pass_k = 0;
+  r.mttr_avg_s = kNoValue;
+  std::vector<double> before, after;
+  double mttr_sum = 0;
+  int mttr_count = 0;
+  struct Repeats { int attempts = 0, passes = 0; bool excluded = false; };
+  std::map<std::string, Repeats> repeats;
+  for (const auto& o : r.cases) {
+    auto& group = repeats[o.id];
+    ++group.attempts;
+    group.excluded = group.excluded || injection_excluded(o);
+    if (o.scored) ++r.raw_scored;
+    else ++r.run_errors;
+    if (injection_excluded(o)) {
+      ++r.injection_ineffective;
+      r.run_notes.push_back("注入未生效：" + o.id + " — " + o.injection.detail);
+    } else if (!o.injection.checked && !o.injection.fault_kind.empty() &&
+               o.injection.fault_kind != "none") {
+      ++r.injection_unchecked;
+    }
+    if (!rate_eligible(o)) continue;
+    ++r.scored;
+    if (o.score.root) ++r.root_rate;
+    if (o.score.evidence) ++r.evidence_rate;
+    if (o.score.sla) ++r.sla_rate;
+    if (o.score.all()) ++group.passes;
+    if (has_value(o.p99_ms_before)) before.push_back(o.p99_ms_before);
+    if (has_value(o.p99_ms_after)) after.push_back(o.p99_ms_after);
+    if (has_value(o.mttr_s)) { mttr_sum += o.mttr_s; ++mttr_count; }
+  }
+  if (r.scored > 0) {
+    r.root_rate /= r.scored;
+    r.evidence_rate /= r.scored;
+    r.sla_rate /= r.scored;
+  }
+  r.p99_ms_before = median(before);
+  r.p99_ms_after = median(after);
+  if (mttr_count > 0) r.mttr_avg_s = mttr_sum / mttr_count;
+  int passed = 0;
+  for (const auto& [id, group] : repeats) {
+    (void)id;
+    if (group.excluded) { ++r.pass_k_excluded; continue; }
+    ++r.pass_k_cases;
+    if (group.attempts == r.repeat && group.passes == r.repeat) ++passed;
+  }
+  if (r.pass_k_cases > 0) r.pass_k = double(passed) / r.pass_k_cases;
+}
+
 std::vector<FailureMode> summarize_failure_modes(const std::vector<Case>& cases,
                                                  const std::vector<CaseOutcome>& outcomes) {
   std::map<std::string, const Case*> by_id;
@@ -2990,6 +3030,7 @@ std::vector<FailureMode> summarize_failure_modes(const std::vector<Case>& cases,
   };
 
   for (const auto& o : outcomes) {
+    if (injection_excluded(o)) continue; // environmental exclusion, not answered_wrong
     if (!o.scored) {
       // run_error = 没有判分结果，不是"答错"。单独一组，语义上不能并进某个根因。
       auto& a = groups[kRunErrorGroup];
@@ -3042,7 +3083,7 @@ Stability compute_stability(const std::vector<CaseOutcome>& outcomes, int repeat
   };
   std::map<int, Round> rounds;
   for (const auto& o : outcomes) {
-    if (!o.scored) continue;  // run_error 不计入分母，也不占轮次样本
+    if (!rate_eligible(o)) continue;  // no rate sample for run errors or known ineffective faults
     auto& rd = rounds[o.attempt];
     ++rd.scored;
     if (o.score.root) ++rd.root;
@@ -3133,12 +3174,21 @@ std::string Engine::render_markdown(const RunReport& r) const {
       << "，" << cfg_.producer_size << "@" << cfg_.producer_bitrate << " kbps，30 fps）\n";
   }
   o << "- 用例: 计划 " << r.planned << "，执行 " << r.executed << "，计分 " << r.scored
-    << "，运行失败 " << r.run_errors << "\n";
+    << "，原始判分 " << r.raw_scored << "，注入排除 " << r.injection_ineffective
+    << "，注入未判定 " << r.injection_unchecked << "，运行失败 " << r.run_errors << "\n";
   o << "- 成本: ¥" << r.cost_yuan << "\n\n";
 
   if (cfg_.agent_mode == "scripted") {
-    o << "> **scripted 模式 = 引擎自检，不判模型**：结论与观测由 case 的 expect 构造，"
-         "100% 通过只证明「判分器 + 引擎」链路通。要评模型能力请用 `--mode real`。\n\n";
+    if (!cfg_.replay_tools_dir.empty()) {
+      o << "> **scripted 工具回放，不判模型**：观测来自工具录制，策略按 case 的 expect 驱动脚本。"
+           "结果用于核对评测链路，不代表模型能力或本次真实媒体运行。\n\n";
+    } else if (!cfg_.record_tools_dir.empty() || !cfg_.endpoint.empty()) {
+      o << "> **scripted 工具模式，不判模型**：观测来自实际工具后端，策略按 case 的 expect 驱动脚本。"
+           "结果用于核对管线与评测链路，不代表模型能力。\n\n";
+    } else {
+      o << "> **scripted 模式 = 引擎自检，不判模型**：结论与观测由 case 的 expect 构造，"
+           "100% 通过只证明「判分器 + 引擎」链路通。要评模型能力请用 `--mode real`。\n\n";
+    }
   }
   if (!cfg_.replay_tools_dir.empty()) {
     o << "> **工具回放**：管线调用来自 `" << cfg_.replay_tools_dir
@@ -3152,6 +3202,9 @@ std::string Engine::render_markdown(const RunReport& r) const {
   }
 
   o << "## 分层成功率\n\n";
+  o << "分母为有效样本 " << r.scored << "；pass^k有效case组 " << r.pass_k_cases
+    << "，排除case组 " << r.pass_k_excluded << "。\n\n";
+  if (r.scored == 0) o << "> 无有效成功率样本，不能据此判通过。\n\n";
   o << "| 指标 | 值 |\n|---|---|\n";
   o << "| 根因命中 | " << (r.root_rate * 100) << "% |\n";
   o << "| 证据成立 | " << (r.evidence_rate * 100) << "% |\n";
@@ -3200,7 +3253,7 @@ std::string Engine::render_markdown(const RunReport& r) const {
   for (const auto& seg : segs) {
     std::vector<double> p50, p95, p99;
     for (const auto& c : r.cases) {
-      if (!c.scored) continue;
+      if (!rate_eligible(c)) continue;
       const auto& l = c.metrics.*seg.field;
       if (has_value(l.p50)) p50.push_back(l.p50);
       if (has_value(l.p95)) p95.push_back(l.p95);
@@ -3300,7 +3353,7 @@ std::string Engine::render_markdown(const RunReport& r) const {
              "要么换一个有真实码率的产帧源（`--producer lavfi`），要么把注入档位调到"
              "源码率能被打穿的水平——总之不能拿这份结果当通过。\n";
       } else {
-        o << "\n本次所有可判定的注入类 case 都真的发生了故障。\n";
+        o << "\n没有已判定为无效的注入；未判定项不代表已验证有效。\n";
       }
     }
   }
@@ -3460,6 +3513,10 @@ std::string Engine::render_json(const RunReport& r) const {
       {"planned", r.planned},
       {"executed", r.executed},
       {"scored", r.scored},
+      {"raw_scored", r.raw_scored},
+      {"injection_unchecked", r.injection_unchecked},
+      {"pass_k_cases", r.pass_k_cases},
+      {"pass_k_excluded", r.pass_k_excluded},
       {"run_errors", r.run_errors},
       {"gated", r.gated},
       {"truncated", r.truncated},
@@ -3504,6 +3561,7 @@ std::string Engine::render_json(const RunReport& r) const {
     json cj{
         {"id", c.id},
         {"scored", c.scored},
+        {"rate_eligible", rate_eligible(c)},
         {"error_kind", c.error_kind},
         {"turns", c.turns},
         {"cost_yuan", c.cost_yuan},
@@ -3600,6 +3658,7 @@ std::string Engine::render_terminal_summary(const RunReport& r) const {
     return o.str();
   }
   o << "用例    : 执行 " << r.executed << " / 计划 " << r.planned << "，计分 " << r.scored
+    << "，原始判分 " << r.raw_scored << "，注入未判定 " << r.injection_unchecked
     << "，run_error " << r.run_errors << (r.truncated ? "，已截断" : "") << "\n";
   o << "成功率  : 根因 " << fmt(r.root_rate * 100, 1) << "% | 证据 " << fmt(r.evidence_rate * 100, 1)
     << "% | SLA " << fmt(r.sla_rate * 100, 1) << "%\n";

@@ -663,6 +663,13 @@ if(Python3_Interpreter_FOUND)
     # 所有子进程，2 vCPU 上再叠加 ASan 的 shadow 映射与 TSan 的内存开销，跑一条 27 s 的
     # 多进程测试只会得到不稳定结果，而它测的不是内存安全（那是 unit test 的职责）。
     # ASan/TSan job 仍跑全部单测，AC-12 的证据不受影响。
+    if(UNIX AND NOT APPLE)
+      add_test(NAME eval_producer
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eval_producer.py
+          --eval $<TARGET_FILE:cue-eval> --cued $<TARGET_FILE:cued>
+          --probe $<TARGET_FILE:cue-probe> --capture $<TARGET_FILE:cue-capture>)
+      set_tests_properties(eval_producer PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
     add_test(NAME cued_reassembly
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_reassembly.py
         --cued $<TARGET_FILE:cued>)

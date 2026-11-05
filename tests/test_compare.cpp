@@ -116,6 +116,18 @@ int main() {
     check(md.find("两 run 不可比") != std::string::npos, "diff markdown 有不可比 banner");
   }
 
+  // C05: known ineffective injection is inconclusive, never a fix/failure.
+  {
+    auto excluded = make_outcome("x", true, true, true);
+    excluded.injection = eval::judge_injection("rate", 0, 0);
+    eval::StateMap a, b;
+    a[{0, 0}] = eval::CachedOutcome{excluded, "fp"};
+    b[{0, 0}] = eval::CachedOutcome{make_outcome("x", false, false, false), "fp"};
+    const auto d = eval::diff_runs(info("A", "fp"), a, info("B", "fp"), b);
+    check(d.inconclusive == 1 && d.new_failures == 0 && d.fixed == 0,
+          "C05 ineffective injection is not a scored regression");
+  }
+
   if (failures == 0) {
     std::printf("test_compare: OK\n");
     return 0;

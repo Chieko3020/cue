@@ -53,6 +53,7 @@ int header_int(const nlohmann::json& h, const char* key, int fallback) {
 std::string case_agg_text(const eval::CaseAgg& g) {
   if (g.attempts == 0) return "—";
   std::string s = std::to_string(g.passes) + "/" + std::to_string(g.attempts) + " 过";
+  if (g.injection_excluded > 0) s += "，注入排除 " + std::to_string(g.injection_excluded) + "（不可判定）";
   if (g.run_errors > 0) s += "，run_error " + std::to_string(g.run_errors) + "（不计分母）";
   return s;
 }

@@ -367,7 +367,76 @@ void test_terminal_summary() {
 
 }  // namespace
 
+void test_injection_eligibility() {
+  auto excluded = mk_outcome("excluded", 0, true, true, true);
+  excluded.injection = eval::judge_injection("rate", 0, 0);
+  excluded.mttr_s = 100;
+  excluded.p99_ms_after = 900;
+  auto valid = mk_outcome("valid", 0, true, false, false);
+  valid.mttr_s = 2;
+  valid.p99_ms_after = 40;
+  eval::RunReport r;
+  r.repeat = 1;
+  r.cases = {excluded, valid, mk_run_error("error", 0)};
+  eval::summarize_scores(r);
+  check(r.raw_scored == 2 && r.scored == 1 && r.run_errors == 1 &&
+            r.injection_ineffective == 1, "eligibility: raw judgement and rate denominator separate");
+  check(r.root_rate == 1 && r.evidence_rate == 0 && r.sla_rate == 0,
+        "eligibility: run rates use only eligible outcomes");
+  check(r.mttr_avg_s == 2 && r.p99_ms_after == 40,
+        "eligibility: excluded injection does not bias MTTR/p99");
+  check(r.pass_k_cases == 2 && r.pass_k_excluded == 1 && r.pass_k == 0,
+        "eligibility: run_error remains a failed pass^k group, injection is excluded");
+  check(r.cases[0].scored && r.cases[0].score.all(),
+        "eligibility: original score and scored retained");
+  check(eval::summarize_failure_modes({mk_case("excluded", "bandwidth_insufficient")},
+                                      {excluded}).empty(),
+        "eligibility: ineffective injection is not a model failure");
+  eval::RunConfig cfg;
+  eval::Engine engine(cfg);
+  const auto j = nlohmann::json::parse(engine.render_json(r));
+  check(j["scored"] == 1 && j["raw_scored"] == 2 && j["injection_ineffective"] == 1 &&
+            j["pass_k_cases"] == 2 && j["pass_k_excluded"] == 1,
+        "eligibility: report JSON exposes denominators");
+  check(engine.render_markdown(r).find("原始判分 2") != std::string::npos,
+        "eligibility: MD exposes raw judgement count");
+  cfg.record_tools_dir = "local-recordings";
+  const std::string actual_md = eval::Engine(cfg).render_markdown(r);
+  check(actual_md.find("观测来自实际工具后端") != std::string::npos &&
+            actual_md.find("结论与观测由 case 的 expect 构造") == std::string::npos,
+        "report: scripted real-tool observations are not called constructed fixtures");
+  cfg.record_tools_dir.clear();
+  cfg.replay_tools_dir = "recorded-tools";
+  check(eval::Engine(cfg).render_markdown(r).find("观测来自工具录制") != std::string::npos,
+        "report: scripted replay observations are attributed to recording");
+  auto excluded_later = excluded;
+  excluded_later.id = "mixed";
+  excluded_later.attempt = 1;
+  auto mixed_good = mk_outcome("mixed", 0, true, true, true);
+  r = {};
+  r.repeat = 2;
+  r.cases = {mixed_good, excluded_later};
+  eval::summarize_scores(r);
+  check(r.scored == 1 && r.pass_k_cases == 0 && r.pass_k_excluded == 1 && r.pass_k == 0,
+        "eligibility: one ineffective repeat makes whole pass^k group inconclusive");
+  r = {};
+  r.cases = {excluded};
+  eval::summarize_scores(r);
+  check(r.raw_scored == 1 && r.scored == 0 && !eval::has_value(r.mttr_avg_s) &&
+            !eval::has_value(r.p99_ms_after), "eligibility: no valid samples are not measured zeros");
+  check(engine.render_markdown(r).find("无有效成功率样本") != std::string::npos,
+        "eligibility: empty denominator is explicit in report");
+  auto unknown = valid;
+  unknown.injection = eval::judge_injection("backlog", 0, 0);
+  r = {};
+  r.cases = {unknown};
+  eval::summarize_scores(r);
+  check(r.scored == 1 && r.injection_unchecked == 1 && !unknown.injection.checked,
+        "eligibility: unsupported fault remains unknown, not fabricated ineffective");
+}
+
 int main() {
+  test_injection_eligibility();
   test_failure_modes();
   test_stability();
   test_markdown_sections();

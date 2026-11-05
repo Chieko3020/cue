@@ -20,6 +20,18 @@ inline constexpr double kNoSample = std::numeric_limits<double>::quiet_NaN();
 // 该分位是否真的采到了（NaN 表示没有样本）
 inline bool has_sample(double v) { return std::isfinite(v); }
 
+// An observed counter is a nonnegative JSON integer, including an actual zero.
+// Missing/null/wrong-type values stay unknown instead of becoming measured zero.
+inline bool read_observed_counter(const nlohmann::json& j, const char* key, uint64_t& out) {
+  out = 0;
+  const auto it = j.find(key);
+  if (it == j.end()) return false;
+  if (it->is_number_unsigned()) { out = it->get<uint64_t>(); return true; }
+  if (!it->is_number_integer() || it->get<int64_t>() < 0) return false;
+  out = static_cast<uint64_t>(it->get<int64_t>());
+  return true;
+}
+
 // 解析 cued 的单段分位对象 `{"p50","p95","p99"}`（METRICS 行顶层六段、
 // metrics.query 响应里的同名段都用这一个口径）。
 //
@@ -370,6 +382,7 @@ struct PipelineMetrics {
   uint64_t frames_out = 0;
   uint64_t dropped = 0;
   uint64_t injected = 0;
+  bool injected_observed = false; // presence is preserved across backends/recordings
   uint64_t decoded = 0;
   uint64_t decode_errors = 0;
   uint64_t rejected = 0;  // 协议边界拒绝数（wire.h 的拒绝原因分类在 cued 侧汇总）
@@ -378,6 +391,7 @@ struct PipelineMetrics {
   uint64_t encode_errors = 0;  // 编码失败（尺寸/格式/编码器错误）
   uint64_t decode_drops = 0;   // 解码器未消费的包（H264Decoder::stats().dropped）
   uint64_t budget_drops = 0;   // 令牌桶不足丢的帧
+  bool budget_drops_observed = false;
   // 排队策略切换（fault.set kind=backlog 改了发送节奏）时主动丢弃的积压帧。
   // 与 dropped 分开：那一刻丢弃是控制面的策略决定，不是链路故障。
   uint64_t queue_dropped = 0;

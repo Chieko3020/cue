@@ -824,14 +824,14 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   m.frames_in = count("frames_in");
   m.frames_out = count("frames_out");
   m.dropped = count("dropped");
-  m.injected = count("injected");
+  m.injected_observed = read_observed_counter(j, "injected", m.injected);
   m.decoded = count("decoded");
   m.decode_errors = count("decode_errors");
   m.rejected = count("rejected");
   m.send_errors = count("send_errors");
   m.encode_errors = count("encode_errors");
   m.decode_drops = count("decode_drops");
-  m.budget_drops = count("budget_drops");
+  m.budget_drops_observed = read_observed_counter(j, "budget_drops", m.budget_drops);
   m.queue_dropped = count("queue_dropped");
   m.delayed_pkts = count("delayed_pkts");
   m.delayed_max_us = count("delayed_max_us");

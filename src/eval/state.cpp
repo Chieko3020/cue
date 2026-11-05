@@ -224,6 +224,7 @@ std::expected<void, std::string> RunLock::acquire(const std::string& dir) {
 json outcome_to_json(const CaseOutcome& o) {
   return json{{"id", o.id},
               {"scored", o.scored},
+              {"rate_eligible", rate_eligible(o)},
               {"error_kind", o.error_kind},
               {"score", {{"root", o.score.root}, {"evidence", o.score.evidence}, {"sla", o.score.sla}}},
               {"turns", o.turns},

@@ -204,11 +204,14 @@ int main() {
 // 11) 工具观测录制/回放（AC-6 的底层保证）：NaN 往返、参数不符报错、录制用尽报 miss
 class FakePipeline : public cue::pipeline::IServicePipeline {
  public:
+  bool counters_known = true;
   bool start(std::string&) override { return true; }
   void stop() override { ++stops; }
   bool running() const override { return true; }
   cue::pipeline::PipelineMetrics latest() const override {
     cue::pipeline::PipelineMetrics m;
+    m.injected_observed = counters_known;
+    m.budget_drops_observed = counters_known;
     m.fps = 29.97;
     m.frames_in = 300;
     m.samples = 1;
@@ -596,6 +599,86 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
           "case13e 旧候选字符串（injected）行为不变");
     check(!pred_evidence({"injected"}, make_obs(), "send_p50_ms=0.09"),
           "case13e 无关字段仍不满足候选");
+  }
+
+  // C05: a judged result with ineffective injection is not a rate sample.
+  {
+    eval::CaseOutcome excluded;
+    excluded.id = "excluded";
+    excluded.scored = true;
+    excluded.score = {true, true, true, {}};
+    excluded.injection = eval::judge_injection("rate", 0, 0);
+    eval::CaseOutcome valid;
+    valid.id = "valid";
+    valid.scored = true;
+    valid.score = {false, false, false, {}};
+    const auto mixed = eval::compute_stability({excluded, valid}, 1);
+    check(mixed.root_rate.mean == 0 && mixed.evidence_rate.mean == 0 &&
+              mixed.sla_rate.mean == 0 && mixed.pass_k.mean == 0,
+          "C05 ineffective injection excluded from stability denominators");
+    check(eval::compute_stability({excluded}, 3).rounds == 0,
+          "C05 all ineffective injection yields no measured stability rounds");
+  }
+
+  // C05: counter presence across backend parsing and actual recording/replay.
+  {
+    cue::pipeline::PipelineMetrics m;
+    m.samples = 1;
+    const std::vector<nlohmann::json> values = {
+        nullptr, "0", -1, 0.5, true, nlohmann::json::object()};
+    for (const auto& value : values) {
+      nlohmann::json j{{"budget_drops", value}, {"injected", value}};
+      m.budget_drops_observed = cue::pipeline::read_observed_counter(j, "budget_drops", m.budget_drops);
+      m.injected_observed = cue::pipeline::read_observed_counter(j, "injected", m.injected);
+      check(!eval::judge_injection("rate", m).checked &&
+                !eval::judge_injection("drop", m).checked,
+            "C05 invalid/null counter is unknown, never measured zero");
+    }
+    m.budget_drops_observed = cue::pipeline::read_observed_counter({}, "budget_drops", m.budget_drops);
+    check(!eval::judge_injection("rate", m).checked, "C05 absent counter is unknown");
+    m.budget_drops_observed = cue::pipeline::read_observed_counter(
+        nlohmann::json{{"budget_drops", 0}}, "budget_drops", m.budget_drops);
+    check(eval::judge_injection("rate", m).checked && !eval::judge_injection("rate", m).effective,
+          "C05 an actually observed zero is ineffective");
+    m.samples = 0;
+    check(!eval::judge_injection("rate", m).checked, "C05 absent sample cannot prove a zero");
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("cue-eval-presence-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    for (const bool known : {false, true}) {
+      const std::string id = known ? "known" : "unknown";
+      {
+        auto fake = std::make_unique<FakePipeline>();
+        fake->counters_known = known;
+        cue::pipeline::RecordingPipeline rec(std::move(fake), dir.string(), id);
+        (void)rec.latest();
+      }
+      cue::pipeline::ReplayPipeline replay(cue::pipeline::tools_record_path(dir.string(), id));
+      const auto read = replay.latest();
+      check(read.samples == 1 && read.budget_drops_observed == known &&
+                read.injected_observed == known && eval::judge_injection("rate", read).checked == known,
+            "C05 recording/replay preserves unknown versus actual zero");
+    }
+    // A legacy recording lacking both keys stays unknown (not replay miss).
+    const auto path = cue::pipeline::tools_record_path(dir.string(), "known");
+    std::ifstream in(path);
+    std::vector<nlohmann::json> rows;
+    std::string line;
+    while (std::getline(in, line)) {
+      auto row = nlohmann::json::parse(line);
+      if (row.contains("ret") && row["ret"].is_object()) {
+        row["ret"].erase("budget_drops"); row["ret"].erase("injected");
+      }
+      rows.push_back(std::move(row));
+    }
+    in.close();
+    { std::ofstream file(path); for (const auto& row : rows) file << row.dump() << "\n"; }
+    cue::pipeline::ReplayPipeline legacy(path);
+    const auto read = legacy.latest();
+    check(read.samples == 1 && !read.budget_drops_observed && !read.injected_observed &&
+              !eval::judge_injection("rate", read).checked && legacy.stats().misses == 0,
+          "C05 legacy missing counters remain unknown without invented zeros");
+    std::filesystem::remove_all(dir);
   }
 
   if (failures == 0) {
