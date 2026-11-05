@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -69,7 +70,7 @@ int xferinfo_cb(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) 
 }
 
 HttpOutcome perform(CURL* curl, const curl_slist* headers, const std::string& url,
-                    const std::string& payload, int timeout_s, std::size_t max_bytes,
+                    const std::string& payload, long timeout_ms, std::size_t max_bytes,
                     const std::atomic<bool>* cancel) {
   HttpOutcome o;
   // 复用句柄：reset 掉上次的选项，但保留连接缓存（省掉每轮一次 TLS 握手）
@@ -81,7 +82,7 @@ HttpOutcome perform(CURL* curl, const curl_slist* headers, const std::string& ur
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout_s));
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
   curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");  // 开启 gzip/deflate，curl 自动解压
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   // 取消：NOPROGRESS 必须关掉，否则 XFERINFOFUNCTION 不会被调用
@@ -221,9 +222,27 @@ OpenAiCompatibleClient::OpenAiCompatibleClient(Config cfg)
 OpenAiCompatibleClient::~OpenAiCompatibleClient() = default;
 
 std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const ChatRequest& req) {
+  using Clock = std::chrono::steady_clock;
+  const auto started = Clock::now();
   if (!impl_->curl) return std::unexpected("curl_easy_init failed");
   // 已经取消就别浪费一次（可能是计费的）请求
   if (req.cancel != nullptr && req.cancel->load()) return std::unexpected("cancelled");
+
+  int timeout_s = cfg_.timeout_s;
+  if (req.timeout_s > 0) timeout_s = timeout_s > 0 ? std::min(req.timeout_s, timeout_s) : req.timeout_s;
+  if (timeout_s <= 0) timeout_s = 60;
+  auto deadline = started + std::chrono::seconds(timeout_s);
+  if (req.deadline) deadline = std::min(deadline, *req.deadline);
+  const auto cancelled = [&] { return req.cancel != nullptr && req.cancel->load(std::memory_order_relaxed); };
+  const auto remaining_ms = [&]() -> int64_t {
+    const auto now = Clock::now();
+    // Compare first: subtracting time_point::min() from now can overflow.
+    if (now >= deadline) return 0;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+  };
+  // A sub-millisecond remainder cannot safely become CURLOPT_TIMEOUT_MS=0
+  // (which means unlimited). Cancellation wins when both conditions apply.
+  if (remaining_ms() <= 0) return std::unexpected("request deadline exceeded");
 
   json body{
       {"model", req.model.empty() ? cfg_.model : req.model},
@@ -241,26 +260,30 @@ std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const Chat
   if (!url.empty() && url.back() == '/') url.pop_back();
   url += "/v1/chat/completions";
 
-  // 请求级超时只能收紧：剩余预算比客户端超时大时，仍用客户端超时
-  int timeout_s = cfg_.timeout_s;
-  if (req.timeout_s > 0) timeout_s = (timeout_s > 0 ? std::min(req.timeout_s, timeout_s) : req.timeout_s);
-  if (timeout_s <= 0) timeout_s = 60;
   const int max_retries = cfg_.max_retries < 0 ? 0 : cfg_.max_retries;
-
   HttpOutcome outcome;
   int attempts = 0;
   for (int attempt = 0; attempt <= max_retries; ++attempt) {
+    if (cancelled()) return std::unexpected("cancelled");
+    if (remaining_ms() <= 0) return std::unexpected("request deadline exceeded");
     if (attempt > 0) {
-      // 退避 200 → 800 ms（SPEC §7.9）
-      const int backoff_ms = attempt == 1 ? 200 : 800;
-      std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+      const auto backoff_end = std::min(deadline, Clock::now() +
+          std::chrono::milliseconds(attempt == 1 ? 200 : 800));
+      while (Clock::now() < backoff_end) {
+        if (cancelled()) return std::unexpected("cancelled");
+        std::this_thread::sleep_until(std::min(backoff_end, Clock::now() + std::chrono::milliseconds(20)));
+      }
     }
+    if (cancelled()) return std::unexpected("cancelled");
+    const auto left = remaining_ms();
+    if (left <= 0) return std::unexpected("request deadline exceeded");
+    const long timeout_ms = static_cast<long>(std::min<int64_t>(left, std::numeric_limits<long>::max()));
     ++attempts;
-    outcome = perform(impl_->curl, impl_->headers, url, payload, timeout_s, cfg_.max_response_bytes,
+    outcome = perform(impl_->curl, impl_->headers, url, payload, timeout_ms, cfg_.max_response_bytes,
                       req.cancel);
-    // 取消是调用方主动放弃：立刻收手，绝不能落进 429/5xx 的退避重试（否则一次取消会
-    // 被拖成 200ms + 800ms + 又一次满超时，AC-8 的 5 秒预算就破了）
-    if (outcome.rc == CURLE_ABORTED_BY_CALLBACK) break;
+    if (cancelled() || outcome.rc == CURLE_ABORTED_BY_CALLBACK) return std::unexpected("cancelled");
+    if (outcome.rc == CURLE_OPERATION_TIMEDOUT || remaining_ms() <= 0)
+      return std::unexpected("request deadline exceeded");
     if (!retryable(outcome.rc, outcome.http_code, outcome.overflow)) break;
   }
 
@@ -281,6 +304,8 @@ std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const Chat
   }
   auto parsed = parse_response(outcome.body);
   if (!parsed) return parsed;
+  if (cancelled()) return std::unexpected("cancelled");
+  if (remaining_ms() <= 0) return std::unexpected("request deadline exceeded");
 
   // 录制发生在「成功返回」之后：失败/重试中的响应不进 cassette，回放只重放确定结论。
   if (!cfg_.record_dir.empty()) {
@@ -290,6 +315,10 @@ std::expected<ChatResponse, std::string> OpenAiCompatibleClient::chat(const Chat
       std::fprintf(stderr, "[llm] cassette 录制失败：%s\n", w.error().c_str());
     }
   }
+  // Recording is synchronous auxiliary I/O. It may finish after the deadline;
+  // never report a late/cancelled result as successful (no rollback is claimed).
+  if (cancelled()) return std::unexpected("cancelled");
+  if (remaining_ms() <= 0) return std::unexpected("request deadline exceeded");
   return parsed;
 }
 

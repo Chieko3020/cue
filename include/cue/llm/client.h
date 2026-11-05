@@ -4,10 +4,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,6 +52,9 @@ struct ChatRequest {
   // 失败，不允许把「用户已经放弃」拖成一次正常超时。
   // 它**不是**请求内容：cassette key 不包含它（否则回放必 miss）。
   const std::atomic<bool>* cancel = nullptr;
+  // Execution-only absolute cap, shared by every attempt and backoff.
+  // Never serialized into the HTTP request or cassette identity.
+  std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
 struct ChatResponse {

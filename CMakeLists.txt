@@ -432,6 +432,10 @@ add_executable(test_agent tests/test_agent.cpp)
 target_link_libraries(test_agent PRIVATE cue_agent)
 add_test(NAME agent COMMAND test_agent)
 
+add_executable(test_llm_deadline tests/test_llm_deadline.cpp)
+target_link_libraries(test_llm_deadline PRIVATE cue_agent)
+add_test(NAME llm_deadline_unit COMMAND test_llm_deadline --unit)
+
 # T-19（FR-AGENT.5）：会话持久化与中断恢复——六类记录往返 / 尾部残行容错 / 预算续算 /
 # 阶段复位 / 已结束会话拒绝续写 / 单写者锁 / 未回填 tool_call 的合成修复。
 # 全是本地文件读写 + ScriptedClient，毫秒级跑完（不联网、不起管线）。
@@ -622,7 +626,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 # 测试不属于任何一层：它们要能同时看见所有头文件（包括故意写错的越界组合，
 # 那是测试的职责）。统一在这里补全，避免 20 多个 target 各写一遍。
 set(CUE_TEST_TARGETS
-  test_wire test_agent test_session test_context test_eval test_manual test_generator test_state test_compare
+  test_wire test_agent test_llm_deadline test_session test_context test_eval test_manual test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget test_upstream_reassembly
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
@@ -669,6 +673,10 @@ if(Python3_Interpreter_FOUND)
     # 多进程测试只会得到不稳定结果，而它测的不是内存安全（那是 unit test 的职责）。
     # ASan/TSan job 仍跑全部单测，AC-12 的证据不受影响。
     if(UNIX AND NOT APPLE)
+      add_test(NAME llm_deadline_http
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_llm_deadline.py
+          --driver $<TARGET_FILE:test_llm_deadline>)
+      set_tests_properties(llm_deadline_http PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
       add_test(NAME eval_manual
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eval_manual.py
           --eval $<TARGET_FILE:cue-eval>)
@@ -776,7 +784,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # N-08/N-07/N-10 新增的单测，守卫当时还没加上（守卫本身也是 N-12 前后才有的），
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
-  set(_cue_san_tests wire agent session context eval manual state compare console cassette probe sandbox
+  set(_cue_san_tests wire agent llm_deadline_unit session context eval manual state compare console cassette probe sandbox
                      probe_render_headless audio_playback capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget upstream_reassembly
                      control_channel tools tool_schema delay_injector nack capture config metrics

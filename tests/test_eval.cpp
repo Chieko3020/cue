@@ -755,6 +755,19 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     }
   }
 
+  {
+    agent::RunResult expired;
+    expired.error = "wall clock budget exhausted";
+    check(eval::classify_run_error(expired) == "agent_timeout",
+          "C07 first-turn wall deadline is timeout, not endpoint unavailable");
+    expired.error = "http 400: wall clock limit configured by endpoint";
+    check(eval::classify_run_error(expired) == "llm_unavailable",
+          "C07 endpoint body cannot impersonate Runner wall-budget reason");
+    expired.error = "curl: connection refused";
+    check(eval::classify_run_error(expired) == "llm_unavailable",
+          "C07 first-turn connection error remains unavailable");
+  }
+
   if (failures == 0) {
     std::printf("test_eval: OK (13 groups)\n");
     return 0;

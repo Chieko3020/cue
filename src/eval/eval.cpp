@@ -1505,6 +1505,7 @@ std::string classify_run_error(const agent::RunResult& res) {
   // 上下文裁完仍超预算（N-13）：harness 主动终止，不是模型答错，也不是 LLM 不可用。
   // 必须先于「零轮次」判定——首轮就超限时 turns==0，否则会被误归成 llm_unavailable。
   if (e.find("context_overflow") != std::string::npos) return "context_overflow";
+  if (e == "wall clock budget exhausted") return "agent_timeout";
   if (res.turns == 0) return "llm_unavailable";
   if (e.find("wall clock") != std::string::npos) return "agent_timeout";
   if (e.find("cost budget") != std::string::npos) return "agent_cost_budget";

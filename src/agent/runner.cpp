@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <cstdio>
 #include <expected>
 #include <string>
@@ -187,7 +188,8 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
   // 退出原因：预算耗尽/异常都必须体现为 GiveUp + 非空 error（否则评测会把
   // "没跑完"当成"答错"计入成功率分母，审查实测过这个污染路径）。
   std::string stop_reason;
-  int64_t t_start = now_us();
+  auto wall_started = std::chrono::steady_clock::now();
+  int64_t resumed_wall_us = 0;
   const int64_t wall_limit_us = int64_t(budget.max_wall_s) * 1'000'000LL;
   // 成本单价：input/output 分开计价（未配置时回落到统一单价）。估算，非账单。
   const double price_in = cfg_.prompt_yuan_per_mtok > 0 ? cfg_.prompt_yuan_per_mtok : cfg_.yuan_per_mtok;
@@ -217,9 +219,15 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     if (cfg_.session == nullptr) return;
     note_write(fn(*cfg_.session));
   };
-  // 墙钟累计（含恢复前那段）：resume 时把 t_start 前移到"已花掉的时长"，
-  // 于是 now - t_start 天然就是累计值，预算检查与 budget 记录用的是同一个量。
-  auto wall_us = [&] { return now_us() - t_start; };
+  // Account for saved wall time without shifting a timepoint into the distant
+  // past. Saturate only an exhausted counter, never wrap it into a new budget.
+  auto wall_us = [&]() -> int64_t {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - wall_started).count();
+    if (elapsed > std::numeric_limits<int64_t>::max() - resumed_wall_us)
+      return std::numeric_limits<int64_t>::max();
+    return resumed_wall_us + elapsed;
+  };
   auto progress = [&] { return SessionProgress{r.turns, r.cost_yuan, wall_us()}; };
 
   std::vector<llm::ChatMessage> msgs;
@@ -256,8 +264,8 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     if (rs.meta.contains("goal") && rs.meta["goal"].is_string()) {
       goal_eff = rs.meta["goal"].get<std::string>();
     }
-    // 墙钟：把 t_start 往前挪已耗时长，剩余预算 = max_wall - 已经花掉的
-    t_start = now_us() - rs.progress.wall_us;
+    resumed_wall_us = std::max<int64_t>(0, rs.progress.wall_us);
+    wall_started = std::chrono::steady_clock::now();
     // 中断在「assistant(tool_calls) 已落盘、tool 结果还没落盘」之间：补合成结果并落盘，
     // 否则历史里有一个没回填的 tool_call，下一次请求直接被 API 400 拒掉。
     for (const auto& synthetic : rs.synthetic_tail) {
@@ -282,6 +290,11 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
                      {"stage", stage_name(stage)},
                      {"resumed", cfg_.resume != nullptr}});
 
+  // Check saved usage before converting to the clock's (typically nanosecond)
+  // duration: an already-exhausted int64 counter must not overflow on conversion.
+  const auto run_deadline = resumed_wall_us >= wall_limit_us
+      ? std::chrono::steady_clock::time_point::min()
+      : wall_started + std::chrono::microseconds(wall_limit_us - resumed_wall_us);
   while (r.turns < budget.max_turns) {
     // 每轮开始先看取消：预算检查在它之后，取消优先（否则会被报成预算耗尽）
     if (cancelled()) {
@@ -290,8 +303,8 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     }
     // 墙钟预算：每轮开头查，并把"剩余预算"作为本次 LLM 调用的硬超时，
     // 否则一次 60 s 的调用就能把 max_wall_s 顶穿（审查 P2）。
-    const int64_t elapsed_us = now_us() - t_start;
-    if (elapsed_us > wall_limit_us) {
+    const int64_t elapsed_us = wall_us();
+    if (elapsed_us >= wall_limit_us) {
       stop_reason = "wall clock budget exhausted";
       break;
     }
@@ -304,6 +317,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     req.tools.push_back(stage_complete_schema());
     req.max_tokens = cfg_.max_tokens;
     req.timeout_s = remaining_s > 0 ? remaining_s : 1;
+    req.deadline = run_deadline;
     // 阶段提示作为最后一条 user 消息里追加（不污染历史）
     req.messages.push_back(msg("user", stage_hint(stage)));
     // 上下文预算：超限丢最旧观测，保留 system 与最近若干条
@@ -345,9 +359,17 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       stop_reason = "cancelled";
       break;
     }
+    if (std::chrono::steady_clock::now() >= run_deadline) {
+      stop_reason = "wall clock budget exhausted";
+      break;
+    }
     auto resp = llm_.chat(req);
     if (!resp) {
-      stop_reason = resp.error();
+      if (cancelled()) stop_reason = "cancelled";
+      else if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                   run_deadline - std::chrono::steady_clock::now()).count() <= 0)
+        stop_reason = "wall clock budget exhausted";
+      else stop_reason = resp.error();
       break;
     }
     ++r.turns;
@@ -373,7 +395,7 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       break;
     }
     // 单轮内工具 + LLM 耗时同样可能超出墙钟，出循环前再查一次
-    if (now_us() - t_start > wall_limit_us) {
+    if (wall_us() >= wall_limit_us) {
       stop_reason = "wall clock budget exhausted";
       break;
     }
