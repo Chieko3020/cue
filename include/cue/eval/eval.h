@@ -221,9 +221,9 @@ bool evidence_matches(const std::string& evidence, const std::vector<Observation
 //  2) 证据文本里必须出现候选的 key（`==`/`!=` 也先按键命中）；
 //  3) 带谓词时，还要用**承载这条引用的那条观测**里该 key 的实际取值去满足谓词。
 //     取值优先来自 Observation::data（JSON 对象；数值/字符串/布尔都是标量）；
-//     data 不是对象、或对象里没有该键时，退回从 text 里解析 `key=VALUE`
-//     （旧录制与纯文本观测只有 text）。
-//  4) 两侧都能解析成 double 时按数值比较（含负数、小数，`==` 是精确相等而非 ±2%
+//     仅data为空/非对象的legacy text-only记录回退text；非空结构化data缺键或坏类型
+//     fail-closed。数值谓词的结构化值必须为有限JSON number，不将string/bool转数字。
+//  4) 数值源类型合法且右值为有限数时按数值比较（含负数、小数，`==` 是精确相等而非 ±2%
 //     容差——容差只用于"引用值是否与观测相符"，不能用来模糊判决条件）；
 //     否则 `==`/`!=` 按**原样字符串**比较，`> < >= <=` 判不满足，并把
 //     "非数值无法比较"写进原因（fail-closed：不猜、不把字符串当 0）。
@@ -290,6 +290,10 @@ std::expected<std::vector<Case>, std::string> load_suite(const std::string& path
 
 struct CaseOutcome {
   std::string id;
+  std::string evaluation_source; // manual_import or empty for existing execution paths
+  std::string manual_source;     // author-declared provenance, not authenticated
+  std::string manual_input_path;
+  std::string manual_input_sha256;
   // 这是第几次 repeat 轮（0-based）。stability 要按轮聚合每级的率：
   // 只有记住轮次，repeat=3 的"同一指标试了 3 次"才能算均值/离散度。
   int attempt = 0;
@@ -342,7 +346,8 @@ struct CaseOutcome {
 
 struct RunConfig {
   std::string suite_path;
-  std::string agent_mode = "scripted";  // scripted | real
+  std::string agent_mode = "scripted";  // scripted | real | manual
+  std::string manual_input; // explicit offline record file; never starts a backend
   int repeat = 1;                       // pass^k 的 k
   double max_yuan = 5.0;                // 单 run 成本闸门
   std::string out_dir = "runs";
@@ -473,6 +478,8 @@ struct RegressionList {
 
 struct RunReport {
   std::string run_id;
+  std::string manual_input_path;   // immutable provenance snapshot for this run
+  std::string manual_input_sha256;
   std::string fingerprint;  // 二进制 ⊕ git ⊕ 生效配置 ⊕ suite（SPEC §7.7/AC-9）
   // 非空 = 根本没有跑起来（state 写不进、锁被占）：此时不得覆盖已有 report.md
   std::string fatal_error;
@@ -576,6 +583,7 @@ class Engine {
   CaseOutcome run_scripted_case_pipeline(const Case& c) const;
   CaseOutcome run_real_case(const Case& c) const;
   void run_real_case_impl(const Case& c, CaseOutcome& o) const;
+  std::string config_hash_with_manual_snapshot(const std::string& hash) const;
   void run_cases(const std::vector<Case>& cases, RunReport& r);
   bool cancelled() const;
 

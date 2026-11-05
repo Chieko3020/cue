@@ -320,6 +320,7 @@ target_include_directories(cue_agent PUBLIC ${CUE_UPPER_INCLUDE})
 # 链接 cue_pipeline 是**实现**依赖（工厂与工具层的 .cpp 在那里），不是头文件依赖。
 add_library(cue_eval STATIC
   src/eval/eval.cpp
+  src/eval/manual.cpp
   src/eval/generator.cpp
   src/eval/state.cpp
   src/eval/compare.cpp)
@@ -451,6 +452,10 @@ add_test(NAME session_registry COMMAND test_session_registry)
 add_executable(test_context tests/test_context.cpp)
 target_link_libraries(test_context PRIVATE cue_agent)
 add_test(NAME context COMMAND test_context)
+
+add_executable(test_manual tests/test_manual.cpp)
+target_link_libraries(test_manual PRIVATE cue_eval)
+add_test(NAME manual COMMAND test_manual)
 
 add_executable(test_eval tests/test_eval.cpp)
 target_link_libraries(test_eval PRIVATE cue_eval)
@@ -617,7 +622,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 # 测试不属于任何一层：它们要能同时看见所有头文件（包括故意写错的越界组合，
 # 那是测试的职责）。统一在这里补全，避免 20 多个 target 各写一遍。
 set(CUE_TEST_TARGETS
-  test_wire test_agent test_session test_context test_eval test_generator test_state test_compare
+  test_wire test_agent test_session test_context test_eval test_manual test_generator test_state test_compare
   test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget test_upstream_reassembly
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
@@ -664,6 +669,10 @@ if(Python3_Interpreter_FOUND)
     # 多进程测试只会得到不稳定结果，而它测的不是内存安全（那是 unit test 的职责）。
     # ASan/TSan job 仍跑全部单测，AC-12 的证据不受影响。
     if(UNIX AND NOT APPLE)
+      add_test(NAME eval_manual
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eval_manual.py
+          --eval $<TARGET_FILE:cue-eval>)
+      set_tests_properties(eval_manual PROPERTIES TIMEOUT 90)
       add_test(NAME eval_producer
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eval_producer.py
           --eval $<TARGET_FILE:cue-eval> --cued $<TARGET_FILE:cued>
@@ -767,7 +776,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # N-08/N-07/N-10 新增的单测，守卫当时还没加上（守卫本身也是 N-12 前后才有的），
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
-  set(_cue_san_tests wire agent session context eval state compare console cassette probe sandbox
+  set(_cue_san_tests wire agent session context eval manual state compare console cassette probe sandbox
                      probe_render_headless audio_playback capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget upstream_reassembly
                      control_channel tools tool_schema delay_injector nack capture config metrics

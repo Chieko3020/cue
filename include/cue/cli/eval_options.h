@@ -24,6 +24,7 @@ struct EvalOptions {
   bool repeat_set = false;
   bool out_set = false;
   bool no_baseline = false;
+  bool llm_config_set = false; // preserve explicit transport/record presence through resume
   bool replay_flag = false;
   bool live_flag = false;
   bool record_flag = false;

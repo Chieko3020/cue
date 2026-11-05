@@ -30,6 +30,7 @@
 #include "cue/common/clock.h"
 #include "cue/common/sha256.h"
 #include "cue/eval/state.h"
+#include "cue/eval/manual.h"
 #include "cue/llm/cassette.h"
 #include "cue/llm/client.h"
 #include "cue/common/recorded_pipeline.h"
@@ -371,6 +372,7 @@ bool parse_number(const std::string& s, double& out) {
 struct ObservedScalar {
   bool found = false;
   bool numeric = false;
+  bool structured = false;
   double number = 0.0;
   std::string text;  // 非数值取值的原文；数值也留一份 dump，供字符串回退比较用
 };
@@ -382,10 +384,12 @@ ObservedScalar observed_scalar(const Observation& o, const std::string& key) {
     for (auto it = o.data.begin(); it != o.data.end(); ++it) {
       if (lower_copy(it.key()) != key) continue;
       const json& val = it.value();
+      v.structured = true;
       if (val.is_number()) {
         v.found = true;
-        v.numeric = true;
         v.number = val.get<double>();
+        v.numeric = std::isfinite(v.number);
+        if (!v.numeric) v.found = false;
         v.text = val.dump();
       } else if (val.is_string()) {
         v.found = true;
@@ -398,8 +402,9 @@ ObservedScalar observed_scalar(const Observation& o, const std::string& key) {
       // 不回退 text：同一个键在两侧不一致时，回退只会让谓词挑更好过的那份取值。
       return v;
     }
+    if (!o.data.empty()) return v; // structured snapshots are authoritative
   }
-  // data 不是对象 / 对象里没有该键：从 text 里解析 key=VALUE（旧录制、纯文本观测）。
+  // Legacy text-only snapshots may use key=value：从 text 里解析 key=VALUE（旧录制、纯文本观测）。
   // 键边界必须严格：`query_metrics(5000ms)` 里的 metrics 不算一个字段。
   const std::string low = lower_copy(o.text);
   const auto boundary_char = [](char ch) {
@@ -442,11 +447,27 @@ bool predicate_holds(const EvidenceCandidate& cand, const ObservedScalar& v, std
     why = "观测里没有 " + cand.key + " 的取值（无法验证 " + cand.key + cand.op + cand.value + "）";
     return false;
   }
+  const auto invalid_number = [](const std::string& raw) {
+    char* end = nullptr;
+    errno = 0;
+    const double number = std::strtod(raw.c_str(), &end);
+    return end != raw.c_str() && end == raw.c_str() + raw.size() &&
+           (errno == ERANGE || !std::isfinite(number));
+  };
+  if (invalid_number(v.text) || invalid_number(cand.value)) {
+    why = "non-finite or out-of-range values cannot satisfy predicates";
+    return false;
+  }
   double lhs = v.number;
   double rhs = 0.0;
   bool lhs_num = v.numeric;
-  if (!lhs_num) lhs_num = parse_number(v.text, lhs);
+  if (!lhs_num && !v.structured) lhs_num = parse_number(v.text, lhs);
   const bool rhs_num = parse_number(cand.value, rhs);
+  if ((rhs_num && v.structured && !v.numeric) ||
+      (v.numeric && !std::isfinite(v.number))) {
+    why = "非数值无法比较：结构化字段类型不支持数值谓词：" + cand.key;
+    return false;
+  }
   if (lhs_num && rhs_num) {
     bool ok = false;
     if (cand.op == ">") ok = lhs > rhs;
@@ -531,9 +552,25 @@ EvidenceCandidate parse_evidence_candidate(const std::string& raw) {
   return c;
 }
 
+namespace {
+bool evidence_has_field(const std::string& evidence, const std::string& key) {
+  const std::string low = lower_copy(evidence);
+  const auto ident = [](unsigned char ch) {
+    return std::isalnum(ch) || ch == '_' || ch == '.';
+  };
+  for (std::size_t at = low.find(key); at != std::string::npos; at = low.find(key, at + 1)) {
+    if ((at == 0 || !ident(static_cast<unsigned char>(low[at - 1]))) &&
+        (at + key.size() == low.size() ||
+         !ident(static_cast<unsigned char>(low[at + key.size()])))) return true;
+  }
+  return false;
+}
+} // namespace
+
 bool evidence_candidate_matches(const std::string& evidence, const Observation& obs,
                                 const EvidenceCandidate& cand, std::string& why) {
-  if (normalize(evidence).find(normalize(cand.key)) == std::string::npos) {
+  if (cand.has_predicate() ? !evidence_has_field(evidence, cand.key)
+                           : normalize(evidence).find(normalize(cand.key)) == std::string::npos) {
     why = "证据里没有候选键 " + cand.key;
     return false;
   }
@@ -555,7 +592,8 @@ bool evidence_hits_candidates(const std::string& evidence, const std::vector<Obs
   std::string first_why;
   for (const auto& raw : cands) {
     const EvidenceCandidate cand = parse_evidence_candidate(raw);
-    if (n.find(normalize(cand.key)) == std::string::npos) {
+    if (cand.has_predicate() ? !evidence_has_field(evidence, cand.key)
+                             : n.find(normalize(cand.key)) == std::string::npos) {
       if (first_why.empty()) first_why = "证据里没有候选键 " + cand.key;
       continue;
     }
@@ -1341,6 +1379,16 @@ std::unique_ptr<Producer> start_producer_if_needed(const RunConfig& cfg, const C
 }  // namespace
 
 std::string Engine::config_hash() const {
+  return config_hash_with_manual_snapshot(cfg_.agent_mode == "manual"
+      ? cue::sha256_file(cfg_.manual_input) : std::string());
+}
+
+std::string Engine::config_hash_with_manual_snapshot(const std::string& hash) const {
+  if (cfg_.agent_mode == "manual") {
+    // Offline grading has no backend/model/warmup configuration. Those ignored
+    // defaults must not invalidate a resume of the exact same imported bytes.
+    return cue::sha256_hex("manual|" + hash + "|evidence=c06-v1|aggregation=c05-v1");
+  }
   std::string cued_hash;
   if (!cfg_.cued_bin.empty()) cued_hash = cue::sha256_file(cfg_.cued_bin);
   // max_yuan（成本闸门）不进指纹：它只是"跑多少"的护栏，不是被测配置。
@@ -1371,7 +1419,7 @@ std::string Engine::config_hash() const {
   return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
                          "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
                          fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s) +
-                         llm_hash + ep_hash + tools_hash + producer_hash + "|aggregation=c05-v1");
+                         llm_hash + ep_hash + tools_hash + producer_hash + "|aggregation=c05-v1|evidence=c06-v1");
 }
 
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg, const std::string& run_dir) {
@@ -1811,13 +1859,13 @@ CaseOutcome Engine::run_scripted_case(const Case& c) const {
   // 那组数"，而 rate 故障真的发生时令牌桶被抽干（N-23 真源实测 78~82），所以这里给 82；
   // 若仍写死 0，rate 类 case 的自检证据会因谓词恒假而变红，那是把判分器测成红的。
   const int fake_budget_drops = c.fault_kind == "rate" ? 82 : 0;
-  ob.data = json{{"fps", 30.3},        {"frames_in", 247},   {"frames_out", 247},
+  ob.data = json{{"fps", c.fault_kind == "backlog" ? 12.0 : 30.3},        {"frames_in", 247},   {"frames_out", 247},
                  {"dropped", 0},       {"injected", 59},     {"decoded", 247},
-                 {"decode_errors", 0}, {"budget_drops", fake_budget_drops},  {"encode_p50_ms", 6.4},
-                 {"encode_p99_ms", 9.1}, {"op_p50_ms", 0.3}, {"samples", 1},
+                 {"decode_errors", 0}, {"budget_drops", fake_budget_drops},  {"encode_p50_ms", c.expect_root_cause == "encoder_too_slow" ? 45.0 : 6.4},
+                 {"encode_p99_ms", c.expect_root_cause == "encoder_too_slow" ? 60.0 : 9.1}, {"op_p50_ms", 0.3}, {"samples", 1},
                  {"send_p50_ms", 201.2}, {"send_p99_ms", 233.0},
                  {"delayed_pkts", 120},  {"delayed_max_us", 233000}, {"ingress_late", 0},
-                 {"encode_width", 1920}, {"encode_height", 1080},
+                 {"encode_width", c.width > 1920 ? c.width : 1920}, {"encode_height", c.height > 1080 ? c.height : 1080},
                  {"encode_bitrate_kbps", 6000}, {"encode_gop", 60},
                  {"encode_preset", "veryfast"}, {"encode_transcode", "on"},
                  {"e2e_fec_recovered", 37}, {"e2e_fec_groups_rx", 118},
@@ -2812,8 +2860,20 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
   r.repeat = cfg_.repeat;
   r.total = static_cast<int>(cases.size()) * cfg_.repeat;
   r.planned = r.total;
+  ManualInput imported;
+  if (cfg_.agent_mode == "manual") {
+    if (cfg_.repeat != 1 || cfg_.manual_input.empty()) {
+      r.fatal_error = "manual mode requires manual_input and repeat=1";
+      return;
+    }
+    auto loaded = load_manual_input(cfg_.manual_input, cases);
+    if (!loaded) { r.fatal_error = loaded.error(); return; }
+    imported = std::move(*loaded);
+    r.manual_input_path = cfg_.manual_input;
+    r.manual_input_sha256 = imported.sha256;
+  }
   // 基线指纹只算一次：suite 哈希 + git describe 不该按 case 重复做（review-eval.md #23）
-  const std::string base = base_fingerprint(cfg_.suite_path, config_hash());
+  const std::string base = base_fingerprint(cfg_.suite_path, config_hash_with_manual_snapshot(imported.sha256));
   r.fingerprint = base;
 
   const std::string run_dir = cfg_.out_dir + "/" + r.run_id;
@@ -2852,6 +2912,8 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
                 {"suite", cfg_.suite_path},
                 {"mode", cfg_.agent_mode},
                 {"llm", cfg_.llm_mode},
+                {"manual_input", r.manual_input_path},
+                {"manual_input_sha256", r.manual_input_sha256},
                 {"repeat", cfg_.repeat},
                 {"fingerprint", r.fingerprint},
                 {"created_us", now_us()}};
@@ -2896,12 +2958,22 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
         }
       }
       if (!reused) {
-        o = (cfg_.agent_mode == "real") ? run_real_case(c) : run_scripted_case(c);
+        if (cfg_.agent_mode == "manual") {
+          const auto it_manual = imported.records.find(c.id);
+          o = grade_manual_record(c, it_manual == imported.records.end() ? nullptr : &it_manual->second,
+                                  cfg_.manual_input, imported.sha256);
+        } else {
+          o = (cfg_.agent_mode == "real") ? run_real_case(c) : run_scripted_case(c);
+        }
         if (auto w = append_state(state_path, static_cast<int>(ci), k, o, fp); !w) {
           // state 写失败必须显式记账：静默丢行会让"续跑不重复计费"失效（P2#28）
           ++r.io_errors;
           r.run_notes.push_back("state 写入失败：" + w.error());
         }
+      }
+      if (cfg_.agent_mode == "manual") {
+        o.manual_input_path = r.manual_input_path;
+        o.manual_input_sha256 = r.manual_input_sha256;
       }
       // 轮次只在这里赋值：复用缓存时 outcome 来自 state，里面没有轮次（stability 需要它）
       o.attempt = k;
@@ -3152,6 +3224,12 @@ std::string Engine::render_markdown(const RunReport& r) const {
   o << "- 指纹: `" << r.fingerprint << "`（二进制 ⊕ git describe ⊕ 生效配置 ⊕ suite，SPEC §7.7）\n";
   o << "- 生效配置: cued=`" << cfg_.cued_bin << "`，model=`" << cfg_.model
     << "`，成本闸门 ¥" << cfg_.max_yuan << "，单价 ¥" << cfg_.yuan_per_mtok << "/Mtok（估算，非账单）\n";
+  if (cfg_.agent_mode == "manual") {
+    o << "> **manual_import：离线重判**。来源由提供者声明，未独立证明现场真实性；本次未重新测量SLA、未启动管线、未运行模型。\n\n";
+    o << "- 人工输入：`" << md_escape(r.manual_input_path) << "`，SHA256 `" << r.manual_input_sha256 << "`\n";
+    for (const auto& item : r.cases)
+      o << "- 来源 `" << md_escape(item.id) << "`：" << md_escape(item.manual_source) << "\n";
+  }
   if (!cfg_.record_tools_dir.empty()) {
     o << "- 工具观测: 录制到 `" << cfg_.record_tools_dir << "`（每个 case 一份 <case_id>.tools.jsonl）\n";
   }
@@ -3506,6 +3584,9 @@ std::string Engine::render_json(const RunReport& r) const {
       {"fatal_error", r.fatal_error.empty() ? json(nullptr) : json(r.fatal_error)},
       {"suite", cfg_.suite_path},
       {"agent_mode", cfg_.agent_mode},
+      {"evaluation_source", cfg_.agent_mode == "manual" ? "manual_import" : cfg_.agent_mode},
+      {"manual_input", r.manual_input_path},
+      {"manual_input_sha256", r.manual_input_sha256},
       {"llm_mode", cfg_.llm_mode},
       {"repeat", r.repeat},
       {"fingerprint", r.fingerprint},
@@ -3560,6 +3641,10 @@ std::string Engine::render_json(const RunReport& r) const {
   for (const auto& c : r.cases) {
     json cj{
         {"id", c.id},
+        {"evaluation_source", c.evaluation_source},
+        {"manual_source", c.manual_source},
+        {"manual_input_path", c.manual_input_path},
+        {"manual_input_sha256", c.manual_input_sha256},
         {"scored", c.scored},
         {"rate_eligible", rate_eligible(c)},
         {"error_kind", c.error_kind},

@@ -223,6 +223,10 @@ std::expected<void, std::string> RunLock::acquire(const std::string& dir) {
 
 json outcome_to_json(const CaseOutcome& o) {
   return json{{"id", o.id},
+              {"evaluation_source", o.evaluation_source},
+              {"manual_source", o.manual_source},
+              {"manual_input_path", o.manual_input_path},
+              {"manual_input_sha256", o.manual_input_sha256},
               {"scored", o.scored},
               {"rate_eligible", rate_eligible(o)},
               {"error_kind", o.error_kind},
@@ -267,6 +271,15 @@ std::expected<CaseOutcome, std::string> outcome_from_json(const json& j) {
   try {
     CaseOutcome o;
     o.id = j["id"].get<std::string>();
+    for (auto [key, field] : {std::pair{"evaluation_source", &o.evaluation_source},
+                              std::pair{"manual_source", &o.manual_source},
+                              std::pair{"manual_input_path", &o.manual_input_path},
+                              std::pair{"manual_input_sha256", &o.manual_input_sha256}}) {
+      if (j.contains(key)) {
+        if (!j[key].is_string()) return std::unexpected(std::string(key) + " must be a string");
+        *field = j[key].get<std::string>();
+      }
+    }
     if (j.contains("scored")) {
       if (!j["scored"].is_boolean()) return std::unexpected("outcome.scored 不是布尔");
       o.scored = j["scored"].get<bool>();

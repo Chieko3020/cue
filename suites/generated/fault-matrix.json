@@ -14,8 +14,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -51,8 +50,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -88,8 +86,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -125,8 +122,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -163,8 +159,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -201,8 +196,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -239,8 +233,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -277,8 +270,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -315,8 +307,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "injected>0",
-          "fps"
+          "injected>0"
         ],
         "root_cause": "network_loss",
         "sla": {
@@ -353,8 +344,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops>0",
-          "fps"
+          "budget_drops>0"
         ],
         "root_cause": "bandwidth_insufficient",
         "sla": {
@@ -393,8 +383,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops>0",
-          "fps"
+          "budget_drops>0"
         ],
         "root_cause": "bandwidth_insufficient",
         "sla": {
@@ -433,8 +422,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops>0",
-          "fps"
+          "budget_drops>0"
         ],
         "root_cause": "bandwidth_insufficient",
         "sla": {
@@ -473,8 +461,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops>0",
-          "fps"
+          "budget_drops>0"
         ],
         "root_cause": "bandwidth_insufficient",
         "sla": {
@@ -513,8 +500,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops>0",
-          "fps"
+          "budget_drops>0"
         ],
         "root_cause": "bandwidth_insufficient",
         "sla": {
@@ -553,8 +539,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "budget_drops>0",
-          "fps"
+          "budget_drops>0"
         ],
         "root_cause": "bandwidth_insufficient",
         "sla": {
@@ -593,9 +578,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -633,9 +616,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -673,9 +654,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -713,9 +692,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -754,9 +731,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -795,9 +770,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -836,9 +809,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -877,9 +848,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -918,9 +887,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "frames_in",
-          "frames_out",
-          "dropped"
+          "fps<25"
         ],
         "root_cause": "queue_backlog",
         "sla": {
@@ -959,9 +926,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "send_p99_ms",
-          "delayed_pkts",
-          "injected"
+          "delayed_pkts>0"
         ],
         "root_cause": "network_delay",
         "sla": {
@@ -998,9 +963,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "send_p99_ms",
-          "delayed_pkts",
-          "injected"
+          "delayed_pkts>0"
         ],
         "root_cause": "network_delay",
         "sla": {
@@ -1037,9 +1000,7 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "send_p99_ms",
-          "delayed_pkts",
-          "injected"
+          "delayed_pkts>0"
         ],
         "root_cause": "network_delay",
         "sla": {
@@ -1075,9 +1036,8 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "encode_p50_ms",
-          "encode_p99_ms",
-          "fps"
+          "encode_p50_ms>33.333333333333336",
+          "encode_p99_ms>33.333333333333336"
         ],
         "root_cause": "encoder_too_slow",
         "sla": {
@@ -1115,9 +1075,8 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "encode_p50_ms",
-          "encode_p99_ms",
-          "fps"
+          "encode_p50_ms>33.333333333333336",
+          "encode_p99_ms>33.333333333333336"
         ],
         "root_cause": "encoder_too_slow",
         "sla": {
@@ -1155,9 +1114,8 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "encode_p50_ms",
-          "encode_p99_ms",
-          "fps"
+          "encode_p50_ms>33.333333333333336",
+          "encode_p99_ms>33.333333333333336"
         ],
         "root_cause": "encoder_too_slow",
         "sla": {
@@ -1195,9 +1153,8 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "encode_p50_ms",
-          "op_p50_ms",
-          "fps"
+          "encode_width>1920",
+          "encode_height>1080"
         ],
         "root_cause": "resolution_too_high",
         "sla": {
@@ -1237,9 +1194,8 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "encode_p50_ms",
-          "op_p50_ms",
-          "fps"
+          "encode_width>1920",
+          "encode_height>1080"
         ],
         "root_cause": "resolution_too_high",
         "sla": {
@@ -1279,9 +1235,8 @@
           "fetch_observation"
         ],
         "evidence_candidates": [
-          "encode_p50_ms",
-          "op_p50_ms",
-          "fps"
+          "encode_width>1920",
+          "encode_height>1080"
         ],
         "root_cause": "resolution_too_high",
         "sla": {
@@ -1311,5 +1266,5 @@
   ],
   "suite": "fault-matrix",
   "version": 1,
-  "note": "由 cue-eval --gen 从矩阵生成（FR-EVAL.5）：注入矩阵 × 管线参数的组合批量生成，prompt / expect.sla / evidence_candidates / allowed_actions / budget / repair 全部继承 base 中同根因的模板，只有轴上的参数被替换。合法性规则：（1）fault.kind=none 与 fault.value 互斥；（2）transcode=off 时编码器轴（preset/size/bitrate/gop）不生效，组合被拒；（3）根因由矩阵的 expect 按 fault.kind 反查，多根因共用同一 kind 时必须显式给 expect.root_cause；（4）以 fps 为判据的根因拒绝 fault.kind=drop（出向丢包不改 fps，修不修都过）；（5）上行丢包率 p 需满足 30*(1-p) <= fps_min-3，排队节奏需 <= fps_min-3；（6）延迟/抖动需越过声明 lat_p99_ms 至少 30 ms，否则故障窗口仍然达标；（7）故障类 case 的修复动作只有清除注入，底子须为 720p 以内 + 快档，否则清除后仍达不到 fps_min；（8）限速值必须落在 cued 可执行的 [0.1,0.25] Mbps：低于 0.1 进程直接拒绝启动，高于 0.25 时故障态 fps 回到阈值以上；（9）时延/抖动类只允许 transcode=off（开转码会叠加编码负载，诊断面与编码类串味）。生成结果只保证「组合合法 + 能被引擎执行」；故障态的实测数值以 base 里的六类模板与实际运行记录为准，生成器不做 fps 预测。"
+  "note": "由 cue-eval --gen 从矩阵生成（FR-EVAL.5）：注入矩阵 × 管线参数的组合批量生成，prompt / expect.sla / evidence_candidates / allowed_actions / budget / repair 全部继承 base 中同根因的模板，只有轴上的参数被替换。合法性规则：（1）fault.kind=none 与 fault.value 互斥；（2）transcode=off 时编码器轴（preset/size/bitrate/gop）不生效，组合被拒；（3）根因由矩阵的 expect 按 fault.kind 反查，多根因共用同一 kind 时必须显式给 expect.root_cause；（4）以 fps 为判据的根因拒绝 fault.kind=drop（出向丢包不改 fps，修不修都过）；（5）上行丢包率 p 需满足 30*(1-p) <= fps_min-3，排队节奏需 <= fps_min-3；（6）延迟/抖动需越过声明 lat_p99_ms 至少 30 ms，否则故障窗口仍然达标；（7）故障类 case 的修复动作只有清除注入，底子须为 720p 以内 + 快档，否则清除后仍达不到 fps_min；（8）限速值必须落在 cued 可执行的 [0.1,0.25] Mbps：低于 0.1 进程直接拒绝启动，高于 0.25 时故障态 fps 回到阈值以上；（9）时延/抖动类只允许 transcode=off（开转码会叠加编码负载，诊断面与编码类串味）。生成结果只保证「组合合法 + 能被引擎执行」；故障态的实测数值以 base 里的六类模板与实际运行记录为准，生成器不做 fps 预测。 C06：正式故障证据使用取值谓词；fps<25依据既有25fps SLA，编码耗时阈值依据30fps的1000/30ms帧预算，不以正常frames_in或裸字段存在证明故障。"
 }

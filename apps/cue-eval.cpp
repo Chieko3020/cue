@@ -439,8 +439,8 @@ int main(int argc, char** argv) {
     cfg.record = false;
   }
 
-  if (cfg.agent_mode != "scripted" && cfg.agent_mode != "real") {
-    std::fprintf(stderr, "--mode 只能是 scripted 或 real（收到 %s）\n", cfg.agent_mode.c_str());
+  if (cfg.agent_mode != "scripted" && cfg.agent_mode != "real" && cfg.agent_mode != "manual") {
+    std::fprintf(stderr, "--mode 只能是 scripted、real 或 manual（收到 %s）\n", cfg.agent_mode.c_str());
     return 2;
   }
 
@@ -488,9 +488,23 @@ int main(int argc, char** argv) {
       return 2;
     }
     cfg.repeat = std::max(1, h_repeat);
+    if (cfg.agent_mode == "manual" && cfg.manual_input.empty())
+      cfg.manual_input = header_str(*hdr, "manual_input");
     cue::log::info("eval", "resume_config",
                    "续跑沿用原 run 配置：suite=" + cfg.suite_path + " mode=" + cfg.agent_mode +
                        " repeat=" + std::to_string(cfg.repeat));
+  }
+
+  if (cfg.agent_mode == "manual") {
+    if (cfg.manual_input.empty() || cfg.repeat != 1 || cfg.producer != "none" ||
+        !cfg.endpoint.empty() || !cfg.record_tools_dir.empty() || !cfg.replay_tools_dir.empty() ||
+        live_flag || replay_flag || record_cli || cfg.record || opts.llm_config_set) {
+      std::fprintf(stderr, "manual requires --manual-input and repeat1; backend/producer/LLM options are incompatible\n");
+      return 2;
+    }
+  } else if (!cfg.manual_input.empty()) {
+    std::fprintf(stderr, "--manual-input requires --mode manual\n");
+    return 2;
   }
 
   if (!suite_set && cfg.suite_path.empty()) {

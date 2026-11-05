@@ -1,7 +1,7 @@
 {
   "suite": "m2-constraints",
   "version": 1,
-  "note": "M2 的约束回归集：把 M0/M2 实测踩到的两个坑固化成可被 M4 评测引擎消费的 case。两者都只能人工复现（AVC level 由浏览器侧 configure 决定，FEC 幽灵帧不在 8 类根因枚举内），因此标 manual_only：real 模式跳过、不计入成功率分母。suite 字段必须全部被引擎认识——未知字段一律报错，避免『写错字段 → SLA 恒真 → 假绿灯』。evidence_candidates 只能引用 query_metrics 真实输出、且**在该场景下取值能支持结论**的字段（N-02 / N-02c）：曾经引用的 frames_no_data / frames_completed 在整个仓库里都不存在，证据层因此永远 0%。avc-level-mismatch 的 encode_width/height 之所以能当尺寸证据，是因为该 case 显式设了 1920x1080 转码（下面 pipeline 块的真实配置值）；transcode=off 时它们恒为 0（0 = 沿用解码尺寸 follow，不是 1080p）——那时用 0 推『coded area 2088960 超 level 3.0 上限』就是伪证：字段真实、取值却不支持结论（N-02b 真管线实测过这个坑）。fec-ghost-frame 的候选里 e2e_fec_ghost_discarded 是**常态计数**（FEC 校验包总在整帧数据之后到达：实测零丢包 8 s/241 帧 → 250 次，约每完成帧 1 次），它出现在候选里只是因为它确实可引用，**不能**拿来证明幽灵帧；幽灵帧的证据落在 e2e_fec_recovered（丢包相关：0% = 0、5% = 45~52）与 e2e_frag_ghost_discarded（异常指示：0% = 0、5% = 2~3）上。N-22 起两条 case 的候选都带取值谓词：avc-level-mismatch 用 encode_width==1920 / encode_height==1080（encode_width=0 不再算尺寸证据），fec-ghost-frame 只用 e2e_fec_recovered>0。e2e_fec_ghost_discarded 是常态计数（恒非零），若留在候选里，引用它就能给幽灵帧作假证，故删除；e2e_frag_ghost_discarded 在 5% 丢包下实测 2~3，但本机没有可复现的 FEC 真管线跑法，未验证前不写进候选。",
+  "note": "C06：manual_only默认real跳过，可用离线manual输入重判。AVC尺寸证据必须实际等于1920/1080。fec_ghost_frame保留历史ID，但只表示已完成帧的迟到分片重建尝试被e2e_frag_ghost_discarded守卫拒绝，不证明成功重组或重复播放；FEC恢复计数非零不是幽灵帧证据。离线来源由提供者声明，不替代真实浏览器/FEC现场验收。",
   "cases": [
     {
       "id": "avc-level-mismatch",
@@ -51,11 +51,11 @@
       "pipeline": {
         "transcode": false
       },
-      "prompt": "下行注入 5% 丢包并启用 XOR-FEC。检查 probe 侧是否出现幽灵帧（迟到的视频分片/重传为已完成的帧重建接收槽位），并给出根因。",
+      "prompt": "下行注入5%丢包并启用XOR-FEC。核对已完成帧的迟到分片是否尝试重建接收槽位并被守卫拒绝，引用e2e_frag_ghost_discarded的实际计数；不要把正常FEC恢复或守卫命中说成已成功重组/重复播放。",
       "expect": {
         "root_cause": "fec_ghost_frame",
         "evidence_candidates": [
-          "e2e_fec_recovered>0"
+          "e2e_frag_ghost_discarded>0"
         ],
         "allowed_actions": [
           "inject_fault",

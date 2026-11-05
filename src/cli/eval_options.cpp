@@ -78,7 +78,7 @@ std::expected<void, std::string> parse_producer_size(std::string_view v) {
 
 std::expected<void, config::Error> apply_eval_config(const config::Doc& doc, EvalOptions& o) {
   static constexpr std::string_view kKnown[] = {
-      "suite_path",   "agent_mode",      "repeat",       "max_yuan",
+      "suite_path",   "agent_mode", "manual_input", "repeat",       "max_yuan",
       "out_dir",      "warmup_s",        "cued_bin",     "probe_bin",
       "endpoint",     "model",           "yuan_per_mtok", "llm_mode",
       "cassette_dir", "record",          "record_tools_dir",
@@ -87,6 +87,7 @@ std::expected<void, config::Error> apply_eval_config(const config::Doc& doc, Eva
       "producer",     "producer_size",   "producer_bitrate", "capture_bin"};
   if (auto ok = doc.reject_unknown_keys("eval", kKnown); !ok) return std::unexpected(ok.error());
 
+  o.llm_config_set = doc.contains("eval.llm_mode") || doc.contains("eval.record");
   auto& cfg = o.cfg;
   if (doc.contains("eval.suite_path")) {
     auto v = doc.get_existing_file("eval.suite_path");
@@ -95,11 +96,16 @@ std::expected<void, config::Error> apply_eval_config(const config::Doc& doc, Eva
     o.suite_set = true;
   }
   if (doc.contains("eval.agent_mode")) {
-    static constexpr std::string_view kModes[] = {"scripted", "real"};
+    static constexpr std::string_view kModes[] = {"scripted", "real", "manual"};
     auto v = doc.get_enum("eval.agent_mode", kModes);
     if (!v) return std::unexpected(v.error());
     cfg.agent_mode = *v;
     o.mode_set = true;
+  }
+  if (doc.contains("eval.manual_input")) {
+    auto v = doc.get_string("eval.manual_input");
+    if (!v) return std::unexpected(v.error());
+    cfg.manual_input = *v;
   }
   if (doc.contains("eval.repeat")) {
     auto v = doc.get_int("eval.repeat", 1, 100);
@@ -231,7 +237,7 @@ void print_eval_usage() {
   std::printf(
       "cue-eval — Cue 评测 CLI\n"
       "\n"
-      "  cue-eval --suite <path> [--mode scripted|real] [--repeat k] [--max-yuan N]\n"
+      "  cue-eval --suite <path> [--mode scripted|real|manual] [--repeat k] [--max-yuan N]\n"
       "           [--out dir] [--warmup s] [--model name] [--cued path] [--probe path]\n"
       "           [--sla-settle-ms N] [--endpoint URL]\n"
       "           [--replay|--live] [--record] [--cassette-dir dir]\n"
@@ -264,6 +270,8 @@ void print_eval_usage() {
       "  --producer-size WxH    合成源尺寸（默认 640x360，宽高须为偶数）。\n"
       "  --producer-bitrate K   合成源码率 kbps（默认 1200）。\n"
       "  --capture BIN          cue-capture 二进制（默认 ./build/cue-capture）。\n"
+      "  --mode manual --manual-input FILE：离线导入version:1的人工诊断/观测/metrics记录，\n"
+      "    仅repeat1，不运行管线或模型；来源由提供者声明，SLA未重新测量。\n"
       "  --suite 缺省为 suites/m4-diagnosis.json；scripted 只是引擎自检，不判模型。\n"
       "  real 模式的 LLM 传输默认 replay：只读 cassette，零成本；缺录制直接报错\n"
       "  （run_error=cassette_miss，不静默走网络）。--live 才用真实网络（需 CUE_API_KEY /\n"
@@ -313,6 +321,9 @@ std::expected<EvalOptions, config::Error> parse_eval_options(int argc, char** ar
         return std::unexpected(cli_error("--mode 缺少取值"));
       }
       o.mode_set = true;
+    } else if (name == "--manual-input") {
+      if (!take_value(argc, argv, i, cfg.manual_input) || cfg.manual_input.empty())
+        return std::unexpected(cli_error("--manual-input requires a file"));
     } else if (name == "--replay") {
       o.replay_flag = true;
     } else if (name == "--live") {

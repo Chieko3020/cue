@@ -681,6 +681,80 @@ class FakePipeline : public cue::pipeline::IServicePipeline {
     std::filesystem::remove_all(dir);
   }
 
+  // C06: structured numeric predicates fail closed and keys are whole fields.
+  {
+    eval::Case c;
+    c.id = "c06-red";
+    c.expect_root_cause = "network_loss";
+    c.evidence_candidates = {"budget_drops>0"};
+    auto r = good_result();
+    r.diagnosis.evidence = {"budget_drops=82"};
+    eval::Observation o{"query_metrics", "budget_drops=82", nlohmann::json{{"budget_drops", "82"}}};
+    check(!eval::judge_case(c, r, {o}, good_metrics()).evidence,
+          "C06 structured numeric string cannot satisfy numeric predicate");
+    o.data = nlohmann::json{{"fps", 30}};
+    check(!eval::judge_case(c, r, {o}, good_metrics()).evidence,
+          "C06 missing structured field cannot fall back to conflicting text");
+    o.data = nlohmann::json{{"budget_drops", 82}, {"not_budget_drops", 82}};
+    o.text = "not_budget_drops=82";
+    r.diagnosis.evidence = {"not_budget_drops=82"};
+    check(!eval::judge_case(c, r, {o}, good_metrics()).evidence,
+          "C06 candidate cannot borrow prefixed field in evidence");
+  }
+
+  {
+    eval::Case c;
+    c.id = "c06-matrix"; c.expect_root_cause = "network_loss";
+    c.evidence_candidates = {"budget_drops>0"};
+    const auto judge = [&](nlohmann::json data, const std::string& text,
+                           const std::string& quote, const std::string& candidate) {
+      auto r = good_result(); r.diagnosis.evidence = {quote};
+      auto copy = c; copy.evidence_candidates = {candidate};
+      return eval::judge_case(copy, r, {{"query_metrics", text, data}}, good_metrics()).evidence;
+    };
+    for (const auto& value : {nlohmann::json(nullptr), nlohmann::json(true),
+                              nlohmann::json::array({82}), nlohmann::json::object({{"n", 82}})})
+      check(!judge({{"budget_drops", value}}, "budget_drops=82", "budget_drops=82", "budget_drops>0"),
+            "C06 bad structured type never borrows text");
+    for (const double value : {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()})
+      check(!judge({{"budget_drops", value}}, "budget_drops=82", "budget_drops=82", "budget_drops!=off"),
+            "C06 nonfinite cannot satisfy nonnumeric inequality");
+    check(!judge({{"budget_drops", 82}}, "budget_drops=82", "budget_drops=82", "budget_drops!=1e999"),
+          "C06 overflowing numeric RHS cannot fall back to string inequality");
+    check(judge(nlohmann::json::object(), "budget_drops=82", "budget_drops=82", "budget_drops>0"),
+          "C06 legacy text-only numeric record remains supported");
+    std::string scalar_why;
+    check(eval::evidence_candidate_matches("mode=on", {"query_metrics", "mode=on", {{"mode", "on"}}},
+                                           eval::parse_evidence_candidate("mode==on"), scalar_why),
+          "C06 scalar predicate retains structured string equality");
+    check(eval::evidence_candidate_matches("enabled=true", {"query_metrics", "enabled=true", {{"enabled", true}}},
+                                           eval::parse_evidence_candidate("enabled==true"), scalar_why),
+          "C06 scalar predicate retains structured boolean equality");
+    check(!judge({{"budget_drops", 82}, {"budget_drops_extra", 82}}, "budget_drops_extra=82",
+                 "budget_drops_extra=82", "budget_drops>0"), "C06 candidate suffix cannot borrow field");
+    auto quoted = good_result(); quoted.diagnosis.evidence = {"budget_drops=0"};
+    check(!eval::judge_case(c, quoted, {{"query_metrics", "budget_drops=0", {{"budget_drops", 0}}},
+                                      {"query_metrics", "budget_drops=82", {{"budget_drops", 82}}}}, good_metrics()).evidence,
+          "C06 cited zero cannot borrow another observation positive count");
+    check(!judge({{"budget_drops", 82}}, "budget_drops=82", "budget_drops=82 因此所有根因均已证明", "budget_drops>0"),
+          "C06 authentic quote plus invented prose is rejected");
+    for (const std::string path : {"suites/real-faults.json", "suites/m4-diagnosis.json", "suites/generated/fault-matrix.json"}) {
+      const auto suite = eval::load_suite(path);
+      check(bool(suite), "C06 maintained suite loads");
+      if (!suite) continue;
+      for (const auto& item : *suite) {
+        for (const auto& candidate : item.evidence_candidates)
+          check(eval::parse_evidence_candidate(candidate).has_predicate(), "C06 formal suite has no bare candidate bypass");
+        auto r = good_result(); r.diagnosis.root_cause = item.expect_root_cause;
+        r.diagnosis.evidence = {item.expect_root_cause == "bandwidth_insufficient" ? "budget_drops=0" : "frames_in=120"};
+        const eval::Observation normal{"query_metrics", "frames_in=120 budget_drops=0 fps=30 encode_width=0",
+                                       {{"frames_in", 120}, {"budget_drops", 0}, {"fps", 30}, {"encode_width", 0}}};
+        check(!eval::judge_case(item, r, {normal}, good_metrics()).evidence,
+              "C06 normal frames or zero budget do not prove suite fault");
+      }
+    }
+  }
+
   if (failures == 0) {
     std::printf("test_eval: OK (13 groups)\n");
     return 0;
