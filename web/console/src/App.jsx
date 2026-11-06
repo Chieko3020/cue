@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getJson, postJson } from './api.js';
+import { createEventStore } from './event-store.js';
 import Device from './pages/Device.jsx';
 import Pipeline from './pages/Pipeline.jsx';
 import Session from './pages/Session.jsx';
@@ -22,59 +23,74 @@ export default function App() {
   const [lastAction, setLastAction] = useState(null);
   const [busy, setBusy] = useState(0);
   const [tick, setTick] = useState(0);
-  const seenRef = useRef(new Set());
-
-  // 事件去重：SSE 推送与 /api/state 快照（首屏补齐、刷新后不空白）可能有同一 id
-  const pushEvent = useCallback((msg) => {
-    if (!msg || typeof msg.id !== 'number' || !msg.ev) return;
-    if (seenRef.current.has(msg.id)) return;
-    seenRef.current.add(msg.id);
-    setEvents((prev) => {
-      const next = prev.concat(msg);
-      return next.length > 800 ? next.slice(next.length - 800) : next;
-    });
+  const storeRef = useRef(createEventStore());
+  const snapshotEpoch = useRef(0);
+  const [snapshotStatus, setSnapshotStatus] = useState('connecting');
+  const [snapshotError, setSnapshotError] = useState('');
+  const selectGeneration = useCallback((generation) => {
+    const store = storeRef.current;
+    const previous = store.generation;
+    if (!store.select(generation)) return false;
+    if (previous !== generation) {
+      snapshotEpoch.current += 1;
+      setEvents([]);
+      setSnapshotStatus('stale');
+    }
+    return true;
   }, []);
 
-  // SSE：浏览器 EventSource 断线会自动重连，并按 Last-Event-ID 让服务端补齐（SPEC §6 M5）
+  const pushEvent = useCallback((msg) => {
+    if (storeRef.current.push(msg)) setEvents(storeRef.current.events);
+  }, []);
+
   useEffect(() => {
     const es = new EventSource('/events');
     es.onopen = () => setSseStatus('live');
-    es.onerror = () => setSseStatus('reconnecting');
+    es.onerror = () => {
+      snapshotEpoch.current += 1;
+      setSseStatus('reconnecting');
+      setSnapshotStatus('stale');
+    };
     es.onmessage = (e) => {
-      let msg = null;
-      try {
-        msg = JSON.parse(e.data);
-      } catch {
-        return;
-      }
-      if (!msg || !msg.ev) return;
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (!msg?.ev || !selectGeneration(msg.generation)) return;
       setSseStatus('live');
-      if (msg.ev === 'console.ready') return; // 握手提示，不是业务事件
       pushEvent(msg);
     };
     return () => es.close();
-  }, [pushEvent]);
+  }, [pushEvent, selectGeneration]);
 
-  // 状态快照轮询：指标/管线参数/待审批（SSE 只负责增量）
+  // Schedule after completion, rather than setInterval: at most one snapshot
+  // request is live. SSE errors and generation switches invalidate older responses.
   useEffect(() => {
     let alive = true;
+    let timer;
+    const controller = new AbortController();
     const load = async () => {
-      const j = await getJson('/api/state');
+      const epoch = snapshotEpoch.current;
+      const j = await getJson('/api/state', { signal: controller.signal });
       if (!alive) return;
-      if (j && j.ok) {
-        setState(j);
-        if (Array.isArray(j.events)) j.events.forEach(pushEvent);
-      } else {
-        setState((prev) => prev || { ok: false, error: (j && j.error) || '无法连接 cue-serve' });
+      if (epoch === snapshotEpoch.current) {
+        if (j?.ok && selectGeneration(j.server?.generation)) {
+          setState(j);
+          setSnapshotStatus('online');
+          setSnapshotError('');
+          if (Array.isArray(j.events)) j.events.forEach(pushEvent);
+        } else {
+          setSnapshotStatus('offline');
+          setSnapshotError(j?.error || '无法连接 cue-serve');
+        }
       }
+      timer = setTimeout(load, 1500);
     };
     load();
-    const t = setInterval(load, 1500);
     return () => {
       alive = false;
-      clearInterval(t);
+      controller.abort();
+      clearTimeout(timer);
     };
-  }, [pushEvent]);
+  }, [pushEvent, selectGeneration]);
 
   // 审批倒计时每秒重绘
   useEffect(() => {
@@ -93,7 +109,7 @@ export default function App() {
   const pipeline = state?.pipeline || {};
   const metrics = state?.metrics || {};
   const pending = state?.approvals?.pending || [];
-  const connectionOk = state ? state.ok !== false : false;
+  const connectionOk = snapshotStatus === 'online';
 
   return (
     <>
@@ -116,7 +132,7 @@ export default function App() {
             审批模式 <b>{state?.approvals?.mode ?? '—'}</b>
           </span>
           <span>
-            后端 <b>{connectionOk ? '在线' : '离线'}</b>
+            后端 <b data-testid="backend-status">{connectionOk ? '在线' : snapshotStatus === 'connecting' ? '连接中' : '离线 / 快照过期'}</b>
           </span>
           {busy > 0 ? <span className="badge warn">动作进行中 {busy}</span> : null}
         </div>
@@ -140,10 +156,10 @@ export default function App() {
       </nav>
 
       <main>
-        {state && state.ok === false ? (
-          <div className="card">
-            <h2>后端不可用</h2>
-            <div className="muted">{state.error}</div>
+        {!connectionOk && snapshotStatus !== 'connecting' ? (
+          <div className="card" data-testid="snapshot-stale">
+            <h2>后端状态不可用</h2>
+            <div className="muted">{snapshotError || '等待当前服务的状态快照'}{state ? '；下方保留的是旧快照，指标与管线状态可能已过期。' : ''}</div>
           </div>
         ) : null}
         <div data-testid={`page-${page}`} className="page">

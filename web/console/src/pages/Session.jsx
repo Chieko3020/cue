@@ -587,7 +587,7 @@ function EventStream({ events, sseStatus }) {
       ) : (
         <ol className="events" data-testid="event-list">
           {ordered.map((e) => (
-            <li key={`${e.id}-${e.ev}`} data-testid="event-row" data-ev={e.ev}>
+            <li key={`${e.id}-${e.ev}`} data-testid="event-row" data-ev={e.ev} data-generation={e.generation} data-id={e.id}>
               <span className="t">{clock(e.t)}</span>
               <span className="ev">{e.ev}</span>
               <span className="d">{eventSummary(e) || <span className="muted">（无摘要）</span>}</span>
@@ -597,7 +597,7 @@ function EventStream({ events, sseStatus }) {
         </ol>
       )}
       <p className="small muted" style={{ marginBottom: 0 }}>
-        断线重连时浏览器自动带 Last-Event-ID，服务端从环形缓冲补齐后发 console.ready
+        断线重连时浏览器自动带 Last-Event-ID，服务端先发 console.ready 确认服务代际，再从环形缓冲补齐
         （其中 replayed_from 是重连点）。事件最多保留 {num(800, 0)} 条在前端。
       </p>
     </Card>

@@ -9,6 +9,8 @@
 // 关闭哨兵：shutdown() 后向订阅者回调空串，SSE 连接线程据此退出写循环。
 #pragma once
 
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -16,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -30,13 +33,31 @@ inline int64_t wall_us() {
 }
 
 // SSE 帧：id 字段 + 单行 JSON data。浏览器 EventSource 以空行分隔事件。
-inline std::string sse_frame(uint64_t id, const std::string& payload) {
-  return "id: " + std::to_string(id) + "\ndata: " + payload + "\n\n";
+inline std::string sse_frame(const std::string& cursor, const std::string& payload) {
+  return "id: " + cursor + "\ndata: " + payload + "\n\n";
 }
 
 class SseHub {
  public:
   explicit SseHub(std::size_t cap = 512) : cap_(cap == 0 ? 1 : cap) {}
+
+  const std::string& generation() const { return generation_; }
+  std::string cursor(uint64_t id) const { return generation_ + ":" + std::to_string(id); }
+
+  // A foreign generation always starts at the retained ring. Legacy numeric cursors
+  // remain supported, but cannot identify a restart when their id is still in range.
+  uint64_t resume_id(const std::string& cursor) const {
+    std::string_view number(cursor);
+    const auto colon = number.find(':');
+    if (colon != std::string_view::npos) {
+      if (number.substr(0, colon) != generation_) return 0;
+      number.remove_prefix(colon + 1);
+    }
+    uint64_t id = 0;
+    const auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), id);
+    if (ec != std::errc{} || end != number.data() + number.size()) return 0;
+    return id > last_id() ? 0 : id;
+  }
 
   // 发布：入缓冲 + 广播。返回事件 id（关闭后仍然编号，避免前端把 id 当序号用错）。
   uint64_t publish(const std::string& ev, nlohmann::json data) {
@@ -49,8 +70,9 @@ class SseHub {
       std::lock_guard<std::mutex> lk(mu_);
       id = next_id_++;
       payload["id"] = id;
+      payload["generation"] = generation_;
       text = payload.dump();
-      ring_.push_back(Frame{id, text, sse_frame(id, text)});
+      ring_.push_back(Frame{id, text, sse_frame(cursor(id), text)});
       while (ring_.size() > cap_) ring_.pop_front();
       if (closed_) return id;  // 关闭后只留档，不广播
       cbs.reserve(subs_.size());
@@ -124,6 +146,15 @@ class SseHub {
   }
 
  private:
+  static std::string make_generation() {
+    static std::atomic<uint64_t> serial{0};
+    // Wall and monotonic nanoseconds distinguish process lifetimes; serial also
+    // distinguishes multiple hubs constructed in the same process/clock tick.
+    return std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) +
+           "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+           "-" + std::to_string(serial.fetch_add(1));
+  }
+  const std::string generation_ = make_generation();
   struct Frame {
     uint64_t id = 0;
     std::string payload;  // JSON 原文（recent 用）

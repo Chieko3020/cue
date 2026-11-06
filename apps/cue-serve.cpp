@@ -176,7 +176,8 @@ class ConsoleApp {
                      {"runs_dir", opt_.runs_dir},
                      {"approval_mode", opt_.approval},
                      {"approval_timeout_s", opt_.approval_timeout_s},
-                     {"sse_last_id", hub_.last_id()}};
+                     {"sse_last_id", hub_.last_id()},
+                     {"generation", hub_.generation()}};
     out["pipeline"] = {{"running", pipe_->running()},
                        {"config",
                         {{"cued_bin", cfg.cued_bin},
@@ -728,15 +729,7 @@ bool write_chunk(tcp::socket& sock, const std::string& data) {
   return !ec;
 }
 
-bool parse_u64(const std::string& s, uint64_t& out) {
-  if (s.empty()) return false;
-  char* end = nullptr;
-  errno = 0;
-  const unsigned long long v = std::strtoull(s.c_str(), &end, 10);
-  if (errno != 0 || end == nullptr || *end != '\0') return false;
-  out = static_cast<uint64_t>(v);
-  return true;
-}
+
 
 // GET 查询参数：控制台只传 id/run_id 这类白名单字符串，**不做百分号解码**是刻意的——
 // 解码会让 "%2e%2e" 变成 ".."，校验与拼接之间就多出一步需要防守的转换；
@@ -1030,8 +1023,8 @@ class Server {
       return std::nullopt;
     };
 
-    // 推流页入口：/stream 与 /stream/ 都返回 web 根的 index.html。
-    // 页面里的 `./app.js` 在 URL 为 /stream（无尾斜杠）时解析成 /app.js，正好落到上面的回退逻辑。
+    // The stream page uses absolute same-origin asset URLs, so both entry paths
+    // resolve the same resources without shadowing the console SPA.
     if (target == "/stream" || target == "/stream/") {
       if (auto body = read_at(stream, "index.html")) {
         return make_res(http::status::ok, std::move(*body), req, "text/html; charset=utf-8");
@@ -1063,18 +1056,13 @@ class Server {
 
   void serve_sse(tcp::socket& sock, const http::request<http::string_body>& req) {
     // Last-Event-ID：浏览器 EventSource 重连时自动带；也支持 ?last_event_id=N 便于脚本
-    uint64_t last_id = 0;
-    for (const auto& f : req.base()) {
-      if (beast::string_view(f.name_string()) == "Last-Event-ID") {
-        uint64_t v = 0;
-        if (parse_u64(std::string(f.value()), v)) last_id = v;
-      }
-    }
+    std::string resume_cursor;
+    const auto resume_header = req.find("Last-Event-ID");
+    if (resume_header != req.end()) resume_cursor = std::string(resume_header->value());
     const std::string target(req.target());
-    if (const auto p = target.find("last_event_id="); p != std::string::npos) {
-      uint64_t v = 0;
-      if (parse_u64(target.substr(p + 15), v)) last_id = v;
-    }
+    const std::string query_cursor = query_param(target, "last_event_id");
+    if (!query_cursor.empty()) resume_cursor = query_cursor;
+    const uint64_t last_id = app_.hub().resume_id(resume_cursor);
 
     // 自己写响应头：SSE 不结束响应，不能用 beast::http::write（它会补 Content-Length）
     const std::string head =
@@ -1108,21 +1096,18 @@ class Server {
       sink->cv.notify_all();
     });
 
-    bool ok = write_chunk(sock, "retry: 3000\n\n");
+    // Announce the generation before replay, even if the ring is empty.
+    json ready{{"ev", "console.ready"}, {"id", app_.hub().last_id()},
+               {"generation", app_.hub().generation()}, {"t", cow::wall_us()},
+               {"data", {{"replayed_from", last_id}, {"last_id", app_.hub().last_id()}}}};
+    bool ok = write_chunk(sock, "retry: 3000\n\ndata: " + ready.dump() + "\n\n");
     if (ok) {
       for (const auto& frame : app_.hub().replay_after(last_id)) {
-        // 补齐：一个 chunk 装一帧，便于浏览器逐帧 id 记账
         if (!write_chunk(sock, frame)) {
           ok = false;
           break;
         }
       }
-    }
-    // 告诉前端"当前是补齐后的实时流"，前端据此不必等第一条真实事件
-    if (ok) {
-      json ready{{"ev", "console.ready"}, {"id", app_.hub().last_id()}, {"t", cow::wall_us()},
-                 {"data", {{"replayed_from", last_id}, {"last_id", app_.hub().last_id()}}}};
-      ok = write_chunk(sock, "data: " + ready.dump() + "\n\n");
     }
 
     while (ok) {
@@ -1137,7 +1122,12 @@ class Server {
       }
       if (!batch.empty()) {
         std::string data;
-        for (const auto& f : batch) data += f;
+        for (const auto& f : batch) {
+          const auto event = json::parse(f, nullptr, false);
+          if (event.is_object() && event.contains("id")) {
+            data += cow::sse_frame(app_.hub().cursor(event["id"].get<uint64_t>()), f);
+          }
+        }
         ok = write_chunk(sock, data);
       }
       if (closed) break;

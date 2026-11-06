@@ -20,12 +20,21 @@ export async function postJson(url, body) {
   }
 }
 
-export async function getJson(url) {
+export async function getJson(url, { timeoutMs = 4000, signal } = {}) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, timeoutMs);
   try {
-    const res = await fetch(url, { cache: 'no-store' });
+    const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
     return await res.json();
   } catch (e) {
     return { ok: false, error: `请求失败：${e && e.message ? e.message : e}` };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
   }
 }
 

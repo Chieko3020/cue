@@ -715,6 +715,8 @@ endif()
 # 与上面 python3 的处理同一口径。
 find_program(NODE_EXECUTABLE node)
 if(NODE_EXECUTABLE)
+  add_test(NAME console_client
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_console_client.mjs)
   add_test(NAME avc_level_consistency
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-avc-level.mjs)
   set_tests_properties(avc_level_consistency PROPERTIES
@@ -816,7 +818,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 豁免：不是 C++ 二进制，不加载 sanitizer 运行时，LD_PRELOAD 对它们没意义。
   #   layer_isolation 是 cmake -P 脚本测试；no_external_cdn 是 Python 脚本；
   #   avc_level_consistency 是 node 脚本（只读源码，不加载 C++ 运行时）。
-  set(_cue_san_exempt layer_isolation no_external_cdn avc_level_consistency)
+  set(_cue_san_exempt layer_isolation no_external_cdn avc_level_consistency console_client)
   get_property(_cue_all_tests DIRECTORY PROPERTY TESTS)
   set(_cue_missing "")
   foreach(_t ${_cue_all_tests})

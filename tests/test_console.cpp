@@ -50,9 +50,20 @@ void test_hub() {
   // 补齐：id > last_id 的帧
   auto replay = hub.replay_after(1);
   check(replay.size() == 2, "hub: replay_after(1) 给出后两条");
-  check(replay[0].find("id: 2") == 0, "hub: 补齐帧以 id 开头");
+  check(replay[0].find("id: " + hub.cursor(2)) == 0, "hub: 补齐帧以 id 开头");
   check(replay[1].find("\"id\":3") != std::string::npos, "hub: 补齐帧内含 id");
   check(hub.replay_after(3).empty(), "hub: 已追上时无补齐");
+
+
+  cow::SseHub other;
+  check(hub.generation() != other.generation(), "hub: lifetime generation unique");
+  check(hub.recent(1)[0]["generation"] == hub.generation(), "hub: snapshot generation matches cursor");
+  check(hub.resume_id(hub.cursor(1)) == 1, "hub: same-generation resume");
+  check(hub.resume_id(other.cursor(1)) == 0, "hub: foreign generation replays low ids");
+  check(hub.resume_id("1") == 1, "hub: legacy numeric cursor supported");
+  check(hub.resume_id("999999") == 0, "hub: legacy ahead cursor resets");
+  check(hub.resume_id("bad") == 0 && hub.resume_id(hub.generation() + ":1x") == 0,
+        "hub: malformed cursors reset");
 
   // 环形缓冲上限 3：再发两条，最旧的被淘汰，补齐只能给现存最旧
   hub.publish("metric.sample", {{"fps", 29.0}});

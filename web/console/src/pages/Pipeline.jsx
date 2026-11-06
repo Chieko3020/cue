@@ -5,14 +5,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Card, Metric, ActionResult } from '../components/ui.jsx';
 import { num } from '../api.js';
 
-const SEGMENTS = [
-  { name: 'recv', p50: 'recv_p50_ms', p99: null },
-  { name: 'buffer', p50: 'buffer_p50_ms', p99: null },
-  { name: 'decode', p50: 'decode_p50_ms', p99: 'decode_p99_ms' },
-  { name: 'op', p50: 'op_p50_ms', p99: 'op_p99_ms' },
-  { name: 'encode', p50: 'encode_p50_ms', p99: 'encode_p99_ms' },
-  { name: 'send', p50: 'send_p50_ms', p99: null },
-];
+const SEGMENTS = ['recv', 'buffer', 'decode', 'op', 'encode', 'send'];
 
 const PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'];
 
@@ -133,21 +126,23 @@ export default function Pipeline({ state, runAction, busy, lastAction }) {
         </div>
       </Card>
 
-      <Card title="六段耗时（ms）" sub="p50 / p99；— 表示这段没有样本，不是 0">
+      <Card title="六段耗时（ms）" sub="p50 / p95 / p99；— 表示这段没有样本，不是 0">
         <table>
           <thead>
             <tr>
               <th>段</th>
               <th className="num">p50</th>
+              <th className="num">p95</th>
               <th className="num">p99</th>
             </tr>
           </thead>
           <tbody>
             {SEGMENTS.map((s) => (
-              <tr key={s.name} data-testid={`seg-${s.name}`}>
-                <td>{s.name}</td>
-                <td className="num">{num(m[s.p50], 2)}</td>
-                <td className="num">{s.p99 ? num(m[s.p99], 2) : '—'}</td>
+              <tr key={s} data-testid={`seg-${s}`}>
+                <td>{s}</td>
+                {['p50', 'p95', 'p99'].map((p) => (
+                  <td key={p} className="num">{num(m[`${s}_${p}_ms`], 2)}</td>
+                ))}
               </tr>
             ))}
           </tbody>
