@@ -395,15 +395,19 @@ struct PipelineMetrics {
   // 排队策略切换（fault.set kind=backlog 改了发送节奏）时主动丢弃的积压帧。
   // 与 dropped 分开：那一刻丢弃是控制面的策略决定，不是链路故障。
   uint64_t queue_dropped = 0;
+  bool queue_dropped_observed = false;
   // 延迟注入（FR-PIPE.10 的 delay / jitter）的实际效果：被压进延迟队列的数据报数，
   // 以及单个数据报被压住的最长时间（微秒）。它们是「延迟而不是丢包」的正面证据：
   // 只有这两个数涨而 injected / budget_drops 不涨，才说明数据报最终都发出去了、只是晚了。
   uint64_t delayed_pkts = 0;
+  bool delayed_pkts_observed = false;
   uint64_t delayed_max_us = 0;
+  bool delayed_max_us_observed = false;
   // 迟到帧（相对最小延迟基线晚到超过 --max-ingress-lag-ms 而被丢弃）。
   // 它和延迟注入的关系必须能读出来：延迟注入只压下行数据报，**不**改变帧的年龄，
   // 所以注入 delay 时这个计数应该保持 0；一旦它涨，说明是真的积压/时钟问题，不是注入。
   uint64_t ingress_late = 0;
+  bool ingress_late_observed = false;
   // 六段分位（ms）：recv/buffer/decode/op/encode/send 各 p50/p95/p99。
   // 生产端（cued 的 summary / session_snapshot / metric.sample）三处都发这三个分位，
   // 所以消费端六段的三分位**一律可读**：某一位是 NaN 只表示**那一位没有样本**
@@ -428,6 +432,7 @@ struct PipelineMetrics {
   // 请求数。空字符串 = 这行 METRICS 来自没有该字段的旧 cued（不要读成"没有控制面"）。
   std::string control_channel;
   uint64_t control_ops = 0;
+  bool control_ops_observed = false;
   // 编码档位快照（N-02）：来自 cued 的 `metrics.query` 响应里的 `params`（ParamStore 的
   // 运行期真值，agent 改过的 set_param 会体现在这里）。过去这份数据只在控制面内部
   // 用来更新 spawn 参数，agent 的 query_metrics 里看不到——于是"AVC level 配错"这类

@@ -63,20 +63,20 @@ json metrics_json(const PipelineMetrics& m, int64_t now) {
               {"encode_errors", m.encode_errors},
               {"decode_drops", m.decode_drops},
               {"budget_drops", m.budget_drops_observed ? json(m.budget_drops) : json(nullptr)},
-              {"queue_dropped", m.queue_dropped},
+              {"queue_dropped", m.queue_dropped_observed ? json(m.queue_dropped) : json(nullptr)},
               // 延迟注入的两个计数：被压住的数据报数 + 最长压住时长（微秒）。
               // 「延迟而非丢包」的判据就在这一对与 injected/budget_drops 的对照上。
-              {"delayed_pkts", m.delayed_pkts},
-              {"delayed_max_us", m.delayed_max_us},
+              {"delayed_pkts", m.delayed_pkts_observed ? json(m.delayed_pkts) : json(nullptr)},
+              {"delayed_max_us", m.delayed_max_us_observed ? json(m.delayed_max_us) : json(nullptr)},
               // 迟到帧：延迟注入**不**该让它涨（注入只压下行包，不改帧年龄）。
               // 它涨了说明问题在积压/时钟，而不是网络时延——这是区分两种根因的一票。
-              {"ingress_late", m.ingress_late},
+              {"ingress_late", m.ingress_late_observed ? json(m.ingress_late) : json(nullptr)},
               {"samples", m.samples},
               // 控制面（T-05）：通道类型与 cued 侧累计处理的控制请求数。旧版 cued 不上报
               // 时 control_channel 为 null——"不知道"不能写成 "stdout"。
               {"control_channel", m.control_channel.empty() ? json(nullptr)
                                                             : json(m.control_channel)},
-              {"control_ops", m.control_ops},
+              {"control_ops", m.control_ops_observed ? json(m.control_ops) : json(nullptr)},
               // 编码档位（N-02）：AVC level / 分辨率类根因过去只有一个报错字符串可讲，
               // 因为 agent 看不到"实际在用什么尺寸/码率编码"。这里输出的是 cued
               // ParamStore 的运行期真值（set_param 改过也在内）。

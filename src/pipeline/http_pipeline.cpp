@@ -110,6 +110,15 @@ void parse_metrics(const json& j, PipelineMetrics& m, int64_t now) {
   cnt("encode_errors", m.encode_errors);
   cnt("decode_drops", m.decode_drops);
   m.budget_drops_observed = read_observed_counter(j, "budget_drops", m.budget_drops);
+  m.queue_dropped_observed = read_observed_counter(j, "queue_dropped", m.queue_dropped);
+  m.delayed_pkts_observed = read_observed_counter(j, "delayed_pkts", m.delayed_pkts);
+  m.delayed_max_us_observed = read_observed_counter(j, "delayed_max_us", m.delayed_max_us);
+  m.ingress_late_observed = read_observed_counter(j, "ingress_late", m.ingress_late);
+  m.control_ops_observed = read_observed_counter(j, "control_ops", m.control_ops);
+  if (const auto it = j.find("control_channel"); it != j.end() && it->is_string()) {
+    m.control_channel = it->get<std::string>();
+  }
+
   // 六段分位（N-05）：REST 后端的 /api/state 若带 p95/p99 就照读；缺失保持 NaN。
   pct("recv_p50_ms", m.recv_p50);
   pct("recv_p95_ms", m.recv_p95);

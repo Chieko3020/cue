@@ -832,10 +832,10 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   m.encode_errors = count("encode_errors");
   m.decode_drops = count("decode_drops");
   m.budget_drops_observed = read_observed_counter(j, "budget_drops", m.budget_drops);
-  m.queue_dropped = count("queue_dropped");
-  m.delayed_pkts = count("delayed_pkts");
-  m.delayed_max_us = count("delayed_max_us");
-  m.ingress_late = count("ingress_late");
+  m.queue_dropped_observed = read_observed_counter(j, "queue_dropped", m.queue_dropped);
+  m.delayed_pkts_observed = read_observed_counter(j, "delayed_pkts", m.delayed_pkts);
+  m.delayed_max_us_observed = read_observed_counter(j, "delayed_max_us", m.delayed_max_us);
+  m.ingress_late_observed = read_observed_counter(j, "ingress_late", m.ingress_late);
   // 段分位：cued 写 null（本秒没有样本）或整段缺失 → 保持 NaN，绝不写成 0。
   // p95 过去被塞进一个丢弃用的 sink（"没有消费者"）——这正是报告 p95 恒 n/a 的根因：
   // 生产端一直在发，消费端解析出来就扔了（N-05）。现在六段各收各的三分位，
@@ -852,7 +852,7 @@ bool ProcessPipelineControl::apply_metrics_json(const json& j, bool from_uds) {
   if (const auto it = j.find("control_channel"); it != j.end() && it->is_string()) {
     m.control_channel = it->get<std::string>();
   }
-  m.control_ops = count("control_ops");
+  m.control_ops_observed = read_observed_counter(j, "control_ops", m.control_ops);
   // 编码档位（N-02）：只有 UDS 的 metrics.query 响应带 params（cued 的 ParamStore 真值）。
   // stdout 的 METRICS 行没有这一段 → 保持 encoder_known=false，观测面输出 null（未知），
   // 绝不把"没拿到"写成 0（0 会让"1080p 没在转码"和"不知道尺寸"长得一模一样）。

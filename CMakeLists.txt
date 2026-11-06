@@ -491,6 +491,10 @@ target_link_libraries(test_report PRIVATE cue_eval)
 add_test(NAME report COMMAND test_report)
 set_tests_properties(report PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(test_recorded_metrics tests/test_recorded_metrics.cpp)
+target_link_libraries(test_recorded_metrics PRIVATE cue_pipeline cue_agent)
+add_test(NAME recorded_metrics COMMAND test_recorded_metrics)
+
 # M5 控制台纯逻辑（SSE hub / 审批队列 / report.md 解析）
 add_executable(test_console tests/test_console.cpp)
 target_include_directories(test_console PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
@@ -627,7 +631,7 @@ set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 # 那是测试的职责）。统一在这里补全，避免 20 多个 target 各写一遍。
 set(CUE_TEST_TARGETS
   test_wire test_agent test_llm_deadline test_session test_context test_eval test_manual test_generator test_state test_compare
-  test_report test_console test_cassette test_probe test_sandbox test_jitter_buffer
+  test_report test_console test_recorded_metrics test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget test_upstream_reassembly
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
   test_audio_decoder test_audio_receiver test_audio_playback test_h264_decoder test_config test_metrics)
@@ -673,6 +677,11 @@ if(Python3_Interpreter_FOUND)
     # 多进程测试只会得到不稳定结果，而它测的不是内存安全（那是 unit test 的职责）。
     # ASan/TSan job 仍跑全部单测，AC-12 的证据不受影响。
     if(UNIX AND NOT APPLE)
+      add_test(NAME recorded_metrics_http
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-recorded-metrics-http.py
+          --driver $<TARGET_FILE:test_recorded_metrics>
+          --out ${CMAKE_CURRENT_BINARY_DIR}/recorded-metrics-http)
+      set_tests_properties(recorded_metrics_http PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
       add_test(NAME llm_deadline_http
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_llm_deadline.py
           --driver $<TARGET_FILE:test_llm_deadline>)
@@ -786,7 +795,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # N-08/N-07/N-10 新增的单测，守卫当时还没加上（守卫本身也是 N-12 前后才有的），
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
-  set(_cue_san_tests wire agent llm_deadline_unit session context eval manual state compare console cassette probe sandbox
+  set(_cue_san_tests wire agent llm_deadline_unit session context eval manual state compare console recorded_metrics cassette probe sandbox
                      probe_render_headless audio_playback capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget upstream_reassembly
                      control_channel tools tool_schema delay_injector nack capture config metrics

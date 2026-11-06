@@ -47,6 +47,12 @@ json metrics_to_json(const PipelineMetrics& m) {
               {"encode_errors", m.encode_errors},
               {"decode_drops", m.decode_drops},
               {"budget_drops", m.budget_drops_observed ? json(m.budget_drops) : json(nullptr)},
+              {"queue_dropped", m.queue_dropped_observed ? json(m.queue_dropped) : json(nullptr)},
+              {"delayed_pkts", m.delayed_pkts_observed ? json(m.delayed_pkts) : json(nullptr)},
+              {"delayed_max_us", m.delayed_max_us_observed ? json(m.delayed_max_us) : json(nullptr)},
+              {"ingress_late", m.ingress_late_observed ? json(m.ingress_late) : json(nullptr)},
+              {"control_ops", m.control_ops_observed ? json(m.control_ops) : json(nullptr)},
+              {"control_channel", m.control_channel.empty() ? json(nullptr) : json(m.control_channel)},
               // 六段分位（N-05）：与 tools.cpp 的 metrics_json 同一组键。
               // null = 该位没有样本；旧录制缺这些键，回读按 kNoSample（见 metrics_from_json）。
               {"recv_p50_ms", pct_json(m.recv_p50)},
@@ -150,6 +156,15 @@ bool metrics_from_json(const json& j, PipelineMetrics& m, std::string& err) {
   if (!get_u64(j, "encode_errors", m.encode_errors, err)) return false;
   if (!get_u64(j, "decode_drops", m.decode_drops, err)) return false;
   m.budget_drops_observed = read_observed_counter(j, "budget_drops", m.budget_drops);
+  m.queue_dropped_observed = read_observed_counter(j, "queue_dropped", m.queue_dropped);
+  m.delayed_pkts_observed = read_observed_counter(j, "delayed_pkts", m.delayed_pkts);
+  m.delayed_max_us_observed = read_observed_counter(j, "delayed_max_us", m.delayed_max_us);
+  m.ingress_late_observed = read_observed_counter(j, "ingress_late", m.ingress_late);
+  m.control_ops_observed = read_observed_counter(j, "control_ops", m.control_ops);
+  if (const auto it = j.find("control_channel"); it != j.end() && it->is_string()) {
+    m.control_channel = it->get<std::string>();
+  }
+
   // 六段分位（N-05）：get_pct 的口径是「字段缺失/null → kNoSample」，所以旧录制
   // （没有 *_p95_ms / recv_p99_ms / buffer_p99_ms / send_p99_ms）依然能回放，
   // 不会因为"新增观测"而整体解析失败；但键存在而类型不对仍然 fail-closed。

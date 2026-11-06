@@ -23,6 +23,9 @@
 //   {"v":1,"op":"running","ret":{"value":true}}
 //
 // NaN 口径：PipelineMetrics / ProbeMetrics 用 NaN 表示「没采到样本」（kNoSample）。
+// v1 additive counters (queue_dropped, delayed_pkts, delayed_max_us, ingress_late,
+// control_ops): unknown is null; old missing/null/invalid fields remain unobserved.
+// control_channel is a string or null; absence/non-string is unknown.
 // JSON 里写 null，回读时还原成 NaN，绝不变成 0——「没采到」被写成「花了 0 ms」
 // 是最危险的一类假绿。
 #pragma once
