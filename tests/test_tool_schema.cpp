@@ -17,6 +17,11 @@
 #include <cstddef>
 #include <cstdio>
 #include <functional>
+#include <limits>
+#include <filesystem>
+#include <chrono>
+
+#include "cue/llm/cassette.h"
 #include <string>
 #include <vector>
 
@@ -79,7 +84,8 @@ json keys_of(const json& obj) {
 //   type/description 恒有；enum_values 非空才有 enum；has_range 才有 minimum/maximum。
 json allowed_param_keys(const tool::ParamSpec& p) {
   std::vector<std::string> ks = {"description", "type"};
-  if (!p.enum_values.empty()) ks.push_back("enum");
+  if (!p.enum_values.empty() && !p.soft_enum) ks.push_back("enum");
+  if (p.type == "array" && !p.items_type.empty()) ks.push_back("items");
   if (p.has_range) {
     ks.push_back("maximum");
     ks.push_back("minimum");
@@ -187,11 +193,15 @@ void compare_registry(const tool::Registry& reg, const char* tag) {
       // description 必须存在且非空：空描述等于让模型猜参数语义，单靠 type 猜不出来
       const std::string pdesc = pj.value("description", std::string());
       check(!pdesc.empty(), w + ": description 非空（模型可用性的下限）");
-      check_str(pdesc, p.desc, w + ": description == ParamSpec::desc");
+      const std::string expected_desc = p.soft_enum && !p.enum_values.empty()
+          ? p.desc + " Suggested values (not exhaustive): " + json(p.enum_values).dump() : p.desc;
+      check_str(pdesc, expected_desc, w + ": description preserves declaration and advisory values");
+      if (p.type == "array" && !p.items_type.empty())
+        check_json(pj.value("items", json::object()), json{{"type", p.items_type}}, w + ": array items contract");
 
       // enum：顺序敏感。实现是按 enum_values 原样赋值数组的；顺序进线格式后模型对
       // 枚举的偏好会受影响（越靠前越容易被选中），所以"值集合相同但顺序不同"也算漂移。
-      if (p.enum_values.empty()) {
+      if (p.enum_values.empty() || p.soft_enum) {
         check(!pj.contains("enum"), w + ": 无 enum_values 时 schema 不出现 enum 键");
       } else {
         check(pj.contains("enum"), w + ": 有 enum_values 时 schema 带 enum");
@@ -291,6 +301,73 @@ int main() {
                                         .max = 0}}},
               [](const json&) { return tool::ToolResult{}; });
     compare_registry(tiny, "自检注册表");
+  }
+
+  // Exercise actual validation, rather than only comparing schema with its source.
+  {
+    const auto* shell = reg.find_spec("run_shell");
+    check(shell != nullptr, "real run_shell exists");
+    if (shell) {
+      check(bool(tool::validate_args(*shell, json{{"cmd", "/usr/bin/ls"}, {"args", {"-l"}}})),
+            "absolute whitelist path remains allowed by advisory validation");
+      check(!tool::validate_args(*shell, json{{"cmd", "ls"}, {"args", "-l"}}), "reject scalar args");
+      check(!tool::validate_args(*shell, json{{"cmd", "ls"}, {"args", {"-l", 1}}}), "reject mixed args");
+      check(!tool::validate_args(*shell, json{{"cmd", "ls"}, {"timeout_ms", 199}}), "reject below range");
+      check(!tool::validate_args(*shell, json{{"cmd", "ls"}, {"unknown", 1}}), "reject unknown param");
+      check(!tool::validate_args(*shell, json::object()), "reject missing required cmd");
+      check(bool(tool::validate_args(*shell, json{{"cmd", "ls"}, {"timeout_ms", 5000.0}})), "integral float accepted");
+      check(!tool::validate_args(*shell, json{{"cmd", "ls"}, {"timeout_ms", 5000.5}}), "fractional integer rejected");
+      // Approval still precedes execution; no shell process is launched here.
+      tool::CallContext deny;
+      deny.mode = tool::ApprovalMode::Deny;
+      check(reg.call_guarded("run_shell", json{{"cmd", "/usr/bin/ls"}}, deny).status ==
+                tool::GuardedCall::Status::ApprovalDenied, "advisory schema does not bypass approval");
+    }
+    const auto* metrics = reg.find_spec("query_metrics");
+    if (metrics) check(!tool::validate_args(*metrics, json{{"window_ms", "5000"}}), "scalar type checked");
+    tool::ToolSpec scalar{.name = "bounds", .desc = "numeric edge contracts",
+      .params = {{.name = "i", .type = "integer", .desc = "signed integer", .enum_values = {}},
+                 {.name = "n", .type = "number", .desc = "finite number", .enum_values = {}}}};
+    check(!tool::validate_args(scalar, json{{"i", UINT64_MAX}, {"n", 0}}), "unsigned int64 overflow rejected");
+    check(!tool::validate_args(scalar, json{{"i", 0x1p63}, {"n", 0}}), "float int64 overflow rejected");
+    check(bool(tool::validate_args(scalar, json{{"i", -0x1p63}, {"n", 0}})), "int64 minimum accepted");
+    check(!tool::validate_args(scalar, json{{"i", 0}, {"n", std::numeric_limits<double>::quiet_NaN()}}), "NaN rejected");
+    check(!tool::validate_args(scalar, json{{"i", 0}, {"n", std::numeric_limits<double>::infinity()}}), "infinity rejected");
+    const auto* fault = reg.find_spec("inject_fault");
+    if (fault) check(!tool::validate_args(*fault, json{{"kind", "invented"}, {"value", 0}}), "hard enum remains enforced");
+  }
+
+  {
+    // Fresh cassette with the actual current registry schema. Public schema
+    // changes legitimately change old keys; never rewrite the key algorithm.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("cue-c12-schema-" + std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count()));
+    cue::llm::ChatRequest request;
+    request.model = "scripted";
+    request.tools = reg.schema();
+    cue::llm::ChatMessage message;
+    message.role = "user"; message.content = "schema round trip";
+    request.messages.push_back(message);
+    cue::llm::ScriptedClient scripted;
+    cue::llm::ChatResponse response;
+    response.content = "recorded response";
+    response.usage = {71, 19};
+    scripted.push(response);
+    const auto generated = scripted.chat(request);
+    check(bool(generated), "scripted schema response generated");
+    if (generated) {
+      const auto written = cue::llm::cassette_append(dir.string(), request, "", *generated);
+      check(bool(written), "actual schema cassette recorded");
+      cue::llm::CassetteClient replay({.dir = dir.string(), .default_model = ""});
+      const auto result = replay.chat(request);
+      check(result && result->content == response.content && result->usage.prompt_tokens == 71 &&
+          result->usage.completion_tokens == 19, "actual schema cassette replay preserves response and usage");
+      check(replay.stats().hits == 1 && replay.stats().misses == 0, "actual schema cassette key hits");
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    check(!ec && !fs::exists(dir), "temporary schema cassette cleaned up");
   }
 
   if (failures == 0) {

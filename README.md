@@ -7,6 +7,8 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 - **评测** — 声明式 case、三重判分（根因 / 证据 / SLA）、pass^k、指纹、回归对比、人读报告
 - **可观测** — `cue-serve` + React 控制台五页、SSE 事件流、审批 UI；`cue-probe` 跨机接收端
 
+2026-11-07 C12关联回归：普通11/11、ASan+UBSan10/10、TSan10/10、无SDL3/3通过，未重新运行下方C11全量矩阵。Runner保留query_metrics/fetch_observation及stage_complete的完整调用/结果轮次，保护可从已有会话历史重建；`max_context_tokens`现包含估算消息、工具schema和模型输出上限，无法容纳时发结构化`context.overflow`，不再发下一次模型请求。tokens仍为估算，保守保留证据可能更早触发overflow，不负责验证自由文本证据的真实性。soft enum改为描述中的非穷尽建议，run_shell.args声明并校验字符串元素；白名单和审批不放松。实际schema或裁剪后请求变化会改变旧cassette身份，原录制不回填、不削弱key算法，当前真实注册表的离线录制/回放已通过。线协议仍为原小端，本批仅运行既有golden bytes，未验证大端硬件、真实模型、设备听感、公网或当前远端CI。
+
 2026-11-07 本地C11回归：普通SDL 52/52通过、无SDL 49/49通过；ASan+UBSan（SDL）44/44通过；TSan（SDL）44/44通过。普通SDL为40个C++、4个脚本检查及8个进程/网络测试；无SDL少1个SDL专属C++和2个SDL恢复脚本；sanitizer保留全部40个SDL配置C++及4个脚本检查，进程/网络脚本单列普通配置。Windows原生客户端入口SDL 15/15、OFF 14/14通过，未覆盖原生Windows cued/Harness或真实设备。清单和结果由 `scripts/ci-regression.py` 与独立冻结的 `scripts/ci-test-inventory.json` 逐项核对；原33/32计数是历史快照。
 
 既有验收记录（2026-10-25，非本轮重跑）：AC-15曾记录18 case × REPEAT=3；AC-1曾记录一台Windows集成摄像头和Realtek麦克风的浏览器推流。C11工程回归不重新签这些人工/设备验收；C10零预缓冲轻微卡顿、首260ms实音失败，以及公网UDP、音画同步和独立硬件长测边界继续保留。当前本地提交尚无对应远端CI运行，历史成功不能签当前版本。

@@ -20,10 +20,11 @@ namespace {
 // 只要数值可无损转成 int64 就接受；1.5 / NaN / 越界仍然拒绝。
 bool is_integral_value(const json& v) {
   if (!v.is_number()) return false;
-  if (v.is_number_integer() || v.is_number_unsigned()) return true;
+  if (v.is_number_unsigned()) return v.get<std::uint64_t>() <= std::uint64_t(INT64_MAX);
+  if (v.is_number_integer()) return true;
   const double d = v.get<double>();
   if (!std::isfinite(d) || d != std::trunc(d)) return false;
-  return d >= -9.2e18 && d <= 9.2e18;
+  return d >= -0x1p63 && d < 0x1p63;
 }
 
 }  // namespace
@@ -52,8 +53,15 @@ std::expected<void, std::string> validate_args(const ToolSpec& spec, const json&
     const auto& v = args[p.name];
     if (p.type == "string" && !v.is_string()) return std::unexpected(p.name + " must be string");
     if (p.type == "integer" && !is_integral_value(v)) return std::unexpected(p.name + " must be integer");
-    if (p.type == "number" && !v.is_number()) return std::unexpected(p.name + " must be number");
+    if (p.type == "number" && (!v.is_number() || !std::isfinite(v.get<double>()))) return std::unexpected(p.name + " must be number");
     if (p.type == "boolean" && !v.is_boolean()) return std::unexpected(p.name + " must be boolean");
+
+    if (p.type == "array") {
+      if (!v.is_array()) return std::unexpected(p.name + " must be array");
+      if (p.items_type == "string")
+        for (const auto& item : v)
+          if (!item.is_string()) return std::unexpected(p.name + " items must be string");
+    }
 
     // soft_enum：enum 只作为 schema 提示（见 ParamSpec 注释），由 handler 自己拒绝并留痕
     if (!p.enum_values.empty() && !p.soft_enum) {
@@ -96,7 +104,12 @@ json Registry::schema() const {
     json required = json::array();
     for (const auto& p : spec.params) {
       json pj{{"type", p.type}, {"description", p.desc}};
-      if (!p.enum_values.empty()) pj["enum"] = p.enum_values;
+      if (!p.enum_values.empty()) {
+        if (p.soft_enum)
+          pj["description"] = p.desc + " Suggested values (not exhaustive): " + json(p.enum_values).dump();
+        else pj["enum"] = p.enum_values;
+      }
+      if (p.type == "array" && !p.items_type.empty()) pj["items"] = {{"type", p.items_type}};
       if (p.has_range) {
         pj["minimum"] = p.min;
         pj["maximum"] = p.max;

@@ -1,6 +1,7 @@
 // 上下文预算单测：估算、裁剪边界、不可丢的消息
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -297,8 +298,96 @@ int main() {
           "N-13 reserve: over_by consistent with effective_tokens");
   }
 
+  // C12: protected rounds survive, later eligible rounds are still reclaimed.
+  {
+    std::vector<llm::ChatMessage> history{msg("system", 30), msg("user", 30)};
+    auto round = [&](const std::string& name, std::size_t bytes) {
+      llm::ChatMessage a;
+      a.role = "assistant";
+      a.tool_calls.push_back({name, name, "{}"});
+      history.push_back(a);
+      auto t = msg("tool", bytes);
+      t.name = name;
+      t.tool_call_id = name;
+      history.push_back(t);
+    };
+    round("query_metrics", 6000);
+    round("stage_complete", 6000);
+    round("other", 6000);
+    history.push_back(msg("user", 30));
+    agent::ContextBudget b;
+    b.max_tokens = 6000;
+    b.keep_recent = 1;
+    b.single_msg_tokens = 1;
+    b.protect_tool = [](const std::string& name) { return name != "other"; };
+    const auto result = agent::trim_report(history, b);
+    check(result.dropped == 2 && result.truncated == 0 && !result.still_over,
+          "C12 skip protected oldest, delete later complete round");
+    check(history[3].content == std::string(6000, 'x') && history[5].content == std::string(6000, 'x'),
+          "C12 observation and diagnosis byte exact");
+    b.keep_recent = std::numeric_limits<std::size_t>::max();
+    b.max_tokens = 1;
+    const auto saved = history;
+    const auto tiny = agent::trim_report(history, b);
+    check(tiny.dropped == 0 && tiny.truncated == 0 && tiny.still_over, "C12 huge keep_recent safe");
+    check(history.size() == saved.size(), "C12 huge recent preserves complete rounds");
+    b.k = std::numeric_limits<double>::quiet_NaN();
+    b.max_tokens = std::numeric_limits<std::size_t>::max();
+    check(agent::trim_report(history, b).still_over, "C12 NaN fails closed at maximum budget");
+    b.k = std::numeric_limits<double>::max();
+    check(agent::trim_report(history, b).still_over, "C12 scaled estimate overflow fails closed");
+    b.k = 1;
+    b.schema_tokens = std::numeric_limits<std::size_t>::max();
+    b.output_tokens = 1;
+    check(agent::trim_report(history, b).still_over, "C12 reserve arithmetic overflow fails closed");
+    b.schema_tokens = 0;
+    b.output_tokens = -1;
+    check(agent::trim_report(history, b).still_over, "C12 negative output fails closed");
+  }
+  {
+    std::vector<llm::ChatMessage> history{msg("system", 30), msg("user", 30)};
+    agent::ContextBudget b;
+    b.k = 2;
+    const auto input = agent::effective_tokens(history, b);
+    b.schema_tokens = 7;
+    b.reserve_tokens = 11;
+    b.output_tokens = 101;
+    check(agent::effective_tokens(history, b) == input + 119, "C12 fixed reserves not calibrated");
+    b.max_tokens = input + 119;
+    check(!agent::trim_report(history, b).still_over, "C12 exact budget equality fits");
+    --b.max_tokens;
+    check(agent::trim_report(history, b).over_by == 1, "C12 one output token over boundary");
+    b.single_msg_tokens = std::numeric_limits<std::size_t>::max();
+    history.push_back(msg("tool", 300));
+    b.keep_recent = 100;
+    check(agent::trim_report(history, b).truncated == 0, "C12 huge single message limit cannot wrap");
+  }
+
+  {
+    std::vector<llm::ChatMessage> history{msg("system", 30), msg("user", 30)};
+    constexpr std::size_t rounds = 200;
+    for (std::size_t i = 0; i < rounds; ++i) {
+      llm::ChatMessage a;
+      a.role = "assistant";
+      a.tool_calls.push_back({"id" + std::to_string(i), "query_metrics", "{}"});
+      history.push_back(a);
+      auto t = msg("tool", 300);
+      t.name = "query_metrics";
+      t.tool_call_id = a.tool_calls[0].id;
+      history.push_back(t);
+    }
+    agent::ContextBudget b;
+    b.max_tokens = 1;
+    std::size_t checks = 0;
+    b.protect_tool = [&](const std::string&) { ++checks; return true; };
+    const auto result = agent::trim_report(history, b);
+    check(result.still_over && result.dropped == 0 && result.truncated == 0,
+          "C12 all protected history fails closed");
+    check(checks <= 2 * rounds, "C12 protected policy checks grow linearly with rounds");
+  }
+
   if (failures == 0) {
-    std::printf("test_context: OK (13 cases)\n");
+    std::printf("test_context: OK (16 cases)\n");
     return 0;
   }
   std::printf("test_context: %d failure(s)\n", failures);

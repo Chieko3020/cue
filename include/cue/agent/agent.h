@@ -67,7 +67,7 @@ class Runner {
     double yuan_per_mtok = 2.0;
     double prompt_yuan_per_mtok = 0.0;      // 0 = 回落到 yuan_per_mtok
     double completion_yuan_per_mtok = 0.0;  // 0 = 回落到 yuan_per_mtok
-    // 上下文预算：超出后丢最旧观测（system 与最近若干条必须保留）
+    // Context budget includes schema/output; observation/control rounds remain byte exact.
     std::size_t max_context_tokens = 24000;
     // 单轮输出上限。1024 会在多工具/长证据时被截断（SPEC §7.9）。
     int max_tokens = 2048;

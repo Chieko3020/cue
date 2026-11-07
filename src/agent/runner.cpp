@@ -320,13 +320,17 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
     req.deadline = run_deadline;
     // 阶段提示作为最后一条 user 消息里追加（不污染历史）
     req.messages.push_back(msg("user", stage_hint(stage)));
-    // 上下文预算：超限丢最旧观测，保留 system 与最近若干条
+    // Reconstruct evidence/control protection from history, also after resume.
     {
       ContextBudget cb;
       cb.max_tokens = cfg_.max_context_tokens;
       cb.k = ctx_k_;
       // tools schema 每轮都发，必须单独计入（漏算会系统性低估预算）
-      cb.reserve_tokens = estimate_tokens(req.tools);
+      cb.schema_tokens = estimate_tokens(req.tools);
+      cb.output_tokens = req.max_tokens;
+      cb.protect_tool = [](const std::string& name) {
+        return tool::Registry::is_observation_tool(name) || name == "stage_complete";
+      };
       const TrimResult tr = trim_report(req.messages, cb);
       if (tr.dropped > 0 || tr.truncated > 0) {
         // 既有字段名保持不变（报告/cassette 有依赖），只新增下面独立的 overflow 事件
@@ -343,7 +347,11 @@ RunResult Runner::run_impl(const std::string& goal, const Budget& budget,
       if (tr.still_over) {
         emit("context.overflow", {{"est_tokens", effective_tokens(req.messages, cb)},
                                   {"max_tokens", cb.max_tokens},
-                                  {"reserve", cb.reserve_tokens},
+                                  {"reserve", token_add(cb.reserve_tokens, cb.schema_tokens)},
+                                  {"schema_tokens", cb.schema_tokens},
+                                  {"output_tokens", cb.output_tokens},
+                                  {"protected_messages", tr.protected_messages},
+                                  {"invalid_budget", tr.invalid_budget},
                                   {"dropped", tr.dropped},
                                   {"truncated", tr.truncated},
                                   {"over_by", tr.over_by}});

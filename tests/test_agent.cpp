@@ -1,10 +1,13 @@
 // M3a 验证：用 ScriptedClient（不碰网络、不花钱）驱动一次完整「诊断→修复→验证」，
 // 断言状态机守卫、工具审批、诊断证据回填都按 SPEC 工作。
 #include <cstdio>
+#include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "cue/agent/agent.h"
+#include "cue/agent/session.h"
 #include "cue/llm/client.h"
 #include "cue/tool/tool.h"
 
@@ -42,6 +45,14 @@ llm::ChatResponse call(const std::string& id, const std::string& name, const jso
 }
 
 // 一组 mock 工具：行为可观测，用于断言调用次数与参数
+struct RecordingClient : llm::ScriptedClient {
+      std::vector<llm::ChatRequest> requests;
+      std::expected<llm::ChatResponse, std::string> chat(const llm::ChatRequest& req) override {
+        requests.push_back(req);
+        return ScriptedClient::chat(req);
+      }
+};
+
 struct MockTools {
   int metrics_calls = 0;
   int set_param_calls = 0;
@@ -596,8 +607,153 @@ int main() {
     check(overflow_data["over_by"].get<std::size_t>() > 0, "case16 over_by>0");
   }
 
+  // C12 regressions: real Runner requests, without a provider or device.
+  {
+    RecordingClient client;
+    tool::Registry reg;
+    const std::string evidence(42000, 'E');
+    reg.add(tool::ToolSpec{.name = "query_metrics", .desc = "controlled observation", .params = {}},
+            [&](const json&) { return tool::ToolResult{evidence}; });
+    auto cfg = make_cfg(tool::ApprovalMode::Auto);
+    cfg.max_context_tokens = 12000;
+    client.push(call("evidence", "query_metrics", json::object()));
+    auto res = agent::Runner(client, reg, cfg).run("preserve evidence", agent::Budget{});
+    check(res.error == "context_overflow", "C12 observation overflow is explicit");
+    check(client.requests.size() == 1, "C12 never send truncated protected observation");
+
+    RecordingClient output;
+    cfg.max_context_tokens = 10000;
+    cfg.max_tokens = 10000;
+    json event;
+    res = agent::Runner(output, reg, cfg).run("output reserve", agent::Budget{},
+      [&](const agent::Event& e) { if (e.type == "context.overflow") event = e.data; });
+    check(res.error == "context_overflow", "C12 output alone exhausts context");
+    check(output.requests.empty(), "C12 output overflow sends zero requests");
+    check(res.turns == 0 && res.cost_yuan == 0, "C12 overflow has no usage or cost");
+  }
+
+  {
+    // Resume uses only serialized ChatMessage fields, including failed/ambiguous
+    // control rounds. No transient evidence IDs or metadata are available.
+    agent::LoadedSession saved;
+    saved.stage = agent::Stage::Repair;
+    saved.used_observe = true;
+    saved.diagnosis = {"queue", {"original evidence"}, 0.9};
+    auto append = [&](llm::ChatMessage m) {
+      auto decoded = agent::message_from_json(agent::message_to_json(m));
+      check(bool(decoded), "C12 session message round trip");
+      if (decoded) saved.messages.push_back(*decoded);
+    };
+    llm::ChatMessage system;
+    system.role = "system"; system.content = "saved system"; append(system);
+    llm::ChatMessage goal_message;
+    goal_message.role = "user"; goal_message.content = "saved goal"; append(goal_message);
+    auto round = [&](const std::string& id, const std::string& name, const std::string& result,
+                     const std::string& args = "{}") {
+      llm::ChatMessage a;
+      a.role = "assistant";
+      a.tool_calls.push_back({id, name, args});
+      append(a);
+      llm::ChatMessage t;
+      t.role = "tool";
+      t.name = name;
+      t.tool_call_id = id;
+      t.content = result;
+      append(t);
+    };
+    const std::string observation(16000, 'O');
+    const std::string diagnosis = json{{"next", "repair"}, {"root_cause", "queue_backlog"},
+      {"evidence", {std::string(9000, 'D')}}, {"confidence", 0.9}}.dump();
+    round("observation", "query_metrics", observation);
+    round("diagnosis", "stage_complete", "repair accepted", diagnosis);
+    for (int i = 0; i < 12; ++i) round("other" + std::to_string(i), "other", std::string(3000, 'X'));
+    RecordingClient client;
+    tool::Registry reg;
+    MockTools tools;
+    tools.build(reg);
+    auto cfg = make_cfg(tool::ApprovalMode::Auto);
+    cfg.resume = &saved;
+    cfg.max_context_tokens = 22000;
+    int dropped = 0;
+    agent::Runner(client, reg, cfg).run("ignored on resume", agent::Budget{}, [&](const agent::Event& e) {
+      if (e.type == "context.trim") dropped += e.data["dropped"].get<int>();
+    });
+    check(client.requests.size() == 1 && dropped > 0, "C12 resumed repair reclaims unrelated history");
+    if (!client.requests.empty()) {
+      const auto& messages = client.requests[0].messages;
+      check(messages[0].content == "saved system" && messages[1].content == "saved goal", "C12 saved prompts preserved");
+      check(messages[3].content == observation, "C12 resumed observation byte exact");
+      check(messages[4].tool_calls[0].arguments == diagnosis && messages[5].content == "repair accepted",
+            "C12 diagnosis call and result protected together");
+      std::vector<std::string> open;
+      for (const auto& m : messages) {
+        for (const auto& tc : m.tool_calls) open.push_back(tc.id);
+        if (m.role == "tool") {
+          const auto it = std::find(open.begin(), open.end(), m.tool_call_id);
+          check(it != open.end(), "C12 resumed request has no orphan results");
+          if (it != open.end()) open.erase(it);
+        }
+      }
+      check(open.empty(), "C12 resumed request has all call results");
+    }
+    RecordingClient overflow;
+    cfg.max_context_tokens = 6000;
+    json data;
+    int count = 0;
+    const auto result = agent::Runner(overflow, reg, cfg).run("ignored", agent::Budget{}, [&](const agent::Event& e) {
+      if (e.type == "context.overflow") { ++count; data = e.data; }
+    });
+    check(count == 1 && overflow.requests.empty() && result.error == "context_overflow",
+          "C12 resumed protected overflow sends no request");
+    check(data.value("protected_messages", 0) >= 5 && data.value("output_tokens", 0) == cfg.max_tokens &&
+              data.value("schema_tokens", 0) > 0, "C12 overflow explains protected/schema/output costs");
+    check(result.turns == saved.progress.turns && result.cost_yuan == saved.progress.cost_yuan,
+          "C12 resume overflow preserves saved accounting");
+    cfg.resume = nullptr;
+    cfg.max_tokens = -1;
+    cfg.max_context_tokens = std::numeric_limits<std::size_t>::max();
+    RecordingClient invalid;
+    const auto bad = agent::Runner(invalid, reg, cfg).run("invalid", agent::Budget{});
+    check(bad.error == "context_overflow" && invalid.requests.empty(), "C12 negative output cannot bypass budget");
+  }
+
+  {
+    // Live collect -> diagnose -> repair, then unrelated tool pressure.
+    RecordingClient client;
+    tool::Registry reg;
+    const std::string observation(16000, 'O');
+    const std::string evidence = observation.substr(0, 9000);
+    reg.add(tool::ToolSpec{.name = "query_metrics", .desc = "controlled metrics", .params = {}},
+      [&](const json&) { return tool::ToolResult{observation}; });
+    reg.add(tool::ToolSpec{.name = "other", .desc = "unrelated result", .params = {}},
+      [](const json&) { return tool::ToolResult{std::string(6000, 'X')}; });
+    auto push = [&](llm::ChatResponse response) { response.usage = {}; client.push(response); };
+    push(call("live-observation", "query_metrics", json::object()));
+    push(call("live-diagnose", "stage_complete", json{{"next", "diagnose"}}));
+    const json diagnosis{{"next", "repair"}, {"root_cause", "queue_backlog"},
+      {"evidence", {evidence}}, {"confidence", 0.9}};
+    push(call("live-repair", "stage_complete", diagnosis));
+    for (int i = 0; i < 10; ++i) push(call("live-other-" + std::to_string(i), "other", json::object()));
+    auto cfg = make_cfg(tool::ApprovalMode::Auto);
+    cfg.max_context_tokens = 24000;
+    int trimmed = 0;
+    agent::Budget budget;
+    budget.max_turns = 20;
+    const auto result = agent::Runner(client, reg, cfg).run("preserve live evidence", budget,
+      [&](const agent::Event& e) { if (e.type == "context.trim") ++trimmed; });
+    check(client.requests.size() == 14 && trimmed > 0, "C12 live repair reached request under history pressure");
+    bool observed = false, diagnosed = false;
+    if (!client.requests.empty()) for (const auto& m : client.requests.back().messages) {
+      if (m.tool_call_id == "live-observation") observed = m.content == observation;
+      for (const auto& tc : m.tool_calls)
+        if (tc.id == "live-repair") diagnosed = tc.arguments == diagnosis.dump();
+    }
+    check(observed && diagnosed && result.diagnosis.evidence == std::vector<std::string>{evidence},
+      "C12 live observation and diagnostic evidence remain byte exact after repair pressure");
+  }
+
   if (failures == 0) {
-    std::printf("test_agent: OK (16 cases)\n");
+    std::printf("test_agent: OK (19 cases)\n");
     return 0;
   }
   std::printf("test_agent: %d failure(s)\n", failures);

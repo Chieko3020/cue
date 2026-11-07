@@ -49,11 +49,13 @@ struct ParamSpec {
   bool has_range = false;
   double min = 0;
   double max = 0;
-  // enum 只写进 schema 给模型看，不在 validate_args 里硬拒。
+  // Suggested values appear in the description, never as a restrictive schema enum.
   // 用于 run_shell.cmd：被拒的命令必须真正走到 handler 才能落审计行（AC-11），
   // 在 schema 校验层就拒掉会让「尝试了白名单外命令」这件事在审计里消失。
   // 此时 handler 自己负责拒绝并留痕。
   bool soft_enum = false;
+  // Supported array contract: empty means untyped; "string" validates each item.
+  std::string items_type = {};
 };
 
 struct ToolSpec {
