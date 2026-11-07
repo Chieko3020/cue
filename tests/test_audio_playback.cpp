@@ -7,15 +7,17 @@ namespace {
 int failures = 0;
 void check(bool ok, const char* what) { if (!ok) { std::printf("FAIL: %s\n",what); ++failures; } }
 struct Device final : cue::probe::AudioQueueDevice {
-  bool present = true, paused = true, fail = false;
+  bool present = true, paused = true, fail = false, immediate = false, buffered = false;
   uint32_t bytes = 0;
   std::vector<std::string> actions;
   bool available() const override { return present; }
   int queued_ms() const override { return static_cast<int>(bytes / 96); }
   void pause(bool p) override { paused=p;actions.push_back(p?"pause":"play"); }
   void clear() override { bytes=0;actions.push_back("clear"); }
-  bool queue(const int16_t*, uint32_t count) override {
-    actions.push_back("queue"); if(fail)return false;bytes+=count;return true;
+  cue::probe::AudioQueueResult queue(const int16_t*, uint32_t count) override {
+    actions.push_back("queue"); if(fail)return cue::probe::AudioQueueResult::Failed;
+    if(buffered)return cue::probe::AudioQueueResult::Buffered;
+    bytes+=count;if(immediate&&!paused)bytes=0;return cue::probe::AudioQueueResult::Queued;
   }
 };
 int16_t pcm[960]{};
@@ -62,6 +64,33 @@ void limits_and_reset() {
   q.configure(0);d.actions.clear();q.reset();
   check(d.actions==std::vector<std::string>{"pause","clear","play"},"zero target reset resumes immediately");
 }
+void starvation_and_continuity() {
+  {
+    Device d;d.immediate=true;cue::probe::AudioPlaybackQueue q(d);q.configure(0);
+    d.buffered=true;q.push(pcm,1);q.observe();
+    check(q.stats().starved==0&&q.stats().queued==0,"filter-only buffering cannot arm starvation");
+    d.buffered=false;q.push(pcm,960);q.observe();
+    check(q.stats().starved==1,"successful output consumed immediately still counts once");
+    q.push(pcm,960);q.observe();check(q.stats().starved==2,"new immediately-consumed output rearms once");
+  }
+
+  for(int target:{0,250,260,500,2000}) {
+    Device d; cue::probe::AudioPlaybackQueue q(d);q.configure(target);
+    q.observe();check(q.stats().starved==0,"initial/no input is not starved");
+    const int packets=target?((target+19)/20):1;
+    for(int i=0;i<packets;++i)q.push(pcm,960);
+    for(int i=0;i<100;++i){d.bytes-=20*96;q.observe();q.push(pcm,960);}
+    check(q.stats().dropped_drift==0,"legal high prebuffer continues without soft dropping PCM");
+    const auto before=q.stats().starved;
+    d.bytes=0;q.observe();q.observe();
+    check(q.stats().starved==before+1,"idle empty episode observed once before next input");
+    check(q.started()==(target==0),"positive target re-enters prebuffer after depletion");
+    for(int i=0;i<packets;++i)q.push(pcm,960);
+    d.bytes=0;q.push(pcm,960);
+    check(q.stats().starved==before+2,"pre-push sample catches depletion before refilling");
+    q.reset();q.observe();check(q.stats().starved==before+2,"explicit reset cannot create starvation");
+  }
+}
 void failures_and_unavailable() {
   Device d;cue::probe::AudioPlaybackQueue q(d);q.configure(500);d.bytes=480*96;d.fail=true;
   q.push(pcm,960);
@@ -77,5 +106,5 @@ void failures_and_unavailable() {
   check(absent.actions.empty()&&no_device.stats().queued==0,"unavailable device has no operations or success");
 }
 }
-int main(){targets();limits_and_reset();failures_and_unavailable();
+int main(){targets();limits_and_reset();starvation_and_continuity();failures_and_unavailable();
   std::printf("audio playback failures=%d\n",failures);return failures?1:0;}

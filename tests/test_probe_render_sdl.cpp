@@ -15,7 +15,7 @@ bool drained(cue::probe::Renderer& r){
 }
 void targets(){
   for(int target:{0,250,260,500,2000}){
-    cue::probe::Renderer r;cue::probe::RenderConfig cfg;cfg.audio_prebuffer_ms=target;
+    cue::probe::Renderer r;cue::probe::RenderConfig cfg;cfg.audio_prebuffer_ms=target;cfg.audio_drift_compensation=false;
     std::string error;check(r.open(cfg,error),"real SDL Renderer opens");
     check(r.queued_ms()>=0,"dummy audio device actually opened");
     if(r.queued_ms()<0)continue;
@@ -29,8 +29,21 @@ void targets(){
     check(drained(r),"real SDL consumer starts and drains every legal target");
   }
 }
+void compensated_targets(){
+  for(int target:{260,500,2000}){
+    cue::probe::Renderer r;cue::probe::RenderConfig cfg;cfg.audio_prebuffer_ms=target;
+    std::string error;check(r.open(cfg,error)&&r.queued_ms()>=0,"default swr SDL target opens");
+    if(r.queued_ms()<0)continue;
+    for(int i=0;i<(target+19)/20+1;++i)r.queue_audio(pcm,960);
+    for(int i=0;i<15;++i){SDL_Delay(20);r.sample_audio();r.queue_audio(pcm,960);}
+    const auto stats=r.audio_stats();
+    check(stats.dropped_drift==0&&stats.trimmed==0&&stats.compensation_errors==0,
+          "default swr normal continuation at high target neither drops nor hard-clears");
+    check(stats.input_samples>0&&stats.output_samples>0,"default playback traverses real swr");
+  }
+}
 void resets(){
-  cue::probe::Renderer r;cue::probe::RenderConfig cfg;cfg.audio_prebuffer_ms=500;
+  cue::probe::Renderer r;cue::probe::RenderConfig cfg;cfg.audio_prebuffer_ms=500;cfg.audio_drift_compensation=false;
   std::string error;check(r.open(cfg,error),"reset SDL Renderer opens");
   if(r.queued_ms()<0){check(false,"reset dummy audio opened");return;}
   for(int i=0;i<25;++i)r.queue_audio(pcm,960);
@@ -55,5 +68,5 @@ int main(){
   for(int invalid:{-1,2001}){cue::probe::Renderer r;cue::probe::RenderConfig cfg;
     cfg.audio_prebuffer_ms=invalid;std::string error;
     check(!r.open(cfg,error)&&error.find("2000")!=std::string::npos,"invalid direct Renderer configuration fails");}
-  targets();resets();std::printf("SDL renderer failures=%d\n",failures);return failures?1:0;
+  targets();resets();compensated_targets();std::printf("SDL renderer failures=%d\n",failures);return failures?1:0;
 }

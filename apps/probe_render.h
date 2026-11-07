@@ -38,6 +38,7 @@ struct RenderConfig {
   // 所以默认 0，由调用方按链路质量显式给。合法范围 0..2000ms。
   // 预缓冲阶段不应用250ms播放软限；reset/硬清后按同一目标重新启动。
   int audio_prebuffer_ms = 0;
+  bool audio_drift_compensation = true;
 };
 
 // 只有声明；实现在 probe_render.cpp（SDL2 不可用时是空实现）。
@@ -62,10 +63,14 @@ class Renderer {
   // 没有这个观测就只能靠"听起来有没有咔咔"来猜，而咔咔的原因很可能在自己这边
   // （实测过：队列超上限就把新包丢掉，等于自己制造了丢包）。
   int queued_ms() const;
+  // Actual queued interleaved s16 samples, avoiding integer-ms rounding.
+  int queued_samples() const;
 
   // 清空播放队列。流换代/重连时必须调用：否则上一轮已解码的 PCM 会继续播完，
   // 听起来就是"重启后重复播放的还是上一轮的旧数据"。
   void reset_audio();
+  // Sample actual depletion on the main-loop clock, including packet-free periods.
+  void sample_audio();
 
   // 播放队列的累计账。只有把它放进指标行，"是链路丢了还是播放侧自己丢了/自己积压了"
   // 这个问题才有证据可查——只听声音只能判断"有咔咔"，判断不了责任在哪一侧。
@@ -78,7 +83,12 @@ class Renderer {
     uint64_t starved = 0;
     uint64_t trimmed = 0;      // 越过硬上限、被迫清空的次数（听感上是一次跳变）
     uint64_t queued = 0;       // 成功入队的 PCM 段数
-    uint64_t push_errors = 0;  // SDL_QueueAudio 失败次数（设备被拔/后端异常）
+    uint64_t push_errors = 0;  // SDL queue or playback processing failures
+    uint64_t rebuffered = 0;
+    uint64_t compensation_updates = 0, compensation_errors = 0;
+    uint64_t input_samples = 0, output_samples = 0, queue_samples = 0;
+    int compensation_ppm = 0;
+    int queue_p50_ms = -1, queue_p95_ms = -1, queue_p99_ms = -1;
   };
   AudioStats audio_stats() const;
 

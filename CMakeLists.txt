@@ -236,6 +236,7 @@ add_library(cue_capture STATIC
   src/media/opus_encoder.cpp)
 target_link_libraries(cue_capture PUBLIC cue_proto PkgConfig::FFMPEG PkgConfig::OPUS)
 target_link_libraries(cue_capture PRIVATE cue_headers_all)
+target_link_libraries(cue-probe PRIVATE cue_capture)
 
 # cue-capture：三后端（lavfi / ffmpeg 子进程 / v4l2）+ 上行 WS 客户端。
 # 复用 media/encoder（X264Encoder）而不是再写一份 x264 封装——cued 的转码链与采集端
@@ -382,12 +383,23 @@ add_test(NAME probe_render_headless COMMAND test_probe_render_headless)
 add_executable(test_audio_playback tests/test_audio_playback.cpp)
 target_include_directories(test_audio_playback PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
 add_test(NAME audio_playback COMMAND test_audio_playback)
+add_executable(test_audio_drift tests/test_audio_drift.cpp apps/probe_render.cpp)
+target_include_directories(test_audio_drift PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+target_link_libraries(test_audio_drift PRIVATE cue_capture cue_headers_all nlohmann_json::nlohmann_json Threads::Threads)
+if(CUE_ENABLE_SDL2 AND SDL2_FOUND)
+  target_compile_definitions(test_audio_drift PRIVATE CUE_HAVE_SDL2=1)
+  target_include_directories(test_audio_drift PRIVATE ${SDL2_INCLUDE_DIRS})
+  target_link_libraries(test_audio_drift PRIVATE ${SDL2_LIBRARIES})
+endif()
+add_test(NAME audio_drift COMMAND test_audio_drift)
+set_tests_properties(audio_drift PROPERTIES TIMEOUT 120)
+
 if(CUE_ENABLE_SDL2 AND SDL2_FOUND)
   add_executable(test_probe_render_sdl tests/test_probe_render_sdl.cpp apps/probe_render.cpp)
   target_include_directories(test_probe_render_sdl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps
     ${SDL2_INCLUDE_DIRS})
   target_compile_definitions(test_probe_render_sdl PRIVATE CUE_HAVE_SDL2=1)
-  target_link_libraries(test_probe_render_sdl PRIVATE cue_headers_all PkgConfig::FFMPEG
+  target_link_libraries(test_probe_render_sdl PRIVATE cue_capture cue_headers_all PkgConfig::FFMPEG
     ${SDL2_LIBRARIES})
   add_test(NAME probe_render_sdl COMMAND test_probe_render_sdl)
   set_tests_properties(probe_render_sdl PROPERTIES TIMEOUT 40)
@@ -634,7 +646,7 @@ set(CUE_TEST_TARGETS
   test_report test_console test_recorded_metrics test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget test_upstream_reassembly
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
-  test_audio_decoder test_audio_receiver test_audio_playback test_h264_decoder test_config test_metrics)
+  test_audio_decoder test_audio_receiver test_audio_playback test_audio_drift test_h264_decoder test_config test_metrics)
 foreach(_t IN LISTS CUE_TEST_TARGETS)
   target_link_libraries(${_t} PRIVATE cue_headers_all)
 endforeach()
@@ -661,6 +673,11 @@ if(Python3_Interpreter_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_probe_audio_recovery.py
         --probe $<TARGET_FILE:cue-probe>)
     set_tests_properties(probe_audio_recovery PROPERTIES TIMEOUT 90)
+    add_test(NAME probe_audio_drift_recovery
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_probe_audio_recovery.py
+        --probe $<TARGET_FILE:cue-probe> --compensation on)
+    set_tests_properties(probe_audio_drift_recovery PROPERTIES TIMEOUT 90)
+
   elseif(CUE_ENABLE_SDL2 AND SDL2_FOUND)
     message(STATUS "CUE_SANITIZE=${CUE_SANITIZE}: probe_audio_recovery runs only in regular builds")
   endif()
@@ -796,7 +813,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
   set(_cue_san_tests wire agent llm_deadline_unit session context eval manual state compare console recorded_metrics cassette probe sandbox
-                     probe_render_headless audio_playback capture_process probe_network
+                     probe_render_headless audio_playback audio_drift capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget upstream_reassembly
                      control_channel tools tool_schema delay_injector nack capture config metrics
                      session_registry generator report audio_decoder audio_receiver h264_decoder avc_level)

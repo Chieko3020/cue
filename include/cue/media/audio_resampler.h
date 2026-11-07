@@ -24,6 +24,8 @@ struct ResampleSpec {
   int in_channels = 2;
   int out_rate = 48000;
   int out_channels = 1;
+  // Keep the filter active even at equal rates; avoids reinitializing on first compensation.
+  bool force_resample = false;
 };
 
 enum class ResampleError : uint8_t {
@@ -57,6 +59,8 @@ class AudioResampler {
   // out 被追加写入（不清空）：调用方通常把多次 convert 的输出拼成 960 样本的 Opus 帧。
   std::expected<void, ResampleError> convert(const int16_t* in, std::size_t in_frames,
                                              std::vector<int16_t>& out, std::string& err);
+
+  std::expected<void, ResampleError> compensate(int sample_delta, int distance, std::string& err);
 
   // 排空重采样器内部的滤波器延迟（收流结束时调用一次，否则末尾几十个样本会丢）。
   std::expected<void, ResampleError> flush(std::vector<int16_t>& out, std::string& err);

@@ -619,6 +619,7 @@ int main(int argc, char** argv) {
   long long av_delay_ms = 0;
   // 播放前预缓冲（毫秒）：公网有到达抖动，攒一小段再开播可避免设备饿着。
   long long audio_prebuffer_ms = 0;
+  bool audio_drift_compensation = true;
   std::string snap_prefix;
   bool list_audio = false;
   long long jitter_max_level = 2;
@@ -692,6 +693,10 @@ int main(int argc, char** argv) {
     } else if (a == "--audio-prebuffer-ms") {
       const auto val = next();
       if (!parse_int(val, 0, 2000, audio_prebuffer_ms)) bad(a, val);
+    } else if (a == "--audio-drift-compensation") {
+      const auto val = next();
+      if (val != "on" && val != "off") bad(a, val);
+      audio_drift_compensation = val == "on";
     } else if (a == "--audio-fec") {
       // 只影响**恢复**路径（用后一包的 LBRR 救前一帧），不影响正常解码。
       const auto val = next();
@@ -761,7 +766,7 @@ int main(int argc, char** argv) {
           "          [--fps 30] [--stall-factor 1.5]\n"
           "          [--peer-timeout-ms 500] [--jitter on|off] [--jitter-budget-ms 40]\n"
           "          [--jitter-max-level 0..4] [--jitter-target-frames 0..16]\n"
-          "          [--audio-out NAME] [--av-delay-ms N] [--audio-prebuffer-ms N] [--list-audio]\n"
+          "          [--audio-out NAME] [--av-delay-ms N] [--audio-prebuffer-ms N] [--audio-drift-compensation on|off] [--list-audio]\n"
           "          [--audio-fec on|off] [--audio-plc on|off]\n"
           "          [--snap-ms N --snap-prefix PATH]\n"
           "          [--report-addrs host:port[,host:port]]\n"
@@ -1217,6 +1222,7 @@ int main(int argc, char** argv) {
     rcfg.width = render_w;
     rcfg.audio_out = audio_out;
     rcfg.audio_prebuffer_ms = static_cast<int>(audio_prebuffer_ms);
+    rcfg.audio_drift_compensation = audio_drift_compensation;
     rcfg.height = render_h;
     std::string rerr;
     if (renderer.open(rcfg, rerr)) {
@@ -1707,6 +1713,7 @@ int main(int argc, char** argv) {
     }
     // ---- 周期任务放在循环顶部：FEC 分支 / 完全没包时都不会被跳过 ----
     const int64_t now_tick = cue::now_us();
+    if (render_live) renderer.sample_audio();
     // 抖动缓冲的到期帧先放行：后面的周期任务（清理/窗口/指标行）这一拍就该看到它们，
     // 否则 buffer_us 的采样与 jb_depth 会慢一拍。
     drain_jb(now_tick);
@@ -2062,6 +2069,16 @@ int main(int argc, char** argv) {
           {"audio_queue_trimmed", rstats.trimmed},
           {"audio_queue_push_errors", rstats.push_errors},
           {"audio_queue_segments", rstats.queued},
+          {"audio_rebuffered", rstats.rebuffered},
+          {"audio_compensation_updates", rstats.compensation_updates},
+          {"audio_compensation_errors", rstats.compensation_errors},
+          {"audio_compensation_ppm", rstats.compensation_ppm},
+          {"audio_playback_input_samples", rstats.input_samples},
+          {"audio_playback_output_samples", rstats.output_samples},
+          {"audio_queue_samples", rstats.queue_samples},
+          {"audio_queue_p50_ms", rstats.queue_p50_ms < 0 ? json(nullptr) : json(rstats.queue_p50_ms)},
+          {"audio_queue_p95_ms", rstats.queue_p95_ms < 0 ? json(nullptr) : json(rstats.queue_p95_ms)},
+          {"audio_queue_p99_ms", rstats.queue_p99_ms < 0 ? json(nullptr) : json(rstats.queue_p99_ms)},
           {"audio_rms_frames", audio_rms.frames()},
           {"audio_rms_dbfs",
            audio_rms.empty() ? json(nullptr) : json(cue::media::dbfs_for_metric(audio_rms.dbfs()))},
@@ -2115,6 +2132,7 @@ int main(int argc, char** argv) {
       }
     }
     probe_pollfd pfd{static_cast<decltype(probe_pollfd::fd)>(udp_fd), POLLIN, 0};
+    if (render_live) poll_timeout_ms = std::min(poll_timeout_ms, 10);
     const int pr = probe_poll(&pfd, 1, poll_timeout_ms);
     if (getenv("CUE_PROBE_TRACE") != nullptr) {
       static int n_trace = 0;

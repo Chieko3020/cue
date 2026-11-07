@@ -23,8 +23,9 @@ TAG = "[cue-event] "
 
 
 class Probe:
-    def __init__(self, binary, target, artifacts):
+    def __init__(self, binary, target, artifacts, compensation="off"):
         self.target = target
+        self.compensation = compensation
         self.sent = self.gaps = self.resyncs = 0
         self.session = 404
         self.sequence = 0
@@ -37,7 +38,8 @@ class Probe:
             self.address = reservation.getsockname()
         env = dict(os.environ, SDL_AUDIODRIVER="dummy", SDL_VIDEODRIVER="dummy")
         self.argv = [str(binary), "--bind", "127.0.0.1", "--port",
-                     str(self.address[1]), "--render", "--audio-prebuffer-ms", str(target)]
+                     str(self.address[1]), "--render", "--audio-prebuffer-ms", str(target),
+                     "--audio-drift-compensation", compensation]
         self.p = subprocess.Popen(self.argv, stdout=self.log, stderr=subprocess.STDOUT, env=env)
         self.checkpoints = []
 
@@ -76,7 +78,13 @@ class Probe:
                 if data["audio_decoded_frames"] != self.sent:
                     continue
                 # Startup uses None to wait for the real render/metric loop.
-                if queue_ms is not None and data["audio_queue_ms"] != queue_ms:
+                # Equal-rate swr has sub-millisecond filter latency. The exact
+                # off-mode legacy queue remains strict; on-mode permits only
+                # the single integer-ms boundary while retaining PCM ledgers.
+                expected_depths = {queue_ms}
+                if self.compensation == "on" and queue_ms and queue_ms > 0:
+                    expected_depths.add(queue_ms - 1)
+                if queue_ms is not None and data["audio_queue_ms"] not in expected_depths:
                     continue
                 expected = {
                     "audio_decode_errors": 0, "audio_failed_frames": 0,
@@ -125,6 +133,9 @@ def scenario(p):
         p.observe("nonempty-before-resync", 1980)
         p.skip(6)
         p.send(1)
+        if p.compensation == "on":
+            p.observe("nonempty-resync-preserves-filtered-pcm", 2000)
+            p.send(1)
         p.observe("nonempty-resync-preserves-and-drains", 0)
         return
     if p.target == 250:
@@ -155,6 +166,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", required=True, type=Path)
     parser.add_argument("--artifacts", type=Path)
+    parser.add_argument("--compensation", choices=("on", "off"), default="off")
     args = parser.parse_args()
     binary = args.probe.resolve()
     artifacts = args.artifacts or Path(tempfile.mkdtemp(prefix="cue-audio-recovery-"))
@@ -163,7 +175,7 @@ def main():
           (artifacts.resolve(), hashlib.sha256(binary.read_bytes()).hexdigest()), flush=True)
     failures = []
     for target in (250, 0, 2000):
-        p = Probe(binary, target, artifacts)
+        p = Probe(binary, target, artifacts, args.compensation)
         try:
             scenario(p)
         except (AssertionError, OSError, ValueError) as error:

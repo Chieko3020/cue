@@ -43,6 +43,11 @@ bool AudioResampler::open(const ResampleSpec& spec, std::string& err) {
     swr_ = nullptr;
     return false;
   }
+  if (spec.force_resample && av_opt_set_int(swr_, "flags", SWR_FLAG_RESAMPLE, 0) < 0) {
+    err = "cannot force resampling";
+    close();
+    return false;
+  }
   // dither 关闭：s16 → s16 没有位深变化，开 dither 只会多一层噪声；
   // 重采样矩阵/相位由 swr 的默认多相滤波器决定，不用 soxr（不引入额外依赖）。
   if (swr_init(swr_) < 0) {
@@ -51,6 +56,20 @@ bool AudioResampler::open(const ResampleSpec& spec, std::string& err) {
     return false;
   }
   return true;
+}
+
+std::expected<void, ResampleError> AudioResampler::compensate(int sample_delta, int distance,
+                                                             std::string& err) {
+  if (!swr_ || distance < 0 || (distance == 0 && sample_delta != 0)) {
+    err = "invalid compensation state or distance";
+    return std::unexpected(ResampleError::InvalidSpec);
+  }
+  const int rc = swr_set_compensation(swr_, sample_delta, distance);
+  if (rc < 0) {
+    err = "swr_set_compensation failed: " + std::to_string(rc);
+    return std::unexpected(ResampleError::ConvertFailed);
+  }
+  return {};
 }
 
 std::size_t AudioResampler::output_frames_for(std::size_t in_frames, int in_rate, int out_rate) {

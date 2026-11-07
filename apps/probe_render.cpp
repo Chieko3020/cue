@@ -5,6 +5,9 @@
 #if defined(CUE_HAVE_SDL2) && CUE_HAVE_SDL2
 
 #include <SDL2/SDL.h>
+#include "audio_drift.h"
+#include <algorithm>
+#include <deque>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -42,6 +45,12 @@ struct Renderer::Impl : AudioQueueDevice {
   // 用途正是"我就要这么大的窗口"（RenderConfig 里 0 才表示"用第一帧的"）。
   bool window_auto = true;
   AudioPlaybackQueue playback{*this};
+  AudioDrift drift;
+  std::vector<int16_t> converted;
+  std::deque<int> queue_depths;
+  uint64_t queue_samples = 0;
+  Uint64 last_sample_ms = 0, last_quantile_ms = 0;
+  int queue_p50_ms = -1, queue_p95_ms = -1, queue_p99_ms = -1;
   int snap_every_ms = 0;
   std::string snap_prefix;
   uint64_t snap_count = 0;
@@ -66,15 +75,26 @@ struct Renderer::Impl : AudioQueueDevice {
     const double bytes_per_sec = double(audio_hz) * audio_ch * sizeof(int16_t);
     return static_cast<int>(double(SDL_GetQueuedAudioSize(adev)) * 1000.0 / bytes_per_sec);
   }
+  bool empty() const override { return adev != 0 && SDL_GetQueuedAudioSize(adev) == 0; }
+  void reset_processing() override { drift.reset(); }
   void pause(bool paused) override { SDL_PauseAudioDevice(adev, paused ? 1 : 0); }
   void clear() override { SDL_ClearQueuedAudio(adev); }
-  bool queue(const int16_t* pcm, uint32_t bytes) override {
-    if (SDL_QueueAudio(adev, pcm, bytes) == 0) return true;
+  AudioQueueResult queue(const int16_t* pcm, uint32_t bytes) override {
+    drift.update(queued_ms(), static_cast<int64_t>(SDL_GetTicks64()) * 1000, playback.started());
+    if (!drift.convert(pcm, static_cast<int>(bytes / sizeof(int16_t)), converted)) {
+      if (!warned_audio) {
+        warned_audio = true;
+        std::fprintf(stderr, "[probe] playback resampler failed: %s\n", drift.last_error().c_str());
+      }
+      return AudioQueueResult::Failed;
+    }
+    if (converted.empty()) return AudioQueueResult::Buffered;
+    if (SDL_QueueAudio(adev, converted.data(), static_cast<Uint32>(converted.size() * sizeof(int16_t))) == 0) return AudioQueueResult::Queued;
     if (!warned_audio) {
       warned_audio = true;
       std::fprintf(stderr, "[probe] SDL_QueueAudio 失败（只报一次）：%s\n", SDL_GetError());
     }
-    return false;
+    return AudioQueueResult::Failed;
   }
 
   ~Impl() {
@@ -204,6 +224,14 @@ bool Renderer::open(const RenderConfig& cfg, std::string& err) {
       std::fprintf(stderr, "[probe] 音频输出设备：%s%s（%d Hz / %d ch / s16）\n",
                    chosen.empty() ? "(系统默认)" : chosen.c_str(),
                    chosen.empty() ? "" : " ", im->audio_hz, im->audio_ch);
+      std::fprintf(stderr, "[probe] audio buffer=%u samples, nominal_period_ms=%.6f\n",
+                   static_cast<unsigned>(have.samples), 1000.0 * have.samples / have.freq);
+      if (!im->drift.configure(im->audio_hz, im->audio_ch, cfg.audio_prebuffer_ms,
+                               cfg.audio_drift_compensation)) {
+        std::fprintf(stderr, "[probe] playback resampler initialization failed; audio disabled\n");
+        SDL_CloseAudioDevice(im->adev);
+        im->adev = 0;
+      }
       im->playback.configure(cfg.audio_prebuffer_ms);
       if (cfg.audio_prebuffer_ms > 0) {
         std::fprintf(stderr, "[probe] 音频预缓冲 %d ms（攒够再开始播放）\n",
@@ -338,6 +366,29 @@ int Renderer::queued_ms() const {
   return impl_ ? impl_->queued_ms() : -1;
 }
 
+int Renderer::queued_samples() const {
+  return impl_ && impl_->available() ? static_cast<int>(SDL_GetQueuedAudioSize(impl_->adev) / sizeof(int16_t)) : -1;
+}
+
+void Renderer::sample_audio() {
+  if (!impl_ || !impl_->available()) return;
+  impl_->playback.observe();
+  const auto now = SDL_GetTicks64();
+  if (impl_->last_sample_ms != 0 && now - impl_->last_sample_ms < 10) return;
+  impl_->last_sample_ms = now;
+  ++impl_->queue_samples;
+  impl_->queue_depths.push_back(impl_->queued_ms());
+  if (impl_->queue_depths.size() > 6000) impl_->queue_depths.pop_front();
+  if (impl_->last_quantile_ms == 0 || now - impl_->last_quantile_ms >= 1000) {
+    impl_->last_quantile_ms = now;
+    std::vector<int> depths(impl_->queue_depths.begin(), impl_->queue_depths.end());
+    std::sort(depths.begin(), depths.end());
+    auto pct = [&](double p) { return depths[static_cast<std::size_t>(p * double(depths.size()-1))]; };
+    impl_->queue_p50_ms = pct(.5); impl_->queue_p95_ms = pct(.95); impl_->queue_p99_ms = pct(.99);
+  }
+
+}
+
 void Renderer::reset_audio() {
   if (impl_) impl_->playback.reset();
 }
@@ -345,8 +396,20 @@ void Renderer::reset_audio() {
 Renderer::AudioStats Renderer::audio_stats() const {
   if (!impl_) return {};
   const auto& stats = impl_->playback.stats();
-  return {stats.over_soft, stats.dropped_drift, stats.starved, stats.trimmed,
-          stats.queued, stats.push_errors};
+  AudioStats out;
+  out.over_soft = stats.over_soft; out.dropped_drift = stats.dropped_drift;
+  out.starved = stats.starved; out.trimmed = stats.trimmed;
+  out.queued = stats.queued; out.push_errors = stats.push_errors;
+  out.rebuffered = stats.rebuffered;
+  const auto& ds = impl_->drift.stats();
+  out.compensation_updates = ds.updates; out.compensation_errors = ds.errors;
+  out.compensation_ppm = ds.ppm;
+  out.input_samples = ds.input_samples; out.output_samples = ds.output_samples;
+  out.queue_samples = impl_->queue_samples;
+  out.queue_p50_ms = impl_->queue_p50_ms;
+  out.queue_p95_ms = impl_->queue_p95_ms;
+  out.queue_p99_ms = impl_->queue_p99_ms;
+  return out;
 }
 
 void Renderer::enable_snapshot(int every_ms, std::string prefix) {
@@ -390,7 +453,9 @@ void Renderer::queue_audio(const int16_t*, int) {}
 // 而是直接编译不过（no declaration matches）——而没有 SDL2 的构建正好是
 // "CI/服务器环境"这一支，最容易一直没人编到它。
 int Renderer::queued_ms() const { return -1; }
+int Renderer::queued_samples() const { return -1; }
 void Renderer::reset_audio() {}
+void Renderer::sample_audio() {}
 void Renderer::enable_snapshot(int, std::string) {}
 Renderer::AudioStats Renderer::audio_stats() const { return AudioStats{}; }
 
