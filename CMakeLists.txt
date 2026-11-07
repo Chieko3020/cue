@@ -69,7 +69,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   #         （实测 0.52 MB → 9.43 MB），构建贴着限制被节流到跑不完。
   # 之所以做成变量而不是让外部用 CMAKE_CXX_FLAGS 覆盖：add_compile_options 排在后面，
   # 硬编码的 -g 会把外部传的 -g1 顶掉（这个坑实际踩过，构建日志里同时出现 -g -g1）。
-  set(CUE_SAN_DEBUG_FLAGS "-g" CACHE STRING "sanitizer 构建的调试信息级别（-g 或 -g1）")
+  set(CUE_SAN_DEBUG_FLAGS "-g" CACHE STRING "sanitizer 构建的调试信息级别（-g、-g1 或 -g0）")
   add_compile_options(${_cue_san_flags} -fno-omit-frame-pointer ${CUE_SAN_DEBUG_FLAGS})
   add_link_options(${_cue_san_flags})
   # UBSan 默认「报告后继续」，那样 ctest 会绿着漏过 UB；这里让 undefined 直接终止，

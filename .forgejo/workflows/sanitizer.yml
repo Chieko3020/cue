@@ -1,21 +1,7 @@
-# Sanitizer（ASan+UBSan / TSan）—— **手动触发**，不进 push 流水线。
-#
-# 为什么不常驻：本机是 2 vCPU / 1967 MB，其中 DSH 常驻近 1 GB；
-# runner 的 cgroup MemoryHigh=700M。sanitizer 插桩让每个 TU 的编译内存大幅上升，
-# 连 -g1（只留行表）都压不到 700M 以下——实测 MemoryCurrent 恒贴着 734M 不动，
-# 单个 TU 编 5 分钟，整个 job 跑不完。这不是配置能调的，是内存硬边界。
-#
-# 所以：常驻 CI 只保留 build + ac13-static + e2e-console（能在预算内跑完），
-# sanitizer 改为手动触发，在机器空闲时跑。
-# 本地验证记录见 README 的「测试」与 SPEC 的 AC-12 附注。
-#
-# 手动跑：
-#   在 Forgejo 的 Actions 页面选本 workflow → Run workflow
-#   或本地等价命令（注意 -j1）：
-#     cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-#       -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1" -DCUE_SAN_DEBUG_FLAGS="-g1" \
-#       -DCUE_SANITIZE=address,undefined
-#     cmake --build build-asan -j1 && ctest --test-dir build-asan --output-on-failure
+# ASan+UBSan / TSan 手动验证；两配置共享单重任务并发组。
+# 与本地回归一致：GCC14、O0/g0、-j1，保留 leak/UB/race 检测。
+# runtime 预检失败会判红；不修改 sysctl、ASLR、preload 配置或安装包。
+# 最小 runtime 成功不代表全套测试成功，完整 CTest 输出独立保留。
 name: sanitizer（手动）
 
 on:
@@ -27,51 +13,21 @@ concurrency:
 
 jobs:
   asan:
-    name: ASan+UBSan（手动）
+    name: ASan+UBSan（手动、SDL）
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-
-      - name: 配置（ASan+UBSan，-g1 压内存）
-        # -g1 而不是 -g：仍能报文件:行号，但调试信息小一个量级。
-        # -O1 而不是 -O2：编译内存更低，且 sanitizer 的检查与优化级别无关。
-        run: |
-          cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=g++-14 \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1" \
-            -DCUE_SAN_DEBUG_FLAGS="-g1" \
-            -DCUE_SANITIZE=address,undefined
-
-      - name: 构建（-j1）
-        run: cmake --build build-asan -j1
-
-      - name: ctest（UBSan halt_on_error=1）
-        run: ctest --test-dir build-asan --output-on-failure
+      - name: 实际 runtime 预检
+        run: python3 scripts/ci-sanitizer-preflight.py address,undefined
+      - name: 全量配置、构建、CTest与身份记录
+        run: python3 scripts/ci-regression.py --build-dir build-asan --sdl ON --sanitize address,undefined --out "${RUNNER_TEMP:-/tmp}/cue-asan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
 
   tsan:
-    name: TSan（手动）
+    name: TSan（手动、SDL）
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-
-      - name: 环境（TSan 需要较低的 mmap 随机化位数）
-        run: |
-          # vm.mmap_rnd_bits=32（Ubuntu 24.04 内核默认）下 libtsan 会随机
-          # FATAL: ThreadSanitizer: unexpected memory mapping；28 是 6.6 之前的默认值。
-          # 只是本次运行的临时改动，重启即恢复。
-          sudo -n sysctl -w vm.mmap_rnd_bits=28 \
-            || echo "::warning::无 sudo 权限，未能下调 vm.mmap_rnd_bits；若 tsan 报 unexpected memory mapping，请以 root 执行 sysctl -w vm.mmap_rnd_bits=28"
-
-      - name: 配置（TSan 单独一个构建目录）
-        run: |
-          cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=g++-14 \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1" \
-            -DCUE_SAN_DEBUG_FLAGS="-g1" \
-            -DCUE_SANITIZE=thread
-
-      - name: 构建（-j1）
-        run: cmake --build build-tsan -j1
-
-      - name: ctest
-        run: ctest --test-dir build-tsan --output-on-failure
+      - name: 实际 runtime 预检（不更改系统设置）
+        run: python3 scripts/ci-sanitizer-preflight.py thread
+      - name: 独立目录全量配置、构建、CTest与身份记录
+        run: python3 scripts/ci-regression.py --build-dir build-tsan --sdl ON --sanitize thread --out "${RUNNER_TEMP:-/tmp}/cue-tsan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"

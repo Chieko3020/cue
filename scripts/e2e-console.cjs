@@ -87,14 +87,47 @@ function start(name, cmd, args, opts = {}) {
 }
 
 
-// 直接读一段 SSE 流（用于验证 Last-Event-ID 补齐；浏览器页面之外的独立检查）
-// 读一段 SSE，**收到 console.ready 就返回**，而不是死等 1500 个字符。
-//
-// 为什么改：补齐帧只有几条（几百字符），永远到不了 1500；旧实现会一直读到 2500ms
-// 超时才返回。CI 的慢环境下，服务端「retry → 补齐 → console.ready」这三步
-// 在超时前走不完，于是只拿到 "retry: 3000" 就断言失败——run14 绿、run15 红就是这个。
-// 判据应该是「补齐完成」这个事件，而不是一个与内容量无关的字符数阈值。
-async function readSse(headers, ms = 8000) {
+// Validate complete SSE frames against the actual generation:sequence protocol.
+// console.ready precedes replay and has no id line. A known pre-reconnect event
+// must be present, so a ready frame or unrelated live traffic cannot prove replay.
+function parseReplay(text, generation, from, throughId) {
+  const requireReplay = (condition, message) => { if (!condition) throw new Error(message); };
+  requireReplay(typeof generation === 'string' && generation.length > 0, 'missing expected generation');
+  requireReplay(Number.isSafeInteger(from) && from >= 0 && Number.isSafeInteger(throughId) && throughId > from,
+    'invalid expected replay interval');
+  const blocks = text.split(/\r?\n\r?\n/);
+  blocks.pop(); // The final block may be incomplete; only validate complete frames.
+  const ids = [];
+  let ready = null;
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    const idLines = lines.filter((line) => line.startsWith('id:'));
+    const dataLines = lines.filter((line) => line.startsWith('data:'));
+    if (idLines.length === 0 && dataLines.length === 0) continue; // retry/comments
+    requireReplay(dataLines.length === 1, 'expected one JSON data line per frame');
+    const data = JSON.parse(dataLines[0].slice(5).trimStart());
+    requireReplay(data.generation === generation, 'JSON generation mismatch');
+    if (data.ev === 'console.ready') {
+      requireReplay(idLines.length === 0 && ready === null, 'invalid ready frame');
+      requireReplay(data.data?.replayed_from === from && Number.isSafeInteger(data.id) && data.id >= throughId,
+        'ready cursor does not describe requested replay');
+      ready = data;
+      continue;
+    }
+    requireReplay(idLines.length === 1, 'missing or duplicate replay cursor');
+    const cursor = /^id: ([^:\r\n]+):([0-9]+)$/.exec(idLines[0]);
+    requireReplay(cursor !== null && cursor[1] === generation, 'invalid replay cursor generation or syntax');
+    const id = Number(cursor[2]);
+    requireReplay(Number.isSafeInteger(id) && id > from, 'replay sequence does not advance requested cursor');
+    requireReplay(data.id === id, 'JSON id does not match replay cursor sequence');
+    ids.push(id);
+  }
+  requireReplay(ready !== null, 'complete console.ready frame missing');
+  requireReplay(ids.includes(throughId), 'pre-reconnect snapshot event missing from replay');
+  return ids;
+}
+
+async function readSse(headers, generation, from, throughId, ms = 8000) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), ms);
   let text = '';
@@ -102,15 +135,16 @@ async function readSse(headers, ms = 8000) {
     const res = await fetch(`${BASE}/events`, { headers, signal: ac.signal, cache: 'no-store' });
     const reader = res.body.getReader();
     const dec = new TextDecoder();
-    // console.ready 是服务端在补发完之后无条件发的那一条，看到它就可以停了。
-    while (!text.includes('console.ready')) {
+    while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       text += dec.decode(value, { stream: true });
+      try { parseReplay(text, generation, from, throughId); break; }
+      catch { /* Wait for the complete ready and replay frames, or the deadline. */ }
     }
     reader.cancel().catch(() => {});
   } catch {
-    /* abort 是正常结束 */
+    /* The caller validates the final frames, including timeout/abort failures. */
   }
   clearTimeout(timer);
   return text;
@@ -171,7 +205,7 @@ async function shutdown() {
   }
 }
 
-(async () => {
+if (require.main === module) (async () => {
   // ---------------------------------------------------------------- 0. 前置
   const serveBin = path.join(ROOT, BUILD, 'cue-serve');
   const cuedBin = path.join(ROOT, BUILD, 'cued');
@@ -333,13 +367,14 @@ async function shutdown() {
     fail(`事件太少（sse_last_id=${lastId}，等 12 s 仍不足），无法验证 Last-Event-ID 补齐`);
   }
   const from = Math.max(1, lastId - 3);
-  const replay = await readSse({ 'Last-Event-ID': String(from) });
-  if (!replay.includes(`"replayed_from":${from}`)) {
-    fail(`SSE Last-Event-ID 补齐没生效（期望 replayed_from=${from}）：${replay.slice(0, 200)}`);
-  } else {
-    const ids = [...replay.matchAll(/^id: (\d+)/gm)].map((m) => Number(m[1]));
-    if (!ids.some((n) => n > from)) fail(`补齐帧里没有 id > ${from}：${ids.join(',')}`);
-    else ok(`SSE Last-Event-ID 补齐生效（from=${from}，补发 ${ids.length} 帧）`);
+  const generation = st.server && st.server.generation;
+  // Legacy numeric request remains covered; responses must carry modern cursors.
+  const replay = await readSse({ 'Last-Event-ID': String(from) }, generation, from, lastId);
+  try {
+    const ids = parseReplay(replay, generation, from, lastId);
+    ok(`SSE Last-Event-ID 补齐生效（from=${from}，补发 ${ids.length} 帧，generation/sequence/JSON 一致）`);
+  } catch (error) {
+    fail(`SSE Last-Event-ID 补齐验证失败：${error.message}；${replay.slice(0, 200)}`);
   }
 
   // ---------------------------------------------------------------- 5c. 畸形请求不能把服务打挂
@@ -485,3 +520,5 @@ async function shutdown() {
   await shutdown();
   process.exit(1);
 });
+
+module.exports = { parseReplay };

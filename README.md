@@ -7,9 +7,11 @@ Cue 是 C++23 的 Agent Harness：驱动一条真实的低延迟视频管线，�
 - **评测** — 声明式 case、三重判分（根因 / 证据 / SLA）、pass^k、指纹、回归对比、人读报告
 - **可观测** — `cue-serve` + React 控制台五页、SSE 事件流、审批 UI；`cue-probe` 跨机接收端
 
-当前状态：主构建 `ctest` **33 项全绿**（C++ 单测 29 + 静态检查 3 + 起真进程的集成测试 1；2026-10-25 复核）；`build-asan`（ASan+UBSan）与 `build-tsan` 各 **32 项全绿**（不注册集成测试）。控制台五个 tab、SSE 与审批 UI 可用；cassette、benchmark 脚本（`scripts/bench.sh`，数据不入库）、proto fuzz、CI workflow 都在仓库里。**AC-15 全量通过**（18 case × REPEAT=3 = 54 次，根因/证据/SLA 全 1.0，三次 repeat 的 stddev 全 0）。**AC-1 已在真机验证**：Windows 的集成摄像头 + Realtek 麦克风经浏览器推流，cued 侧 `frames_in 594` / `audio_frames_in 1000` / `decode_errors 0`。
+2026-11-07 本地C11回归：普通SDL 52/52通过、无SDL 49/49通过；ASan+UBSan（SDL）44/44通过；TSan（SDL）44/44通过。普通SDL为40个C++、4个脚本检查及8个进程/网络测试；无SDL少1个SDL专属C++和2个SDL恢复脚本；sanitizer保留全部40个SDL配置C++及4个脚本检查，进程/网络脚本单列普通配置。Windows原生客户端入口SDL 15/15、OFF 14/14通过，未覆盖原生Windows cued/Harness或真实设备。清单和结果由 `scripts/ci-regression.py` 与独立冻结的 `scripts/ci-test-inventory.json` 逐项核对；原33/32计数是历史快照。
 
-CI 分两层：**常驻**（每次 push）跑 build + ctest、AC-13 静态检查、e2e-console；**手动**（`workflow_dispatch`）跑 sanitizer（ASan/UBSan、TSan）与 fuzz。sanitizer 不常驻的原因写在 `.forgejo/workflows/sanitizer.yml` 头部：本机 2 vCPU / 1967 MB（DSH 常驻近 1 GB）+ runner 的 `MemoryHigh=700M`，插桩构建连 `-g1` 都压不进预算（`MemoryCurrent` 恒贴 734M，单 TU 编 5 分钟）。
+既有验收记录（2026-10-25，非本轮重跑）：AC-15曾记录18 case × REPEAT=3；AC-1曾记录一台Windows集成摄像头和Realtek麦克风的浏览器推流。C11工程回归不重新签这些人工/设备验收；C10零预缓冲轻微卡顿、首260ms实音失败，以及公网UDP、音画同步和独立硬件长测边界继续保留。当前本地提交尚无对应远端CI运行，历史成功不能签当前版本。
+
+CI 分两层：常驻工作流串行跑SDL ON/OFF全构建与全CTest、AC-13静态检查及原console/恢复两套浏览器回归；手动工作流跑ASan+UBSan与独立TSan，另保留手动fuzz。Linux回归统一GCC14、`-O0 -DNDEBUG -g0`、`-j1`，不安装依赖或修改系统设置。运行清单、逐项结果、编译命令及源文件/二进制哈希写入各任务独立的临时证据目录。浏览器缺少现有Vite/Playwright依赖时明确记录NOT EXECUTED；job绿色不能代表浏览器已经执行。Windows用现有MSYS2 MINGW64运行 `bash scripts/check-windows-clients.sh <build-dir> ON|OFF`，仓库未凭空增加Windows runner。
 
 ## 为什么是这个拼法
 
@@ -282,10 +284,10 @@ landlock 不可用时会降级（例如内核不支持），降级原因通过�
 - **抖动缓冲的粒度受帧率约束**：档位是 1/2/4/8 帧，30 fps 下约 0/33/100/233 ms，做不了音频那种毫秒级目标延迟；也没有时间伸缩（视频本就不适用）。抖动缓冲与 NACK 之间只做了"重传在途时放宽空洞等待"这一处联动，不与 feedback 的拥塞信号联动。
 - **抖动估计的基准已改为首片到达**，但"帧在途耗时污染抖动"这条在本机复现不出来（loopback 没有真实带宽整形，`sendmmsg` 一次推完整帧分片）。机制由单测证明，真实链路上的幅度未量化。
 - **`src/eval/state.cpp` 用 `popen("git describe …")` 算指纹**：命令固定、无用户输入，暂未改成直接读仓库元数据。
-- **TSan 需要 `vm.mmap_rnd_bits=28`**，否则 libtsan 会随机报 `unexpected memory mapping`（手动的 `sanitizer.yml` 里有这一步，`sudo -n` 不可用时只告警）。
+- **TSan运行环境单独验证**：手动工作流先执行 `scripts/ci-sanitizer-preflight.py thread`，失败即阻断，完整CTest另行判断。工作流不会自动修改sysctl/ASLR或系统预加载配置；最小预检成功也不能替代完整插桩测试。
 - **sanitizer 不在常驻 CI 里**：见顶部说明。`ASan/UBSan/TSan 无报告` 这条由本地验证 + 手动 workflow 承担，不是每次 push 的证据。
 - **推流页不发送 `codec_config`（0x03）**：`cued` 侧有接收与缓存实现，浏览器侧没发，`fetch_observation(frames)` 的媒体元信息段因此为空。
-- **控制台前端产物（`web/dist`）不入库**：干净 clone 首次 `serve.sh` 需要联网装前端依赖；CI 里同样要现场 `npm ci`，无网时 e2e 走显式跳过（有 `===== 跳过原因 =====` 横幅与 `ci-skipped.txt`，AC-13 由独立的静态检查 job 兜底）。
+- **控制台前端产物（`web/dist`）不入库**：干净clone需要先准备前端依赖。CI浏览器入口 `scripts/ci-browser.sh` 仅使用现有Vite/Playwright与浏览器，运行 `npm run build` 后执行两套实际浏览器测试，不执行 `npm ci`。缺依赖时在任务证据目录写 `skipped.txt` 和NOT EXECUTED说明；实际运行通过才写 `passed.txt`，AC-13静态扫描独立记录。
 - **推流页不依赖前端构建**：它是 `web/index.html` + `web/app.js` 的原生实现，`cue-serve` 现在同时托管两个根（控制台 `web/dist`、推流页 `web/`），`/stream` 走后者。此前 dist 存在时推流页会 404——干净 clone（无 dist）反而能打开，行为与直觉相反。
 - **集成测试只在 `CUE_SANITIZE=none` 下注册**：它起真进程，而 sanitizer 构建的 `LD_PRELOAD` 会传给子进程，2 vCPU 上不稳定，且它测的不是内存安全；ASan/TSan 仍跑全部单测。
 - **能力协商的端到端未测**：夹取逻辑（配置超过设备上限时夹分辨率/码率）有单测覆盖，但"真客户端发 `0x05` 上报能力 → 服务端按能力下发档位"这条链路没跑过——`cue-capture` 不发 `0x05`，只有浏览器发，而服务器无浏览器。实测两路设备时 `caps_declared` 都是 `false`，走的是"无上报按配置下发"的分支。

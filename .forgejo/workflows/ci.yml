@@ -1,26 +1,11 @@
-# Forgejo Actions（SPEC §9）：-Wall -Wextra -Wpedantic -Werror、GCC 14。
-#
-# 常驻 job：build + ctest、ac13-static、e2e-console（+ 手动 fuzz）。
-# **ASan/TSan 已移到 sanitizer.yml（手动触发）**：本机 2 vCPU / 1967 MB，runner 的
-# cgroup MemoryHigh=700M，sanitizer 插桩后连 -g1 都压不进这个预算（MemoryCurrent
-# 恒贴 734M、单 TU 编 5 分钟）。那是内存硬边界，不是能调的配置。
-#
-# 约定：
-#   * 只依赖本机系统包（g++-14 / boost / nlohmann / ffmpeg+x264 / libcurl），不拉外部 CDN、不下载脚本；
-#   * 一律 -j1：本机 1.9 GiB 内存，-j2 编 libavcodec 相关 TU 会 OOM（见 docs 记录）；
-#   * 不上传任何产物（bench 数据与覆盖率日志留在 runner 本地）。
-#
-# runner 前置（self-hosted）：
-#   * g++-14 / cmake>=3.20 / node / python3 / ffmpeg+x264 / libboost-system / nlohmann-json / libcurl；
-#   * tsan job 需要把 vm.mmap_rnd_bits 调到 28：内核默认 32 时 GCC 14 的 libtsan 会随机
-#     FATAL: unexpected memory mapping（见 tsan job 的「环境」步骤，sudo 不可用时只告警）；
-#   * ASan 的 LD_PRELOAD 由 CMake 的 ctest ENVIRONMENT 处理（本机 /etc/ld.so.preload 预加载
-#     libonion.so，会把 libasan 挤到第二位），不需要 job 里额外写；
-#   * e2e-console 的 playwright 不是系统包（本机手工装在 /tmp/pwtest/node_modules）。缺它时
-#     该 job **显式跳过**（::warning:: + 落盘跳过原因），不再用"直接 exit 0"冒充 success；
-#   * fuzz job 需要 clang++（libFuzzer 随 Clang 提供），只在手动触发时跑。
-#
-# 本地手动验证（本机没有注册 Forgejo runner 时）：逐条跑各 job 的 run: 命令即可。
+# Forgejo Actions: GCC14; SDL ON / OFF full builds and CTest run serially.
+# Resource budget: 2 vCPU / 2 GiB, -O0 -DNDEBUG -g0 and -j1.
+# Existing system toolchain/dependencies only; browser job uses installed Vite/Playwright.
+# Missing browser prerequisites explicitly mean NOT EXECUTED, never browser acceptance.
+# Sanitizer jobs remain manual in sanitizer.yml and never change host settings.
+# Exact registration, per-test results, flags and source/binary hashes stay on runner disk.
+# Windows: scripts/check-windows-clients.sh is a native MSYS2 entry; no Windows runner
+# is configured here and Linux jobs do not establish Windows or physical-device acceptance.
 name: ci（常驻：build + ac13 + e2e；sanitizer 见 sanitizer.yml）
 
 on:
@@ -42,40 +27,17 @@ concurrency:
 
 jobs:
   build:
-    name: build + ctest (g++-14, -Werror)
+    name: SDL / no-SDL full build + CTest (g++-14)
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-
-      - name: 工具链
+      - name: 两配置串行全量回归（O0/g0、-j1、无安装）
         run: |
           set -eu
           g++-14 --version | head -1
           cmake --version | head -1
-          node --version
-          python3 --version
-
-      - name: 配置与构建（-j1 防 OOM）
-        run: |
-          set -euo pipefail
-          # 本机 2 vCPU / 1967 MB，runner 的 cgroup MemoryHigh=700M。构建被节流的根因
-          # 不是累积内存，而是**单个 TU 的编译峰值**就超过 700M：cued.cpp（Boost+FFmpeg
-          # 模板）一个 TU 就能吃掉 700M+，加什么 -g 级别都改不了这个数量级。
-          # 实测：-g0 让 .o 从 9.43 MB 降到 0.52 MB（18 倍），但 MemoryCurrent 仍贴 734M、
-          # 5 分钟只编 2 个 TU。所以这里进一步用 -O0：优化分析是编译期内存的另一个大户，
-          # build job 的职责是「编译 + 跑测试」，不是产出可发布二进制（性能场景在 bench）。
-          # 要栈信息看 asan job（-g1）；要真实优化级别，本地按 README 的 RelWithDebInfo 构建。
-          cmake -S . -B build-ci -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O0 -DNDEBUG -g0"
-          cmake --build build-ci -j1 2>&1 | tee /tmp/cue-build.log
-          # 0 warning 是硬口径：构建日志里出现 "warning:" 就算失败
-          if grep -n "warning:" /tmp/cue-build.log; then
-            echo "::error::构建出现 warning（SPEC §9 要求 0 warning）"
-            exit 1
-          fi
-
-      - name: ctest（含 integration 与 AC-13 静态检查）
-        run: ctest --test-dir build-ci --output-on-failure
+          python3 scripts/ci-regression.py --build-dir build-ci-sdl --sdl ON --out "${RUNNER_TEMP:-/tmp}/cue-sdl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
+          python3 scripts/ci-regression.py --build-dir build-ci-off --sdl OFF --out "${RUNNER_TEMP:-/tmp}/cue-off-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
 
   # AC-13（前端无外部 CDN、断网可加载）的可执行证据（T-17a）。
   # 为什么独立成一个 job：不需要浏览器、不需要网络、不需要 npm，所以永远能跑；
@@ -97,66 +59,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 构建
-        run: |
-          set -euo pipefail
-          cmake -S . -B build-e2e -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g0"
-          # 只编 e2e 真正要用的三个二进制。无 target 的全量构建在这台机器上要 20 min，
-          # 而且大部分 target（测试、cue、cue-eval、cue-capture）e2e 根本用不到。
-          # `cue --target` 的依赖链会自动带上它需要的库。
-          cmake --build build-e2e -j1 --target cue-serve cued cue-probe
-
-      - name: 尝试构建 web/dist（失败不判红，但必须显式记录原因）
-        run: |
-          set -eu
-          NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
-          rm -f ci-web-dist.status
-          if [ -f web/dist/index.html ]; then
-            echo "web/dist 已存在，跳过前端构建"
-            echo "ok 已存在" > ci-web-dist.status
-            exit 0
-          fi
-          # npm ci 需要 package-lock.json（仓库里有）。--prefer-offline 优先用 npm 缓存：
-          # 无网但缓存完整时仍能装上；缓存也没有就失败——那种情况按「缺件」处理，不让整个
-          # job 变红（CI 稳定性优先），但必须诚实标注"没有证据"。
-          if (cd web/console && npm ci --prefer-offline --registry="$NPM_REGISTRY" \
-                && npm run build); then
-            echo "web/dist 构建成功"
-            echo "ok 构建成功" > ci-web-dist.status
-          else
-            echo "::warning::web/dist 构建失败（npm ci / npm run build；可能无网且无 npm 缓存），e2e 将显式跳过"
-            echo "skip npm 构建 web/dist 失败（registry=$NPM_REGISTRY）" > ci-web-dist.status
-          fi
-
-      - name: 浏览器 e2e（缺 web/dist 或 playwright 则显式跳过）
-        run: |
-          set -eu
-          PW_NODE_MODULES="${PW_NODE_MODULES:-/tmp/pwtest/node_modules}"
-          SKIP=""
-          if [ ! -f web/dist/index.html ]; then
-            SKIP="web/dist 不存在（$(cat ci-web-dist.status 2>/dev/null || echo '构建步骤没有写状态')）"
-          elif [ ! -d "$PW_NODE_MODULES/playwright" ]; then
-            SKIP="playwright 不存在（$PW_NODE_MODULES；本机手工安装，runner 没有系统包来源）"
-          fi
-
-          if [ -n "$SKIP" ]; then
-            # 三件事同时发生：warning 注解 + 日志里的显式横幅 + 落盘一份跳过原因
-            echo "::warning::e2e-console 跳过：$SKIP"
-            {
-              echo "===== 跳过原因 ====="
-              echo "job: e2e-console"
-              echo "原因: $SKIP"
-              echo "影响: 浏览器端 e2e **没有执行**；job 的 success 不代表 AC-13 有浏览器证据。"
-              echo "兜底: AC-13 的静态检查由独立的 ac13-static job 覆盖（无外部 URL、断网可加载）。"
-              echo "复现: 装好 playwright（NODE_PATH 指向其 node_modules）并构建 web/dist 后重跑本 job。"
-              echo "===================="
-            } | tee ci-skipped.txt
-            exit 0
-          fi
-
-          NODE_PATH="$PW_NODE_MODULES" BUILD_DIR=build-e2e \
-            node scripts/e2e-console.cjs
+      - name: 现有浏览器依赖预检、前端构建与两套实际 e2e
+        run: bash scripts/ci-browser.sh build-e2e
 
   # 手动触发的 libFuzzer（T-18b）：三个 proto 解析入口各 60 s。
   # 不进 push/PR 路径：3 分钟 × 本机 2 vCPU 会拖长每次提交的反馈时间。
