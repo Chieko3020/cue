@@ -713,6 +713,16 @@ if(Python3_Interpreter_FOUND)
           --probe $<TARGET_FILE:cue-probe> --capture $<TARGET_FILE:cue-capture>)
       set_tests_properties(eval_producer PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
     endif()
+    add_test(NAME c13_cli_bench
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_c13_cli_bench.py
+        --eval $<TARGET_FILE:cue-eval>)
+    set_tests_properties(c13_cli_bench PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
+    if(UNIX AND NOT APPLE)
+      add_test(NAME cued_final_snapshot
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_final_snapshot.py
+          --cued $<TARGET_FILE:cued>)
+      set_tests_properties(cued_final_snapshot PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+    endif()
     add_test(NAME cued_reassembly
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_reassembly.py
         --cued $<TARGET_FILE:cued>)

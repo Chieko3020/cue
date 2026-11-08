@@ -58,9 +58,10 @@ fi
 [ -s "$SAMPLE" ] || die "样本为空: $SAMPLE"
 
 PIDS=()
+printf 'scenario\trole\tpid\texit\n' > "$RUN_DIR/processes.tsv"
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill -TERM "$p" 2>/dev/null || true; done
-  wait 2>/dev/null || true
+  for p in "${PIDS[@]:-}"; do wait "$p" 2>/dev/null || true; done
 }
 trap cleanup EXIT
 
@@ -102,6 +103,8 @@ run_scenario() {
   fi
 
   : > "$cued_log"; : > "$probe_log"
+  printf '%q ' "$BUILD_DIR/cue-probe" --port "$PROBE_PORT" --nack "$nack" >> "$RAW/$label.commands"
+  printf '\n' >> "$RAW/$label.commands"
   "$BUILD_DIR/cue-probe" --port "$PROBE_PORT" --nack "$nack" >"$probe_log" 2>&1 &
   local probe_pid=$!; PIDS+=("$probe_pid")
   wait_port "$PROBE_PORT" u || die "probe 没在 ${PROBE_PORT} 上监听（见 $probe_log）"
@@ -111,26 +114,37 @@ run_scenario() {
   if [ "$drop" != "0" ]; then
     cued_cmd+=(--inject-drop "$drop" --inject-seed 42 --inject-trace "$RAW/$label.inject.trace")
   fi
+  printf '%q ' "${cued_cmd[@]}" >> "$RAW/$label.commands"
+  printf '\n' >> "$RAW/$label.commands"
   "${cued_cmd[@]}" >"$cued_log" 2>&1 &
   local cued_pid=$!; PIDS+=("$cued_pid")
   wait_port "$WS_PORT" t || die "cued 没在 ${WS_PORT} 上监听（见 $cued_log）"
 
   echo "[bench] $label: transcode=$transcode fec=$fec nack=$nack drop=${drop}% → ${SECONDS_PER_RUN}s"
+  printf '%q ' node "$ROOT/scripts/bench-client.cjs" "ws://127.0.0.1:$WS_PORT/" "$SAMPLE" "$SECONDS_PER_RUN" --fps "$FPS" --json "$client_json" >> "$RAW/$label.commands"
+  printf '\n' >> "$RAW/$label.commands"
   node "$ROOT/scripts/bench-client.cjs" "ws://127.0.0.1:$WS_PORT/" "$SAMPLE" "$SECONDS_PER_RUN" \
-    --fps "$FPS" --json "$client_json" >"$client_log" 2>&1 \
-    || die "客户端失败（见 $client_log）"
+    --fps "$FPS" --json "$client_json" >"$client_log" 2>&1 &
+  local client_pid=$! client_exit=0
+  PIDS+=("$client_pid")
+  wait "$client_pid" || client_exit=$?
+  printf '%s\tclient\t%s\t%s\n' "$label" "$client_pid" "$client_exit" >> "$RUN_DIR/processes.tsv"
+  PIDS=("$probe_pid" "$cued_pid")
+  [ "$client_exit" = 0 ] || die "客户端失败（见 $client_log）"
 
   # 结算窗口：probe 对「2 s 内没凑齐」的帧才判丢，立刻杀掉会把在途帧算成已完成
   sleep "$SETTLE_SECS"
 
   kill -TERM "$cued_pid" 2>/dev/null || true
-  wait "$cued_pid" 2>/dev/null || true
+  local cued_exit=0 probe_exit=0
+  wait "$cued_pid" 2>/dev/null || cued_exit=$?
   kill -TERM "$probe_pid" 2>/dev/null || true
-  wait "$probe_pid" 2>/dev/null || true
+  wait "$probe_pid" 2>/dev/null || probe_exit=$?
+  printf '%s\tcued\t%s\t%s\n%s\tprobe\t%s\t%s\n' "$label" "$cued_pid" "$cued_exit" "$label" "$probe_pid" "$probe_exit" >> "$RUN_DIR/processes.tsv"
   PIDS=()
 
   grep -q "METRICS " "$cued_log" || echo "[bench] 警告：$label 没有 METRICS 行" >&2
-  grep -q "\[probe\] fps=" "$probe_log" || echo "[bench] 警告：$label 没有 probe 指标行" >&2
+  grep -qE "\[probe\] (session=[0-9]+ )?fps=" "$probe_log" || echo "[bench] 警告：$label 没有 probe 指标行" >&2
 }
 
 for sc in "${SCENARIOS[@]}"; do
@@ -141,7 +155,7 @@ done
 # ---- run.json：环境 + 场景清单（样本尺寸从客户端摘要里取，客户端真的读了这个文件）----
 python3 - "$RUN_DIR" "$STAMP" "$BUILD_DIR" "$SECONDS_PER_RUN" "$FPS" "$SETTLE_SECS" "$DROP_PCT" "$SAMPLE" \
   "${SCENARIOS[@]}" <<'PY'
-import json, os, platform, subprocess, sys
+import hashlib, json, os, platform, subprocess, sys
 run_dir, stamp, build_dir, secs, fps, settle, drop_pct, sample = sys.argv[1:9]
 scen_args = sys.argv[9:]
 first = json.load(open(os.path.join(run_dir, 'raw', scen_args[0].split('|')[0] + '.client.json')))
@@ -151,15 +165,40 @@ for s in scen_args:
     scenarios.append({'label': label, 'transcode': tc, 'fec': fec == 'on',
                       'nack': nack == 'on', 'drop_pct': float(drop)})
 mem_gib = round(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 2**30, 1)
-compiler = subprocess.run(['g++-14', '--version'], capture_output=True, text=True).stdout.splitlines()[0].split(') ')[-1]
+cache = {}
+try:
+    for line in open(os.path.join(build_dir, 'CMakeCache.txt')):
+        if '=' in line and ':' in line.split('=', 1)[0]:
+            key, value = line.rstrip().split('=', 1)
+            cache[key.split(':', 1)[0]] = value
+except FileNotFoundError:
+    pass
+build_type = cache.get('CMAKE_BUILD_TYPE', 'unknown')
+compiler_path = cache.get('CMAKE_CXX_COMPILER')
+compiler = 'unknown'
+if compiler_path:
+    result = subprocess.run([compiler_path, '--version'], capture_output=True, text=True)
+    if result.returncode == 0 and result.stdout.splitlines():
+        compiler = result.stdout.splitlines()[0]
+stream = {}
+try:
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                            '-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', sample],
+                           capture_output=True, text=True)
+    if probe.returncode == 0:
+        stream = json.loads(probe.stdout).get('streams', [{}])[0]
+except (FileNotFoundError, ValueError, IndexError):
+    pass
 meta = {
     'stamp': stamp, 'iso': subprocess.run(['date', '-Is'], capture_output=True, text=True).stdout.strip(),
     'host': platform.node(), 'nproc': os.cpu_count(), 'mem_gib': mem_gib,
-    'build_dir': build_dir, 'build_type': 'RelWithDebInfo', 'compiler': compiler,
+    'build_dir': build_dir, 'build_type': build_type, 'compiler': compiler,
+    'build_flags': cache.get('CMAKE_CXX_FLAGS', 'unknown') + ' ' + cache.get('CMAKE_CXX_FLAGS_' + build_type.upper(), 'unknown'),
+    'binary_sha256': {name: hashlib.sha256(open(os.path.join(build_dir, name), 'rb').read()).hexdigest() for name in ('cued', 'cue-probe')},
     'seconds_per_run': float(secs), 'fps': float(fps), 'settle_secs': float(settle),
     'drop_pct_for_lossy': float(drop_pct),
-    'sample': {'name': os.path.basename(sample), 'width': 640, 'height': 360,
-               'fps': float(fps), 'frames': first['sample_frames'],
+    'sample': {'name': os.path.basename(sample), 'width': stream.get('width', 'unknown'), 'height': stream.get('height', 'unknown'),
+               'fps': stream.get('r_frame_rate', 'unknown'), 'sha256': hashlib.sha256(open(sample, 'rb').read()).hexdigest(), 'frames': first['sample_frames'],
                'avg_frame_bytes': first['sample_frame_bytes'],
                'avg_fragments': first['sample_fragments_per_frame']},
     'scenarios': scenarios,

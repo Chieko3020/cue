@@ -30,7 +30,7 @@ const lastCuedMetrics = (log) => {
   }
 };
 
-const RE_PROBE = /\[probe\] fps=([\d.]+) frames=(\d+) lost=(\d+) pend=\d+ pkts=(\d+) nack=(\d+) pause=(\d+) fec_rec=(\d+) rej=(\d+) loss=([\d.]+)%/;
+const RE_PROBE = /\[probe\] (?:session=\d+ )?fps=([\d.]+) frames=(\d+) lost=(\d+) pend=\d+ pkts=(\d+) nack=(\d+)[^\n]*? pause=(\d+) fec_rec=(\d+)[^\n]*? rej=(\d+)[^\n]*? loss=([\d.]+)%/;
 const lastProbe = (log) => {
   const ms = [...log.matchAll(new RegExp(RE_PROBE, 'g'))];
   if (ms.length === 0) return null;
@@ -92,7 +92,8 @@ lines.push('');
 lines.push(`- 生成时间：${meta.iso}`);
 lines.push(`- 主机：${meta.host}（${meta.nproc} vCPU，${meta.mem_gib} GiB）`);
 lines.push(`- 构建：\`${meta.build_dir}\`（${meta.build_type}，${meta.compiler}）`);
-lines.push(`- 样本：${meta.sample.name}，${meta.sample.width}x${meta.sample.height} @${meta.sample.fps}fps，`
+lines.push(`- 编译参数（CMake cache）：${meta.build_flags ?? 'unknown'}；样本 SHA256：${meta.sample.sha256 ?? 'unknown'}`);
+lines.push(`- 样本：${meta.sample.name}，${meta.sample.width}x${meta.sample.height}，ffprobe r_frame_rate=${meta.sample.fps}（裸 H264 声明值，非实测帧率），`
   + `循环 ${meta.sample.frames} 帧 / 平均 ${meta.sample.avg_frame_bytes} B/帧 / `
   // 注意这是「上行 WS 分片数」（≤16 KiB/片），不是下行数据报数：下行由 cued 按 ≤1200 B 切片，
   // 帧越大分片越多 —— FEC/NACK 只有在「每帧 >1 个下行数据报」时才真正参与。
@@ -118,15 +119,16 @@ for (const [title, p, withLat] of [['p50', 'p50', true], ['p99', 'p99', false]])
   lines.push(withLat ? '|---|---|---|---|---|---|---|---|---|---|' : '|---|---|---|---|---|---|---|---|---|');
   for (const d of clean) lines.push(row(d, p, withLat));
   lines.push('');
+  lines.push('端到端延迟取最后一条 probe.metric；结算静默窗口可为 n/a，表示该窗口未测得延迟，不补零。');
   lines.push('`encode` 为 `-` 表示该段没有被采样（passthrough 不编码），不是 0 ms。');
   lines.push('');
 }
-lines.push('> `recv` 与 `buffer` 同口径（M2a 尚未拆出抖动缓冲）：都是「帧内首片到达 → 重组完成」。');
+lines.push('> `recv` 为帧内首片到达至重组完成；`buffer` 为重组完成后在抖动缓冲中等待放行的时间，来源分别为 cued 的重组完成和 JitterBuffer 放行采样。');
 lines.push('');
 
 // ---- 表 3：5% 丢包的帧完成率 ----
 const lossy = data.filter((d) => d.s.drop_pct > 0);
-lines.push(`## ${meta.sample.drop_pct_for_lossy || 5}% 丢包下的帧完成率与 FEC/NACK 恢复`);
+lines.push(`## ${meta.drop_pct_for_lossy ?? 'unknown'}% 丢包下的帧完成率与 FEC/NACK 恢复`);
 lines.push('');
 lines.push('| 配置 | FEC | NACK | 客户端发帧 | probe 完成帧 | 帧完成率 | probe 判丢帧 | FEC 恢复分片 | NACK 请求 | 注入丢包分片 | probe 缺片率均值 |');
 lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
@@ -175,6 +177,10 @@ if (baseline && baseline.client.frames_sent && baseline.probe) {
 
 // ---- 原始计数（便于复核）----
 lines.push('## 原始计数');
+for (const d of data) {
+  if (!d.cued || !d.probe || !d.client.frames_sent)
+    lines.push(`> ${d.s.label}：缺少关键指标或客户端摘要，未完成测量；未知值保持 n/a。`);
+}
 lines.push('');
 lines.push('| 场景 | cued frames_in | cued frames_out | cued injected | budget_drops | encode_errors | probe pkts | probe 完成帧 |');
 lines.push('|---|---|---|---|---|---|---|---|');

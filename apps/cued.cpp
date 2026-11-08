@@ -1971,6 +1971,14 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   // probe 侧看到的是 PTS 空洞（一次误判的"丢包"）。
   flush_delayq(cue::now_us() + 10'000'000);
 
+  // Freeze the actual counters after the existing close-time queue processing.
+  // This records completed sends, not delivery or a guarantee that sendq drained.
+  c.decode_drops = decoder.stats().dropped;
+  registry.publish_stats(session_id,
+                         session_snapshot(rings, c, cue::now_us(), t_last_report,
+                                          frames_prev, jb.stats(), shared->fb,
+                                          upstream_stream_id, pending));
+
   // ---- 断连收尾 ----
   // 先取回收原因再清表：lease_expired / session.kill / device_replaced 都写在表里，
   // unregister 之后就读不到了。顺序反了，事件里永远是 client_closed。

@@ -198,6 +198,29 @@ int main() {
           "closed sessions leave live aggregate; process lifetime counters are separate");
   }
 
+  // A final publish replaces a tick snapshot and remains associated with its
+  // closed session/device, while a new live session starts a separate ledger.
+  {
+    pipeline::SessionRegistry reg(opts(1));
+    auto a = reg.register_session(req("final-a"), 0);
+    reg.publish_stats(a->session_id, {{"audio_frames_in", 2}});
+    reg.publish_stats(a->session_id, {{"audio_frames_in", 7}, {"audio_frames_out", 7}});
+    reg.unregister(a->session_id);
+    auto b = reg.register_session(req("final-b"), 1);
+    reg.publish_stats(b->session_id, {{"audio_frames_in", 3}});
+    const auto rows = reg.sessions_json(1, true)["sessions"];
+    bool found = false;
+    for (const auto& row : rows) {
+      if (row["session_id"] == a->session_id) {
+        found = row["state"] == "closed" && row["device_id"] == "final-a" &&
+                row["stats"]["audio_frames_in"] == 7 && row["stats"]["audio_frames_out"] == 7;
+      }
+    }
+    check(found, "closed record retains final counters and original device association");
+    check(reg.aggregate(1)["counters"]["audio_frames_in"] == 3,
+          "closed final audio ledger does not inflate live aggregate");
+  }
+
   // ---------------------------------------------------------------- 7) sessions_json 的接口约定
   //
   // 三个「没有会话表」的后端必须返回空表**并且**在 err 里说明原因：
