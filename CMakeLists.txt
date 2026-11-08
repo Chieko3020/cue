@@ -188,7 +188,7 @@ target_include_directories(cue_proto INTERFACE ${CUE_PROTO_INCLUDE})
 # media/audio_decoder：上行音频（type=0x02）的 Opus 解码，PCM 只用来算指标、不下行。
 # media/token_bucket：SPEC §7.2 / FR-PIPE.8 的下行限速。实际在 apps/cued.cpp 里内联过，
 # N-07 抽到 media 层（纯组件、时间从参数进来），单测见 tests/test_token_bucket.cpp。
-add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp
+add_executable(cued apps/cued.cpp src/media/h264_decoder.cpp src/media/encoder.cpp src/media/processor.cpp
   src/media/jitter_buffer.cpp src/media/audio_decoder.cpp src/media/token_bucket.cpp)
 target_link_libraries(cued PRIVATE cue_proto cue_control cue_headers_all ${CUE_BOOST_SYSTEM_LIB}
   Threads::Threads PkgConfig::FFMPEG PkgConfig::OPUS)
@@ -241,7 +241,7 @@ target_link_libraries(cue-probe PRIVATE cue_capture)
 # cue-capture：三后端（lavfi / ffmpeg 子进程 / v4l2）+ 上行 WS 客户端。
 # 复用 media/encoder（X264Encoder）而不是再写一份 x264 封装——cued 的转码链与采集端
 # 对同一组 x264 参数必须得到同一个码流形状，两处各写一份迟早漂移。
-add_executable(cue-capture apps/cue-capture.cpp src/media/encoder.cpp)
+add_executable(cue-capture apps/cue-capture.cpp src/media/encoder.cpp src/media/processor.cpp)
 target_link_libraries(cue-capture PRIVATE cue_capture cue_headers_all ${CUE_BOOST_SYSTEM_LIB}
   Threads::Threads)
 target_compile_options(cue-capture PRIVATE -Wno-deprecated-declarations)
@@ -638,11 +638,16 @@ target_link_libraries(test_metrics PRIVATE cue_pipeline cue_log
 add_test(NAME metrics COMMAND test_metrics)
 set_tests_properties(metrics PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(test_processor tests/test_processor.cpp src/media/processor.cpp src/media/encoder.cpp
+  src/media/h264_decoder.cpp)
+target_link_libraries(test_processor PRIVATE cue_proto PkgConfig::FFMPEG)
+add_test(NAME processor COMMAND test_processor)
+
 # ---- 测试的 include 视图 ----
 # 测试不属于任何一层：它们要能同时看见所有头文件（包括故意写错的越界组合，
 # 那是测试的职责）。统一在这里补全，避免 20 多个 target 各写一遍。
 set(CUE_TEST_TARGETS
-  test_wire test_agent test_llm_deadline test_session test_context test_eval test_manual test_generator test_state test_compare
+  test_processor test_wire test_agent test_llm_deadline test_session test_context test_eval test_manual test_generator test_state test_compare
   test_report test_console test_recorded_metrics test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget test_upstream_reassembly
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
@@ -718,6 +723,10 @@ if(Python3_Interpreter_FOUND)
         --eval $<TARGET_FILE:cue-eval>)
     set_tests_properties(c13_cli_bench PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
     if(UNIX AND NOT APPLE)
+      add_test(NAME cued_processors
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_processors.py
+          --cued $<TARGET_FILE:cued> --decoder $<TARGET_FILE:test_processor>)
+      set_tests_properties(cued_processors PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
       add_test(NAME cued_final_snapshot
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_final_snapshot.py
           --cued $<TARGET_FILE:cued>)
@@ -822,7 +831,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
   # N-08/N-07/N-10 新增的单测，守卫当时还没加上（守卫本身也是 N-12 前后才有的），
   # 于是 build-asan / build-tsan 各自停在旧配置上跑 20 / 10 项而没人发现。
   # 名单需覆盖全部 C++ 测试；非 C++ 脚本检查在下面显式豁免。
-  set(_cue_san_tests wire agent llm_deadline_unit session context eval manual state compare console recorded_metrics cassette probe sandbox
+  set(_cue_san_tests processor wire agent llm_deadline_unit session context eval manual state compare console recorded_metrics cassette probe sandbox
                      probe_render_headless audio_playback audio_drift capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget upstream_reassembly
                      control_channel tools tool_schema delay_injector nack capture config metrics

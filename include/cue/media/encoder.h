@@ -82,6 +82,8 @@ class X264Encoder {
   bool force_keyframe_ = false;
 };
 
+class ProcessorChain;
+
 class TranscodeChain {
  public:
   TranscodeChain();
@@ -89,7 +91,7 @@ class TranscodeChain {
   TranscodeChain(const TranscodeChain&) = delete;
   TranscodeChain& operator=(const TranscodeChain&) = delete;
 
-  // dst_w/dst_h 为 0 表示不缩放（沿用解码尺寸）
+  // dst_w/dst_h must be positive even dimensions (same contract as X264Encoder).
   bool configure(int dst_w, int dst_h, int bitrate_kbps, int fps, int gop, std::string_view preset,
                  std::string& err, int threads = 1);
   void close();
@@ -103,9 +105,7 @@ class TranscodeChain {
                                                     int64_t* encode_ns = nullptr);
 
  private:
-  struct Scaler;
-  std::unique_ptr<Scaler> scaler_;
-  X264Encoder encoder_;
+  std::unique_ptr<ProcessorChain> chain_;
   int dst_w_ = 0;
   int dst_h_ = 0;
   bool enabled_ = false;

@@ -6,12 +6,12 @@
 extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
 #include <x264.h>
 }
 
 #include "cue/common/clock.h"
 #include "cue/media/encoder.h"
+#include "cue/media/processor.h"
 
 namespace cue::media {
 
@@ -205,99 +205,39 @@ std::expected<EncodedResult, EncodeError> X264Encoder::encode(const AVFrame* fra
 
 // -------------------------------------------------------------- TranscodeChain
 
-struct TranscodeChain::Scaler {
-  SwsContext* sws = nullptr;
-  AVFrame* dst = nullptr;
-  int src_w = 0, src_h = 0, dst_w = 0, dst_h = 0;
-  int src_fmt = -1;
-
-  void reset() {
-    if (dst) av_frame_free(&dst);
-    if (sws) sws_freeContext(sws);
-    sws = nullptr;
-    dst = nullptr;
-    src_w = src_h = dst_w = dst_h = 0;
-    src_fmt = -1;
-  }
-
-  bool ensure(int sw, int sh, int sf, int dw, int dh, std::string& err) {
-    if (sws && src_w == sw && src_h == sh && src_fmt == sf && dst_w == dw && dst_h == dh) return true;
-    reset();
-    sws = sws_getContext(sw, sh, static_cast<AVPixelFormat>(sf), dw, dh, AV_PIX_FMT_YUV420P,
-                         SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!sws) {
-      err = "sws_getContext failed";
-      return false;
-    }
-    dst = av_frame_alloc();
-    if (!dst) {
-      err = "av_frame_alloc failed";
-      reset();
-      return false;
-    }
-    dst->format = AV_PIX_FMT_YUV420P;
-    dst->width = dw;
-    dst->height = dh;
-    if (av_frame_get_buffer(dst, 32) < 0) {
-      err = "av_frame_get_buffer failed";
-      reset();
-      return false;
-    }
-    src_w = sw;
-    src_h = sh;
-    dst_w = dw;
-    dst_h = dh;
-    src_fmt = sf;
-    return true;
-  }
-};
-
-TranscodeChain::TranscodeChain() = default;
+TranscodeChain::TranscodeChain() : chain_(std::make_unique<ProcessorChain>()) {}
 TranscodeChain::~TranscodeChain() = default;
 
 bool TranscodeChain::configure(int dst_w, int dst_h, int bitrate_kbps, int fps, int gop,
                                std::string_view preset, std::string& err, int threads) {
   close();
-  if (!scaler_) scaler_ = std::make_unique<Scaler>();
-  dst_w_ = dst_w;
-  dst_h_ = dst_h;
-  if (!encoder_.open(dst_w, dst_h, bitrate_kbps, fps, gop, preset, err, threads)) return false;
+  dst_w_ = dst_w; dst_h_ = dst_h;
+  ProcessorOptions options{dst_w, dst_h, bitrate_kbps, fps, gop, threads, std::string(preset)};
+  auto configured = chain_->configure(ProcessorRegistry::builtins(),
+      {{"scale", options}, {"transcode", options}}, MediaKind::Raw);
+  if (!configured) { err = configured.error().message; return false; }
   enabled_ = true;
   return true;
 }
-
 void TranscodeChain::close() {
   enabled_ = false;
-  encoder_.close();
-  if (scaler_) scaler_->reset();
+  chain_->close();
 }
-
 std::expected<EncodedResult, EncodeError> TranscodeChain::process(const AVFrame* in, int64_t pts,
-                                                                 std::string& err, int64_t* encode_ns) {
+                                                                std::string& err, int64_t* encode_ns) {
   if (encode_ns) *encode_ns = 0;
-  if (!enabled_) {
-    err = "transcode chain not configured";
-    return std::unexpected(EncodeError::NotOpen);
+  if (!enabled_) { err = "transcode chain not configured"; return std::unexpected(EncodeError::NotOpen); }
+  if (!in) { err = "null frame"; return std::unexpected(EncodeError::InvalidFrame); }
+  // The compatibility graph is fixed for this configuration. Scale has a same-size
+  // YUV420P fast path, so a source format/size change never silently restarts x264.
+  ProcessorTiming timing;
+  auto result = chain_->process(ProcessorMedia::raw(in, pts), &timing);
+  if (encode_ns) *encode_ns = timing.encode_us;
+  if (!result) {
+    err = result.error().processor + ": " + result.error().message;
+    return std::unexpected(result.error().code);
   }
-  if (!in) {
-    err = "null frame";
-    return std::unexpected(EncodeError::InvalidFrame);
-  }
-  if (!scaler_) scaler_ = std::make_unique<Scaler>();
-
-  const AVFrame* src = in;
-  if (in->width != dst_w_ || in->height != dst_h_ || in->format != AV_PIX_FMT_YUV420P) {
-    if (!scaler_->ensure(in->width, in->height, in->format, dst_w_, dst_h_, err)) {
-      return std::unexpected(EncodeError::ScaleFailed);
-    }
-    if (sws_scale(scaler_->sws, in->data, in->linesize, 0, in->height, scaler_->dst->data,
-                  scaler_->dst->linesize) <= 0) {
-      err = "sws_scale failed";
-      return std::unexpected(EncodeError::ScaleFailed);
-    }
-    src = scaler_->dst;
-  }
-  return encoder_.encode(src, pts, err, encode_ns);
+  return EncodedResult{std::move(result->data), result->keyframe, result->pts};
 }
 
 }  // namespace cue::media

@@ -54,6 +54,7 @@ extern "C" {
 #include "cue/media/audio_rms.h"
 #include "cue/media/delay_injector.h"
 #include "cue/media/encoder.h"
+#include "cue/media/processor.h"
 #include "cue/media/h264_decoder.h"
 #include "cue/media/jitter_buffer.h"
 #include "cue/media/token_bucket.h"
@@ -1047,6 +1048,9 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   uint64_t last_gen = 0;
   uint64_t chain_failed_gen = kNoGeneration;
   cue::media::TranscodeChain chain;
+  cue::media::ProcessorChain passthrough_chain;
+  (void)passthrough_chain.configure(cue::media::ProcessorRegistry::builtins(),
+                                  {{"passthrough", {}}}, cue::media::MediaKind::Encoded);
   bool chain_ready = false;
   // 音频解码器（上行 type=0x02 → PCM，只用来算指标）。每会话一份：Opus 解码器是带状态的
   // （上一帧的尾巴参与下一帧的重叠相加），跨会话共用会把上一路的余音串到下一路。
@@ -1443,6 +1447,20 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
                                            eerr);
           }
         }
+      }
+    }
+    if (!profile.transcode) {
+      cue::media::ProcessorMedia input;
+      input.data = std::move(jf.payload); input.codec = jf.codec;
+      input.pts = pts_us; input.keyframe = keyframe;
+      auto passed = passthrough_chain.process(std::move(input));
+      if (passed) {
+        encoded_buf = std::move(passed->data);
+        payload = encoded_buf;
+        out_codec = passed->codec;
+        keyframe = passed->keyframe;
+      } else {
+        skip_send = true;
       }
     }
     // op 段只算 ProcessorChain 里除编码以外的部分（M2a 为 passthrough ≈0），

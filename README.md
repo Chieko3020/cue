@@ -51,6 +51,11 @@ CI 分两层：常驻工作流串行跑SDL ON/OFF全构建与全CTest、AC-13静
 
 `cued` 负责 WS 接收、分片重组、**抖动缓冲**、解码、`ProcessorChain`（passthrough / scale / transcode）、编码、UDP 发送，六段埋点（recv / buffer / decode / op / encode / send）逐帧计时、每段给 p50/p95/p99。令牌桶、XOR-FEC（每 N 包一组，可调）、NACK 与**六种损伤注入**（`drop` / `ingress_drop` / `rate` / `backlog` / `delay` / `jitter`）都在发送路径上，同一 seed 逐包可复现。控制面走 UDS（`SOCK_SEQPACKET` 优先，STREAM + JSON-line 兜底），所以改参数与注入**不重启进程、不断流**；只有结构性参数（端口、bind、FEC 开关、抖动缓冲结构）仍需重启。
 
+媒体接口位于 `include/cue/media/processor.h`：`ProcessorRegistry::builtins()` 注册 `passthrough`、`scale`、`transcode`，调用方可用 `add()` 注册自定义 `Processor`，再用 `ProcessorChain::configure()` 按指定顺序组合。配置拒绝未知项、空工厂、重复注册和 raw/encoded 类型不相容的顺序。`ProcessorMedia` 的编码结果拥有字节；raw 输入可在同步 `process()` 内借用，scale 输出为引用计数 AVFrame，保留结果可跨后续处理及 close 使用。共享 raw 缓冲的调用方写入前须遵循 FFmpeg 的 `av_frame_make_writable` 契约。
+
+`src/media/processor.cpp` 使用 libswscale 输出 YUV420P，裸 `transcode` 仅调用现有 `X264Encoder`，尺寸/格式不匹配会返回分类错误。兼容接口 `TranscodeChain` 显式组合 scale 与 transcode；scale 在已匹配的 YUV420P 输入上只引用帧，不重启编码器。`cued` 默认透传也运行注册链。链统计累计处理尝试、成功、失败和正常编码延迟，含失败前耗时；scale 计 op，x264 拷贝与编码计 encode，二者不重复计费。`test_processor` 用合成 AVFrame、自定义修改像素及真实 H264Decoder 验证组合，`cued_processors` 覆盖 loopback WS/UDP 和热重配；这些工程验证不代表设备、公网或性能验收。
+
+
 `pipeline/` 是适配层：`ProcessPipelineControl` 把 `cued` 当子进程拉起，从 stdout 解析指标与事件；`HttpServicePipeline` 连接实现 `GET /api/state` + `POST /api/action` 的外部服务（`cue-mock-svc` 是其中一个确定性假域）。
 
 边界：帧数据只在浏览器/`cue-capture` ↔ `cued` ↔ `cue-probe` 之间流动，不跨进程进 harness。**端到端分位已回传**：harness 托管探针并解析它的输出，`IServicePipeline::probe_latest()` 把端到端 p50/p95/p99、卡顿、四段分解（recv/reassembly/buffer/decode）交给工具与判分；探针不可用时报 `run_error=probe_unavailable`，不退回 `cued` 侧指标。

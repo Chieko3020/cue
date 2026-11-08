@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 INVENTORY = json.loads((ROOT / 'scripts/ci-test-inventory.json').read_text())
 NON_CPP = {'layer_isolation', 'no_external_cdn', 'console_client', 'avc_level_consistency'}
 PROCESS = {'probe_audio_recovery', 'probe_audio_drift_recovery', 'recorded_metrics_http',
-           'llm_deadline_http', 'eval_manual', 'eval_producer', 'cued_reassembly', 'cued_final_snapshot', 'c13_cli_bench', 'integration'}
+           'llm_deadline_http', 'eval_manual', 'eval_producer', 'cued_reassembly', 'cued_processors', 'cued_final_snapshot', 'c13_cli_bench', 'integration'}
 
 
 def require(condition, message):

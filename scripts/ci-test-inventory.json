@@ -28,6 +28,7 @@
     "probe",
     "probe_network",
     "probe_render_headless",
+    "processor",
     "reassembly_budget",
     "recorded_metrics",
     "report",
