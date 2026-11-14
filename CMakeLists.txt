@@ -618,6 +618,10 @@ set_tests_properties(audio_receiver PROPERTIES TIMEOUT 30)
 # 漏一整个帧缓冲：1080p ≈3.1 MB/帧，cued 与 probe 都涨到 GB 级后被 cgroup OOM 杀掉。
 # 功能断言在故障时**全部通过**（decoded 一直在涨、decode_errors 一直是 0），只有量 RSS
 # 才抓得到，这正是它存在的理由。不依赖外部样本：内嵌一张 64x64 IDR 反复解码。
+add_executable(test_h264_dynamic tests/test_h264_dynamic.cpp src/media/h264_decoder.cpp)
+target_link_libraries(test_h264_dynamic PRIVATE cue_headers_all PkgConfig::FFMPEG)
+add_test(NAME h264_dynamic COMMAND test_h264_dynamic)
+
 add_executable(test_h264_decoder tests/test_h264_decoder.cpp src/media/h264_decoder.cpp)
 target_link_libraries(test_h264_decoder PRIVATE cue_headers_all PkgConfig::FFMPEG)
 add_test(NAME h264_decoder COMMAND test_h264_decoder)
@@ -647,7 +651,7 @@ add_test(NAME processor COMMAND test_processor)
 # 测试不属于任何一层：它们要能同时看见所有头文件（包括故意写错的越界组合，
 # 那是测试的职责）。统一在这里补全，避免 20 多个 target 各写一遍。
 set(CUE_TEST_TARGETS
-  test_processor test_wire test_agent test_llm_deadline test_session test_context test_eval test_manual test_generator test_state test_compare
+  test_h264_dynamic test_processor test_wire test_agent test_llm_deadline test_session test_context test_eval test_manual test_generator test_state test_compare
   test_report test_console test_recorded_metrics test_cassette test_probe test_sandbox test_jitter_buffer
   test_token_bucket test_frame_guard test_avc_level test_reassembly_budget test_upstream_reassembly
   test_control_channel test_tools test_tool_schema test_delay_injector test_nack test_capture
@@ -723,6 +727,16 @@ if(Python3_Interpreter_FOUND)
         --eval $<TARGET_FILE:cue-eval>)
     set_tests_properties(c13_cli_bench PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
     if(UNIX AND NOT APPLE)
+      set(_cue_dynamic_render_args)
+      if(NOT CUE_ENABLE_SDL2)
+        list(APPEND _cue_dynamic_render_args --no-render)
+      endif()
+      add_test(NAME cued_dynamic
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_dynamic.py
+          --cued $<TARGET_FILE:cued> --probe $<TARGET_FILE:cue-probe>
+          --fixture $<TARGET_FILE:test_h264_dynamic> --decoder $<TARGET_FILE:test_processor>
+          ${_cue_dynamic_render_args})
+      set_tests_properties(cued_dynamic PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
       add_test(NAME cued_processors
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cued_processors.py
           --cued $<TARGET_FILE:cued> --decoder $<TARGET_FILE:test_processor>)
@@ -835,7 +849,7 @@ if(NOT CUE_SANITIZE STREQUAL "none")
                      probe_render_headless audio_playback audio_drift capture_process probe_network
                      jitter_buffer token_bucket frame_guard reassembly_budget upstream_reassembly
                      control_channel tools tool_schema delay_injector nack capture config metrics
-                     session_registry generator report audio_decoder audio_receiver h264_decoder avc_level)
+                     session_registry generator report audio_decoder audio_receiver h264_decoder h264_dynamic avc_level)
   if(TARGET test_probe_render_sdl)
     list(APPEND _cue_san_tests probe_render_sdl)
   endif()

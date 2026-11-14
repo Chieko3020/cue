@@ -326,3 +326,12 @@ bench/         benchmark 脚本的产出目录（数据不入库）
 - **延迟口径**：跨主机场景下的端到端延迟是相对量，依赖握手阶段的时钟偏移估计（目标误差 < 5 ms）。页面在连接时锚定时钟，每 30 s 重估，漂移 > 5 ms 重锚；重锚只写页面日志（推流页不接控制台的事件流）。数字不含最小网络传播时间，也不含上屏。
 - **上行编码**：关键帧间隔由页面固定为 2 s，`suites` 里的 `pipeline.gop` 只影响服务端转码。
 - **重连**：`cued` 重启后页面自动重连，并在重连成功后的第一帧强制 IDR；断线窗口里不消费这个标志，新解码器无需等 2 s GOP 即可恢复（实测 `dec_err=0`）。
+
+
+C15 的共享 `H264Decoder` 用 FFmpeg 处理健康的 SPS/PPS 与输出尺寸变化，不因参数变化 flush 或重开。Annex-B 观察仅保留每类最近一个、不超过 1024 字节的 SPS/PPS 公告，去掉起始码和尾部零填充后比较，不解析参数 ID 或多参数集语义。公告变化与成功 `AVFrame` 的宽高/格式变化分别计数，候选参数从不作为可信 extradata 回放。仅无 VCL 包使用 FFmpeg `AV_CODEC_FLAG2_CHUNKS` 允许独立参数包先到，携画面包保留原完整帧错误行为；无输出不代表解码成功，真实 send/receive 错误仍记账。
+
+原生 cued 会话 snapshot（包括 closed 行）和 probe metric 提供 `sps_changes`、`pps_changes`、`parameter_packets`（无 VCL）、`inline_parameter_packets`（含 VCL）、`rejected_parameters`、`decode_output_changes`、`decode_resets` 和 `decode_width/height`。以上 counter 在 decoder 对象生命周期累计，首次参数只建立基线；宽高在首个成功输出前为 null，之后代表最近成功输出，close/open 保留累计观察。cued 另有 `decode_format` 和 `decode_recovery_failures`；probe 的 `decode_resets` 包含真实换流 reset 加共享恢复重建，`decode_recovery_rebuilds` 单独说明后者。`decode_recovery_exhausted` 为对象最多三次重建预算耗尽的布尔状态。新字段仅承诺原生每会话/探针层，不扩展 HTTP、录制、工具 DTO 或 Registry 聚合白名单，也不把尺寸相加。
+
+共享恢复在连续 30 次真实失败后等待带完整内联参数的 IDR，仅此时尝试新 decoder；两次尝试至少间隔 120 次非空 decode 调用，每对象最多三次。达到预算仍允许成熟 FFmpeg 用新的有效 IDR 正常解码。close/open/显式 flush 清当前失败串，不重置累计错误和恢复预算。健康参数或重复 header 不触发恢复。probe 的 `probe.decode_output` 记录确认尺寸/格式及该边界清掉的旧代延迟视频帧数，不清音频；`probe.decode_reset` 说明受限恢复理由。cued 仅在自动目标的成功输出尺寸改变时重配必要转码链，`pipeline.encoder_rebuild` 的 `source_change` 理由含旧新尺寸，固定目标不因源尺寸变化重配。
+
+可复验入口为 `h264_dynamic`（真实 x264 A/B/A、PPS-only、参数先行、损坏、恢复及析构）和 `cued_dynamic`（实际 WS/cued/UDP/probe，passthrough、固定目标、自动目标、SDL dummy）。Linux dummy 仅证明渲染适配，不代表真实屏幕、音画同步或听感；本批没有 Windows、设备或公网验收。

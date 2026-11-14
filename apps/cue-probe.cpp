@@ -296,77 +296,11 @@ json seg_or_null(const LatencyRing& r) {
               {"p99", r.percentile(0.99)}};
 }
 
-// ---------------------------------------------------------------- Annex-B 参数集
-// 解码器在 IDR 之前必须先见到 SPS/PPS。发送端有两种形态：内联在 IDR 前面的参数集
-// （浏览器 / x264 的 annexb 输出），以及把参数集放在独立的 codec_config 包里。
-// probe 只收到下行 Video 数据报，所以两种都要能接住：本帧内联了就现取；
-// 本帧没有就补上之前缓存的两组参数，否则解码器会一直报「缺 SPS」并拒绝出帧。
-struct ParamSets {
-  std::vector<uint8_t> sps;
-  std::vector<uint8_t> pps;
-
-  bool complete() const { return !sps.empty() && !pps.empty(); }
-};
-
-// 扫描 Annex-B 起始码；顺手把本帧内联的 SPS/PPS 收进 cache。
-// 返回 false = 这段数据里没有任何起始码（不是 Annex-B 帧的形态，喂进去只会浪费解码器）。
-bool scan_param_sets(std::span<const uint8_t> in, ParamSets& cache, bool& inline_sps,
-                     bool& inline_pps) {
-  struct Nal {
-    std::size_t sc_pos;  // 起始码首字节
-    std::size_t begin;   // NAL 首字节
-  };
-  std::vector<Nal> nals;
-  for (std::size_t i = 0; i + 3 <= in.size();) {
-    // 4 字节起始码优先：00 00 00 01 不能被当成 00 00 01 + 一个多余 0
-    if (i + 4 <= in.size() && in[i] == 0 && in[i + 1] == 0 && in[i + 2] == 0 && in[i + 3] == 1) {
-      nals.push_back(Nal{i, i + 4});
-      i += 4;
-      continue;
-    }
-    if (in[i] == 0 && in[i + 1] == 0 && in[i + 2] == 1) {
-      nals.push_back(Nal{i, i + 3});
-      i += 3;
-      continue;
-    }
-    ++i;
-  }
-  if (nals.empty()) return false;
-  constexpr std::size_t kMaxParamNal = 1024;  // SPS/PPS 不可能更大，异常数据不当参数集
-  for (std::size_t k = 0; k < nals.size(); ++k) {
-    const std::size_t begin = nals[k].begin;
-    const std::size_t end = (k + 1 < nals.size()) ? nals[k + 1].sc_pos : in.size();
-    if (end <= begin || end - begin > kMaxParamNal) continue;
-    switch (static_cast<uint8_t>(in[begin] & 0x1F)) {
-      case 7:
-        cache.sps.assign(in.data() + nals[k].sc_pos, in.data() + end);
-        inline_sps = true;
-        break;
-      case 8:
-        cache.pps.assign(in.data() + nals[k].sc_pos, in.data() + end);
-        inline_pps = true;
-        break;
-      default:
-        break;
-    }
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------- 解码 + 帧统计
-// 单帧解码失败不是灾难（丢包/乱序都可能让一帧解不出），但**连续**失败说明参考帧或
-// 参数集状态已经坏掉：继续硬解只会把每一帧都记成错误，却永远恢复不过来。
-// 所以连续失败到阈值就重置解码器（重新 open，等于丢掉全部参考帧），并记一次事件。
-constexpr int kMaxDecodeFailStreak = 30;
-
+// Shared H264Decoder owns bounded parameter observation and failure recovery.
 struct DecodeState {
   cue::media::H264Decoder dec;
   bool opened = false;
-  bool params_ready = false;  // 解码器已经在有 SPS/PPS 的帧上成功出过帧
-  int fail_streak = 0;
   uint64_t resets = 0;
-  ParamSets params;
-  std::vector<uint8_t> scratch;  // 补参数集时的拼帧缓冲（复用，避免每帧分配）
   // 见过哪些 codec：跳过事件按「每个 codec 值一条」记，否则 30 fps 的非 H264 流
   // 会在一秒内刷出 30 条同样的日志，把真正的事件冲掉。
   std::map<uint8_t, uint64_t> skipped_codecs;
@@ -385,8 +319,6 @@ struct DecodeState {
   void reset() {
     dec.close();
     opened = false;
-    params_ready = false;
-    fail_streak = 0;
     ++resets;
   }
 };
@@ -1346,56 +1278,36 @@ int main(int argc, char** argv) {
       ++fs.decode_errors;
       return;
     }
-    bool inline_sps = false;
-    bool inline_pps = false;
-    const bool annexb = scan_param_sets(payload, dec.params, inline_sps, inline_pps);
-    if (!annexb) {
-      // 没有起始码就不是 Annex-B（可能是 AVCC 长度前缀形态）：这里不做转封装，
-      // 直接记错并限流提示一次，不假装解过。
-      ++fs.decode_errors;
-      if (!warned_bad_frame) {
-        std::fprintf(stderr, "[probe] 帧缺少 Annex-B 起始码，无法解码（只提示一次）\n");
-        warned_bad_frame = true;
-        ++bad_frame_events;
-        emit("probe.decode_unsupported",
-             json{{"reason", "no_annexb_start_code"}, {"bytes", payload.size()}});
-      }
-      return;
-    }
-    std::span<const uint8_t> feed = payload;
-    if (!inline_sps && !inline_pps && !dec.params_ready && dec.params.complete()) {
-      // 参数集在别的包里先到过：补在帧前，否则解码器会一直报「缺 SPS」
-      dec.scratch.clear();
-      dec.scratch.insert(dec.scratch.end(), dec.params.sps.begin(), dec.params.sps.end());
-      dec.scratch.insert(dec.scratch.end(), dec.params.pps.begin(), dec.params.pps.end());
-      dec.scratch.insert(dec.scratch.end(), payload.begin(), payload.end());
-      feed = {dec.scratch.data(), dec.scratch.size()};
-    }
     const int64_t t0 = cue::now_us();
     std::string derr;
-    AVFrame* out = dec.dec.decode(feed, derr);
+    const auto before = dec.dec.stats();
+    AVFrame* out = dec.dec.decode(payload, derr);
+    const auto& after = dec.dec.stats();
+    if (after.recovery_rebuilds != before.recovery_rebuilds)
+      emit("probe.decode_reset", json{{"reason", "consecutive_errors_inline_idr"},
+           {"resets", dec.resets + after.recovery_rebuilds}, {"recovery_rebuilds", after.recovery_rebuilds}});
+    if (out && (before.frames == 0 || after.output_changes != before.output_changes)) {
+      std::size_t discarded = 0;
+      while (!defer_q.empty()) {
+        av_frame_free(&defer_q.front().frame); defer_q.pop_front(); ++discarded;
+      }
+      emit("probe.decode_output", json{{"width", out->width}, {"height", out->height},
+           {"format", out->format}, {"changes", after.output_changes}, {"deferred_discarded", discarded}});
+    }
     const int64_t dec_us = cue::now_us() - t0;
     fs.decode_us.push(std::max<int64_t>(0, dec_us), cue::now_us());
     if (out != nullptr) {
       ++fs.decoded;
-      dec.params_ready = true;
-      dec.fail_streak = 0;
       // 借用指针只在下次 decode 之前有效，所以这里必须立刻上屏（不能存起来延后画）；
       // 用 render_live 而不是 render_enabled：没打开时 draw_yuv 本来就是空操作，
       // 分开只是为了读代码的人不必去翻实现确认这一条。
       if (render_live) defer_or_draw(out);
     } else if (!derr.empty()) {
       ++fs.decode_errors;
-      ++dec.fail_streak;
-      if (dec.fail_streak >= kMaxDecodeFailStreak) {
-        // 连续失败到阈值：重置解码器（重新 open = 丢掉全部参考帧），并留一条事件，
-        // 否则「一直解不出来」在指标里会和「一直没收到帧」长得一模一样。
-        emit("probe.decode_reset",
-             json{{"fail_streak", dec.fail_streak},
-                  {"decode_errors", fs.decode_errors},
-                  {"resets", dec.resets + 1},
-                  {"last_error", derr}});
-        dec.reset();
+      if (derr.starts_with("packet is not Annex-B") && !warned_bad_frame) {
+        warned_bad_frame = true;
+        ++bad_frame_events;
+        emit("probe.decode_unsupported", json{{"reason", "no_annexb_start_code"}, {"bytes", payload.size()}});
       }
     } else {
       // 第三个分支：decode 返回 nullptr 且**没有**错误信息 = 包被解码器吃了，只是这一拍
@@ -2001,7 +1913,16 @@ int main(int argc, char** argv) {
           {"decode_ms_p99", fs.decode_us.size() ? json(double(fs.decode_us.percentile(0.99)) / 1000.0)
                                                 : json(nullptr)},
           {"recv_ts_missing", fs.recv_ts_missing},
-          {"decode_resets", dec.resets},
+          {"decode_resets", dec.resets + dec.dec.stats().recovery_rebuilds},
+          {"sps_changes", dec.dec.stats().sps_changes}, {"pps_changes", dec.dec.stats().pps_changes},
+          {"parameter_packets", dec.dec.stats().parameter_packets},
+          {"inline_parameter_packets", dec.dec.stats().inline_parameter_packets},
+          {"rejected_parameters", dec.dec.stats().rejected_parameters},
+          {"decode_output_changes", dec.dec.stats().output_changes},
+          {"decode_recovery_rebuilds", dec.dec.stats().recovery_rebuilds},
+          {"decode_recovery_exhausted", dec.dec.stats().recovery_exhausted},
+          {"decode_width", dec.dec.stats().output_width > 0 ? json(dec.dec.stats().output_width) : json(nullptr)},
+          {"decode_height", dec.dec.stats().output_height > 0 ? json(dec.dec.stats().output_height) : json(nullptr)},
           // 解码器"等 IDR"期间丢掉的包数（设计行为，不是失败）。不暴露它的话，
           // flush 之后的冻屏会表现成 fps=0 + decode_errors=0，看起来像"链路没在送帧"。
           {"decode_gated", dec.dec.stats().gated},
@@ -2192,7 +2113,6 @@ int main(int argc, char** argv) {
       pending_bytes = 0;  // 表清空 → 预算计数器必须同步归零，否则换代后预算恒为"已满"
       max_completed = 0;
       have_completed = false;
-      dec.params = ParamSets{};
       dec.reset();
       // 抖动缓冲同样要清：上一代的 PTS 基线还在的话，新流前几帧会被判成"迟到"丢掉，
       // 那些帧里往往正好包含新编码器的 IDR/SPS。

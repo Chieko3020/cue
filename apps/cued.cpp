@@ -318,6 +318,7 @@ struct Counters {
   uint64_t bytes_in = 0;
   uint64_t frames_decoded = 0;
   uint64_t decode_errors = 0;
+  cue::media::H264Decoder::Stats decoder_stats;
   uint64_t injected_drops = 0;
   uint64_t rejected = 0;      // 协议边界拒绝（wire.h 的 validate_media 给出具体原因）
   uint64_t budget_drops = 0;  // 令牌桶不足丢的帧（先丢非关键帧）
@@ -660,6 +661,18 @@ json session_snapshot(const Ring rings[6], const Counters& c, int64_t now_us, in
          {"encode_errors", c.encode_errors},
          {"encode_delays", c.encode_delays},
          {"decode_drops", c.decode_drops},
+         {"sps_changes", c.decoder_stats.sps_changes},
+         {"pps_changes", c.decoder_stats.pps_changes},
+         {"parameter_packets", c.decoder_stats.parameter_packets},
+         {"inline_parameter_packets", c.decoder_stats.inline_parameter_packets},
+         {"rejected_parameters", c.decoder_stats.rejected_parameters},
+         {"decode_output_changes", c.decoder_stats.output_changes},
+         {"decode_resets", c.decoder_stats.recovery_rebuilds},
+         {"decode_recovery_failures", c.decoder_stats.recovery_failures},
+         {"decode_recovery_exhausted", c.decoder_stats.recovery_exhausted},
+         {"decode_width", c.decoder_stats.output_width > 0 ? json(c.decoder_stats.output_width) : json(nullptr)},
+         {"decode_height", c.decoder_stats.output_height > 0 ? json(c.decoder_stats.output_height) : json(nullptr)},
+         {"decode_format", c.decoder_stats.output_format >= 0 ? json(c.decoder_stats.output_format) : json(nullptr)},
          {"queue_dropped", c.queue_dropped},
          {"delayed_pkts", c.delayed_pkts},
          {"delayed_max_us", c.delayed_max_us},
@@ -1052,6 +1065,7 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   (void)passthrough_chain.configure(cue::media::ProcessorRegistry::builtins(),
                                   {{"passthrough", {}}}, cue::media::MediaKind::Encoded);
   bool chain_ready = false;
+  int attempted_width = 0, attempted_height = 0;
   // 音频解码器（上行 type=0x02 → PCM，只用来算指标）。每会话一份：Opus 解码器是带状态的
   // （上一帧的尾巴参与下一帧的重叠相加），跨会话共用会把上一路的余音串到下一路。
   // 懒打开：只推视频的会话不付创建解码器的代价。
@@ -1392,7 +1406,24 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
     bool enc_sampled = false;  // transcode 关闭时该段不采样，报告里显示 "-"
 
     if (profile.transcode && decoded) {
+      const int target_w = profile.width > 0 ? profile.width : decoded->width;
+      const int target_h = profile.height > 0 ? profile.height : decoded->height;
+      if (chain_ready && (chain.out_width() != target_w || chain.out_height() != target_h)) {
+        const int old_w = chain.out_width(), old_h = chain.out_height();
+        const int64_t begin = cue::now_us();
+        chain.close();
+        chain_ready = false;
+        chain_failed_gen = kNoGeneration;
+        emit_event("pipeline.encoder_rebuild",
+                   json{{"reason", "source_change"}, {"old_width", old_w}, {"old_height", old_h},
+                        {"width", target_w}, {"height", target_h},
+                        {"elapsed_us", cue::now_us() - begin}});
+      }
+      if (!chain_ready && (target_w != attempted_width || target_h != attempted_height))
+        chain_failed_gen = kNoGeneration;
       if (!chain_ready && chain_failed_gen != profile_enc_gen) {
+        attempted_width = target_w;
+        attempted_height = target_h;
         // 用**下发档位**而不是原始参数配置编码器：这就是"设备只支持 480p 就不给
         // 它 720p 的编码参数"落地的地方（宽高/码率/帧率/preset 都从 profile 取）。
         const int dw = profile.width > 0 ? profile.width : decoded->width;
@@ -1695,6 +1726,7 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
         // 的帧算成积压，buffer 段也会少采样几帧。
         for (auto& ready : jb.poll(now_tick)) process_frame(std::move(ready));
         c.decode_drops = decoder.stats().dropped;
+        c.decoder_stats = decoder.stats();
         // 本会话的读数交给报告线程（它负责聚合成每秒一行；per_session 里就是这一份）
         registry.publish_stats(session_id,
                                session_snapshot(rings, c, now_tick, t_last_report,
@@ -1992,6 +2024,7 @@ void run_session(const SessionEnv& env, websocket::stream<tcp::socket> ws) {
   // Freeze the actual counters after the existing close-time queue processing.
   // This records completed sends, not delivery or a guarantee that sendq drained.
   c.decode_drops = decoder.stats().dropped;
+  c.decoder_stats = decoder.stats();
   registry.publish_stats(session_id,
                          session_snapshot(rings, c, cue::now_us(), t_last_report,
                                           frames_prev, jb.stats(), shared->fb,

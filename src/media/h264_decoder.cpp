@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -20,6 +21,8 @@ struct NalScan {
   bool idr = false;  // 有 IDR(5)：唯一能重建参考链的 NAL
   bool sps = false;  // 7
   bool pps = false;  // 8
+  bool invalid_parameter = false;
+  std::span<const uint8_t> sps_data, pps_data;
 };
 
 // 起始码判据与 probe 的 scan_param_sets 一致：4 字节优先，否则 3 字节。
@@ -47,7 +50,22 @@ NalScan scan_nals(std::span<const uint8_t> in) {
       if (type == 7) s.sps = true;
       if (type == 8) s.pps = true;
     }
-    i = header + 1;
+    std::size_t end = header + 1;
+    while (end + 3 <= in.size() && !(in[end] == 0 && in[end + 1] == 0 &&
+           (in[end + 2] == 1 || (end + 4 <= in.size() && in[end + 2] == 0 && in[end + 3] == 1)))) ++end;
+    if (end + 3 > in.size()) end = in.size();
+    std::size_t trimmed = end;
+    while (trimmed > header && in[trimmed - 1] == 0) --trimmed;
+    if (header < in.size()) {
+      const auto type = in[header] & 31;
+      if (type == 7 || type == 8) {
+        if ((in[header] & 0x80) || trimmed - header < 2 || trimmed - header > 1024) {
+          s.invalid_parameter = true;
+        } else if (type == 7) s.sps_data = in.subspan(header, trimmed - header);
+        else s.pps_data = in.subspan(header, trimmed - header);
+      }
+    }
+    i = end;
   }
   return s;
 }
@@ -57,6 +75,8 @@ NalScan scan_nals(std::span<const uint8_t> in) {
 H264Decoder::~H264Decoder() { close(); }
 
 bool H264Decoder::open(std::string& err) {
+  err.clear();
+  if (ctx_) close();
   const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
   if (!codec) {
     err = "h264 decoder not found";
@@ -99,6 +119,9 @@ void H264Decoder::close() {
   waiting_keyframe_ = true;
   saw_sps_ = false;
   saw_pps_ = false;
+  sps_.clear();
+  pps_.clear();
+  stats_.failure_streak = 0;
 }
 
 AVFrame* H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
@@ -122,11 +145,57 @@ AVFrame* H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
     return nullptr;
   }
 
-  // ---- 参考链状态机 ----
-  // 只在"等 IDR"期间扫 NAL：稳态下每帧扫一遍几十万字节是白烧 CPU，而稳态下
-  // 我们不需要知道这一包里有什么（参数集/分辨率变化由解码器自己处理）。
+  ++calls_;
+  const NalScan scan = scan_nals(data);
+  if (!scan.any) {
+    err = "packet is not Annex-B (no start code)";
+    ++stats_.errors; ++stats_.dropped; ++stats_.failure_streak;
+    return nullptr;
+  }
+  // Keep a bounded announcement only. FFmpeg owns syntax validation; these bytes
+  // are never used as trusted recovery extradata or replayed into a new context.
+  if (scan.invalid_parameter) {
+    ++stats_.rejected_parameters;
+    ++stats_.errors;
+    ++stats_.dropped;
+    ++stats_.failure_streak;
+    err = "invalid or oversized parameter NAL";
+    return nullptr;
+  }
+  auto observe = [](auto nal, auto& previous, auto& initial, auto& changes) {
+    if (nal.empty()) return;
+    if (previous.empty()) ++initial;
+    else if (!std::equal(nal.begin(), nal.end(), previous.begin(), previous.end())) ++changes;
+    previous.assign(nal.begin(), nal.end());
+  };
+  observe(scan.sps_data, sps_, stats_.sps_initial, stats_.sps_changes);
+  observe(scan.pps_data, pps_, stats_.pps_initial, stats_.pps_changes);
+  if (scan.sps || scan.pps) {
+    if (scan.vcl) ++stats_.inline_parameter_packets;
+    else ++stats_.parameter_packets;
+  }
+  // Recovery has one owner for cued and probe. Thirty real consecutive errors
+  // arm it; only an IDR with both bounded inline parameter NALs can attempt a
+  // fresh context. At most three attempts per object and 120 decode calls apart.
+  if (stats_.failure_streak >= 30 && scan.idr && !scan.sps_data.empty() &&
+      !scan.pps_data.empty() && stats_.recovery_rebuilds < 3 &&
+      (stats_.recovery_rebuilds == 0 || calls_ - last_recovery_call_ >= 120)) {
+    close();
+    ++stats_.recovery_rebuilds;
+    last_recovery_call_ = calls_;
+    stats_.failure_streak = 0;
+    if (!open(err)) { ++stats_.recovery_failures; return nullptr; }
+    sps_.assign(scan.sps_data.begin(), scan.sps_data.end());
+    pps_.assign(scan.pps_data.begin(), scan.pps_data.end());
+  }
+  stats_.recovery_exhausted = stats_.recovery_rebuilds >= 3;
+  struct FailureAccounting {
+    Stats& stats;
+    const std::string& err;
+    ~FailureAccounting() { if (!err.empty()) ++stats.failure_streak; }
+  } accounting{stats_, err};
+
   if (waiting_keyframe_) {
-    const NalScan scan = scan_nals(data);
     if (!scan.any) {
       // 没有起始码 = 不是 Annex-B（可能是 AVCC 长度前缀形态）。喂进去只会每帧换回
       // 一个 AVERROR_INVALIDDATA（实测 -1094995529），把真正的"缺参数集"淹掉。
@@ -164,6 +233,16 @@ AVFrame* H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
     }
   }
 
+  // Only a no-VCL packet is an access-unit fragment. Native H264 reads this
+  // flag per packet. VCL retains the strict complete-picture behavior: global
+  // CHUNKS would turn a damaged slice header into silent no-output.
+  struct RestoreFlags {
+    AVCodecContext* ctx;
+    int flags;
+    ~RestoreFlags() { ctx->flags2 = flags; }
+  } restore{ctx_, ctx_->flags2};
+  if (scan.vcl) ctx_->flags2 &= ~AV_CODEC_FLAG2_CHUNKS;
+  else ctx_->flags2 |= AV_CODEC_FLAG2_CHUNKS;
   av_packet_unref(pkt_);
   if (av_new_packet(pkt_, static_cast<int>(data.size())) < 0) {
     err = "av_new_packet failed";
@@ -191,6 +270,14 @@ AVFrame* H264Decoder::decode(std::span<const uint8_t> data, std::string& err) {
         return;
       }
       ++stats_.frames;
+      stats_.failure_streak = 0;
+      if (have_output_ && (stats_.output_width != frame_->width ||
+          stats_.output_height != frame_->height || stats_.output_format != frame_->format))
+        ++stats_.output_changes;
+      have_output_ = true;
+      stats_.output_width = frame_->width;
+      stats_.output_height = frame_->height;
+      stats_.output_format = frame_->format;
       // 低延迟模式下一次 send 通常只产出 0~1 帧；若产出多帧只保留最后一帧
       if (got) av_frame_unref(last_);
       av_frame_move_ref(last_, frame_);
@@ -244,6 +331,7 @@ void H264Decoder::flush() {
   //     SPS/PPS 的 IDR 到达（repeat-headers 打开时就在下一个 IDR）——能自愈。
   //   · 当成"参数集没了"：若解码器其实保留着，我们会空等一个可能永不重发的 SPS
   //     （关掉 repeat-headers 的产线就是这样）——永久冻屏，和这次要修的故障一模一样。
+  stats_.failure_streak = 0;
   ++stats_.flushes;
 }
 

@@ -20,6 +20,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 struct AVCodecContext;
 struct AVPacket;
@@ -70,6 +71,17 @@ class H264Decoder {
     // 其中"等 IDR/参数集"而主动丢掉的包。它不是解码失败，但同样是"这一包没进解码器"，
     // 所以也计入 dropped；分开记是因为处置完全不同（一个要查丢包，一个是设计行为）。
     uint64_t gated = 0;
+    // Annex-B announcements, not semantic validation or proof of activation.
+    uint64_t sps_initial = 0, pps_initial = 0;
+    uint64_t sps_changes = 0, pps_changes = 0;
+    uint64_t parameter_packets = 0, inline_parameter_packets = 0;
+    uint64_t rejected_parameters = 0;
+    // Successful AVFrame boundaries only; first output establishes gauges.
+    uint64_t output_changes = 0;
+    int output_width = 0, output_height = 0, output_format = -1;
+    uint64_t recovery_rebuilds = 0, recovery_failures = 0;
+    uint64_t failure_streak = 0;
+    bool recovery_exhausted = false;
   };
   const Stats& stats() const { return stats_; }
 
@@ -85,6 +97,10 @@ class H264Decoder {
   // （实测 -1094995529），而且**永不自愈**——只能等一个自带参数集的 IDR。
   bool saw_sps_ = false;
   bool saw_pps_ = false;
+  // One most recently announced NAL of each type, <=1024 bytes each. Never replayed.
+  std::vector<uint8_t> sps_, pps_;
+  uint64_t calls_ = 0, last_recovery_call_ = 0;
+  bool have_output_ = false;
 };
 
 }  // namespace cue::media
