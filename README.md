@@ -64,6 +64,8 @@ CI 分两层：常驻工作流串行跑SDL ON/OFF全构建与全CTest、AC-13静
 
 声明式 case：注入参数、prompt、期望根因、允许动作、SLA、预算。引擎按 case 起管线、注入故障、跑 agent、在 agent 结束后重新测量、按三重口径判分，产出 `runs/<run_id>/report.md` 与 `state.jsonl`（断点续跑用）。同一 run 有文件锁，并发 resume 不会双份计费。
 
+续跑指纹包含实际 Process 后端入口的路径与文件内容 SHA256：`cued`、显式 `--probe` 或 `cued` 同目录的 `cue-probe`，以及启用 producer 时的 `--capture`。入口按 `execv` 路径读取，不查 PATH；symlink 跟随目标，同路径、同大小、同 mtime 的内容替换也会使缓存失效。需要的入口缺失或不可读时，Engine 在复用缓存前通过 `fatal_error` 拒绝运行。C17 新身份规则可能使旧的非 manual 缓存一次失效；manual 指纹保持不变。HTTP、工具回放、manual 与纯 scripted 自检，以及 real 模式下全部因 manual_only 跳过的 suite，不读取未使用的本机入口；工具回放保留录制内容与生效采样策略的身份，endpoint 的存在性仍区分历史 HTTP/Process 采样策略，具体 URL 不参与工具回放身份。这个契约只覆盖入口文件，不覆盖 FFmpeg、解释器、动态库或远端服务等传递依赖，也不保证指纹计算到 `execv` 之间文件不能被替换。
+
 边界：`scripted` 模式是引擎自检，不判模型；`real` 模式默认回放 cassette，缺录制直接记 `run_error`，不会静默联网。
 
 ### 可观测（`src/eval` 的事件、`apps/cue-serve.cpp`、`web/console`）

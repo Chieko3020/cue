@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -1380,17 +1381,77 @@ std::unique_ptr<Producer> start_producer_if_needed(const RunConfig& cfg, const C
 
 std::string Engine::config_hash() const {
   return config_hash_with_manual_snapshot(cfg_.agent_mode == "manual"
-      ? cue::sha256_file(cfg_.manual_input) : std::string());
+      ? cue::sha256_file(cfg_.manual_input) : std::string()).value_or(std::string());
 }
 
-std::string Engine::config_hash_with_manual_snapshot(const std::string& hash) const {
+namespace {
+
+// Shared by launch configuration and fingerprinting. execv reads this exact path;
+// a bare filename is relative to cwd, never a PATH lookup.
+std::string resolved_probe_bin(const RunConfig& cfg) {
+  if (!cfg.probe_bin.empty()) return cfg.probe_bin;
+  if (cfg.cued_bin.empty()) return {};
+  const auto slash = cfg.cued_bin.find_last_of('/');
+  return (slash == std::string::npos ? std::string() : cfg.cued_bin.substr(0, slash + 1)) +
+         "cue-probe";
+}
+
+std::expected<std::string, std::string> entry_hash(const std::string& path,
+                                                 const char* role) {
+  // status follows symlinks. Reject directories/devices before opening them;
+  // sha256_file's iterator can throw on a read failure. Do not include arbitrary
+  // configured paths or exception text in this diagnostic.
+  const std::string error = std::string("process entry identity unreadable: ") + role;
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(std::filesystem::status(path, ec)) || ec)
+    return std::unexpected(error);
+  try {
+    auto hash = cue::sha256_file(path);
+    if (hash.empty()) return std::unexpected(error);
+    return hash;
+  } catch (const std::exception&) {
+    return std::unexpected(error);
+  }
+}
+
+}  // namespace
+
+std::expected<std::string, std::string> Engine::config_hash_with_manual_snapshot(
+    const std::string& hash, bool runnable_cases) const {
   if (cfg_.agent_mode == "manual") {
     // Offline grading has no backend/model/warmup configuration. Those ignored
     // defaults must not invalidate a resume of the exact same imported bytes.
     return cue::sha256_hex("manual|" + hash + "|evidence=c06-v1|aggregation=c05-v1");
   }
-  std::string cued_hash;
-  if (!cfg_.cued_bin.empty()) cued_hash = cue::sha256_file(cfg_.cued_bin);
+  const bool replay_tools = !cfg_.replay_tools_dir.empty();
+  const bool process_backend = !replay_tools && cfg_.endpoint.empty() &&
+                               (cfg_.agent_mode != "scripted" || !cfg_.record_tools_dir.empty());
+  const bool process = process_backend && runnable_cases;
+  std::string entries;
+  if (process) {
+    json identities = json::array();
+    auto add = [&identities](const std::string& path, const char* role)
+        -> std::expected<void, std::string> {
+      auto digest = entry_hash(path, role);
+      if (!digest) return std::unexpected(digest.error());
+      // POSIX paths are byte strings, not necessarily UTF-8. Hash their bytes
+      // before JSON serialization so valid paths remain distinct and readable.
+      identities.push_back(json{{"role", role}, {"path_sha256", cue::sha256_hex(path)},
+                                 {"sha256", *digest}});
+      return {};
+    };
+    if (auto result = add(cfg_.cued_bin, "cued"); !result)
+      return std::unexpected(result.error());
+    if (auto result = add(resolved_probe_bin(cfg_), "probe"); !result)
+      return std::unexpected(result.error());
+    if (!cfg_.producer.empty() && cfg_.producer != "none") {
+      if (auto result = add(cfg_.capture_bin, "capture"); !result)
+        return std::unexpected(result.error());
+    }
+    entries = "|process-entries=c17-v1:" + identities.dump();
+  } else if (process_backend) {
+    entries = "|process-entries=unused-no-runnable-cases";
+  }
   // max_yuan（成本闸门）不进指纹：它只是"跑多少"的护栏，不是被测配置。
   // 进指纹会让"闸门触发后续跑"因为换了闸门值而全量作废，与断点续跑语义冲突。
   //
@@ -1401,23 +1462,26 @@ std::string Engine::config_hash_with_manual_snapshot(const std::string& hash) co
     llm_hash = "|llm=" + cfg_.llm_mode;
     if (cfg_.llm_mode == "replay") llm_hash += "|cassette=" + cassette_dir_hash(cfg_.cassette_dir);
   }
-  // endpoint 非空时被测 SUT 换成了 HTTP 服务：不进指纹会让"同一 suite 换个端点"复用旧缓存
-  // （端点为空的旧指纹保持逐字节不变，续跑兼容）。
-  const std::string ep_hash = cfg_.endpoint.empty() ? std::string() : "|endpoint=" + cfg_.endpoint;
+  // Replay does not use the URL, but endpoint presence still selects the
+  // historical scripted sampling policy (Process stability reads vs HTTP).
+  // Retain that effective policy without changing old recording semantics.
+  const std::string ep_hash = replay_tools
+      ? (cfg_.endpoint.empty() ? "|replay_sampling=process" : "|replay_sampling=http")
+      : (cfg_.endpoint.empty() ? std::string() : "|endpoint=" + cfg_.endpoint);
   // AC-6：回放结果取决于录制内容，内容变了缓存必须失效；录制中（内容在变）不进指纹。
   const std::string tools_hash =
       cfg_.replay_tools_dir.empty() ? std::string()
                                     : "|replay_tools=" + cassette_dir_hash(cfg_.replay_tools_dir);
   // 产帧源（N-23）：换了源，同一 case 的 metrics 完全不同，缓存必须失效。
-  // 只在启用时进指纹——默认（none）的指纹必须与改动前逐字节一致，否则既有
-  // runs/ 的续跑缓存会整体作废。
+  // Only enabled producers affect the outcome. C17 deliberately invalidates old
+  // Process caches once to add the previously untracked entry identities.
   const std::string producer_hash =
       (cfg_.producer == "none" || cfg_.producer.empty())
           ? std::string()
           : "|producer=" + cfg_.producer + ":" + cfg_.producer_size + "@" +
                 std::to_string(cfg_.producer_bitrate);
   return cue::sha256_hex(cfg_.agent_mode + "|" + std::to_string(cfg_.repeat) + "|" + cfg_.model +
-                         "|" + cfg_.cued_bin + "|" + cued_hash + "|" +
+                         entries + "|" +
                          fmt_double(cfg_.yuan_per_mtok) + "|" + std::to_string(cfg_.warmup_s) +
                          llm_hash + ep_hash + tools_hash + producer_hash + "|aggregation=c05-v1|evidence=c06-v1");
 }
@@ -1425,17 +1489,7 @@ std::string Engine::config_hash_with_manual_snapshot(const std::string& hash) co
 PipelineConfig pipeline_config_for(const Case& c, const RunConfig& cfg, const std::string& run_dir) {
   PipelineConfig pc;
   pc.cued_bin = cfg.cued_bin;
-  // 探针默认跟着 cued 走：显式 --probe 优先，否则取 cued 同目录的 cue-probe。
-  // 只认 "./build/cue-probe" 这种写死路径的话，--cued build-final/cued 就会配错探针，
-  // 表现为 probe_unavailable——那不是"探针没实现"，是我们指错了二进制。
-  if (!cfg.probe_bin.empty()) {
-    pc.probe_bin = cfg.probe_bin;
-  } else if (!cfg.cued_bin.empty()) {
-    const auto slash = cfg.cued_bin.find_last_of('/');
-    pc.probe_bin = (slash == std::string::npos ? std::string()
-                                              : cfg.cued_bin.substr(0, slash + 1)) +
-                   "cue-probe";
-  }
+  pc.probe_bin = resolved_probe_bin(cfg);
   // 注入档位只来自 case：agent 必须自己从指标里发现故障，评测器不能替它"制造"结论
   pc.inject_drop = (c.fault_kind == "drop") ? c.fault_value : 0.0;
   pc.inject_ingress_drop = (c.fault_kind == "ingress_drop") ? c.fault_value : 0.0;
@@ -2874,7 +2928,16 @@ void Engine::run_cases(const std::vector<Case>& cases, RunReport& r) {
     r.manual_input_sha256 = imported.sha256;
   }
   // 基线指纹只算一次：suite 哈希 + git describe 不该按 case 重复做（review-eval.md #23）
-  const std::string base = base_fingerprint(cfg_.suite_path, config_hash_with_manual_snapshot(imported.sha256));
+  // real-mode manual_only cases are skipped before any backend is started.
+  // Preserve that report-only path even when local Process entries are absent.
+  const bool runnable_cases = cfg_.agent_mode != "real" ||
+      std::any_of(cases.begin(), cases.end(), [](const Case& c) { return !c.manual_only; });
+  const auto config = config_hash_with_manual_snapshot(imported.sha256, runnable_cases);
+  if (!config) {
+    r.fatal_error = config.error();
+    return;
+  }
+  const std::string base = base_fingerprint(cfg_.suite_path, *config);
   r.fingerprint = base;
 
   const std::string run_dir = cfg_.out_dir + "/" + r.run_id;

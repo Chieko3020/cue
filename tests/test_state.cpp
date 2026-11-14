@@ -1,10 +1,15 @@
 // M4b 测试：指纹 / state.jsonl 断点续跑 / 并发锁 / 回归对比 / real 模式配置推导 /
 // suite schema（畸形输入必须返回错误，不能 SIGABRT）
 #include <cstdio>
+#include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "cue/common/sha256.h"
 #include "cue/eval/eval.h"
@@ -17,6 +22,56 @@ namespace fs = std::filesystem;
 namespace {
 
 int failures = 0;
+volatile std::sig_atomic_t fixture_stop = 0;
+void stop_fixture(int) { fixture_stop = 1; }
+
+// Invoked by tiny, replaceable shebang entry files. The interpreter is this test
+// binary, already part of base_fingerprint; no Python/shell/FFmpeg dependency.
+int run_entry_fixture(const std::string& entry) {
+  std::signal(SIGTERM, stop_fixture);
+  std::signal(SIGINT, stop_fixture);
+  const auto role = fs::path(entry).filename().string();
+  const bool cued = role == "cued";
+  const bool capture = role == "capture";
+  int listener = -1, peer = -1;
+  const auto directory = fs::path("/tmp/cue") / std::to_string(::getpid());
+  if (cued) {
+    fs::create_directories(directory);
+    listener = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const auto path = (directory / "control.sock").string();
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    if (listener < 0 || ::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ||
+        ::listen(listener, 1)) return 2;
+  }
+  const nlohmann::json metrics{{"fps", 30}, {"frames_in", 99}, {"frames_out", 99},
+                               {"injected", 0}, {"dropped", 0}};
+  while (!fixture_stop) {
+    if (cued) {
+      if (peer < 0) peer = ::accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+      char buffer[65536];
+      const auto n = peer < 0 ? -1 : ::recv(peer, buffer, sizeof(buffer), MSG_DONTWAIT);
+      if (n > 0) {
+        const auto request = nlohmann::json::parse(buffer, buffer + n, nullptr, false);
+        if (!request.is_object()) return 3;
+        const auto result = request.value("op", std::string()) == "metrics.query"
+                                ? metrics : nlohmann::json::object();
+        const auto reply = nlohmann::json{{"id", request.at("id")}, {"ok", true},
+                                          {"result", result}}.dump();
+        if (::send(peer, reply.data(), reply.size(), MSG_NOSIGNAL) < 0) break;
+      }
+      std::printf("METRICS %s\n", metrics.dump().c_str());
+    } else if (!capture) {
+      std::puts("[cue-event] {\"ev\":\"probe.metric\",\"data\":{\"fps\":30,\"frames\":99,\"decoded\":99,\"synced\":true}}");
+    }
+    std::fflush(stdout);
+    ::usleep(20000);
+  }
+  if (peer >= 0) ::close(peer);
+  if (listener >= 0) { ::close(listener); fs::remove_all(directory); }
+  return 0;
+}
 void check(bool cond, const char* what) {
   if (!cond) {
     std::printf("FAIL: %s\n", what);
@@ -103,8 +158,9 @@ bool rejected(const fs::path& path, const nlohmann::json& suite) {
 
 }  // namespace
 
-int main() {
-  const fs::path tmp = fs::temp_directory_path() / "cue-test-state";
+int main(int argc, char** argv) {
+  if (argc > 2 && std::string(argv[1]) == "--c17-fixture") return run_entry_fixture(argv[2]);
+  const fs::path tmp = fs::temp_directory_path() / ("cue-test-state-" + std::to_string(::getpid()));
   std::error_code ec;
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp, ec);
@@ -358,7 +414,254 @@ int main() {
     }
   }
 
-  fs::remove_all(tmp, ec);
+  // C17: actual entry bytes, including default probe resolution, drive Engine/state resume.
+  {
+    const auto entries = tmp / "entries";
+    fs::create_directories(entries);
+    eval::RunConfig cfg;
+    cfg.agent_mode = "real";
+    cfg.out_dir = (tmp / "identity-runs").string();
+    cfg.suite_path = (tmp / "identity-suite.json").string();
+    cfg.cued_bin = (entries / "cued").string();
+    cfg.capture_bin = (entries / "capture").string();
+    const auto probe = entries / "cue-probe";
+    const auto explicit_probe = entries / "explicit-probe";
+    write_text(cfg.suite_path, "suite bytes");
+    write_text(cfg.cued_bin, "cued-v1");
+    write_text(probe.string(), "probe-1");
+    write_text(explicit_probe.string(), "other-1");
+    write_text(cfg.capture_bin, "capture-1");
+    auto hash = [](const eval::RunConfig& config) { return eval::Engine(config).config_hash(); };
+    const auto initial = hash(cfg);
+    check(!initial.empty() && initial == hash(cfg), "C17 unchanged entry identity is stable");
+    check(eval::pipeline_config_for(make_case("default"), cfg, "").probe_bin == probe.string(),
+          "C17 launch and hash use the same default sibling probe");
+    const auto stamp = fs::last_write_time(probe);
+    write_text(probe.string(), "probe-2");
+    fs::last_write_time(probe, stamp);
+    check(initial != hash(cfg), "C17 default probe same size/mtime byte replacement invalidates");
+    write_text(probe.string(), "probe-1");
+    check(initial == hash(cfg), "C17 identical bytes ignore mtime");
+    write_text(cfg.cued_bin, "cued-v2");
+    check(initial != hash(cfg), "C17 cued entry bytes remain part of identity");
+    write_text(cfg.cued_bin, "cued-v1");
+    const auto old_cwd = fs::current_path();
+    fs::current_path(entries);
+    auto bare = cfg;
+    bare.cued_bin = "cued";
+    check(eval::pipeline_config_for(make_case("bare"), bare, "").probe_bin == "cue-probe" &&
+              !hash(bare).empty(), "C17 bare execv paths resolve in cwd without PATH lookup");
+    fs::current_path(old_cwd);
+    cfg.probe_bin = explicit_probe.string();
+    const auto explicit_hash = hash(cfg);
+    const auto same_bytes_path = entries / "same-probe";
+    write_text(same_bytes_path.string(), "other-1");
+    auto moved = cfg;
+    moved.probe_bin = same_bytes_path.string();
+    check(explicit_hash != hash(moved), "C17 equal bytes at a different entry path invalidate");
+    const auto bytepath_a = entries / (std::string("probe-") + char(0xff));
+    const auto bytepath_b = entries / (std::string("probe-") + char(0xfe));
+    write_text(bytepath_a.string(), "other-1");
+    write_text(bytepath_b.string(), "other-1");
+    moved.probe_bin = bytepath_a.string();
+    const auto bytepath_hash = hash(moved);
+    moved.probe_bin = bytepath_b.string();
+    check(!bytepath_hash.empty() && bytepath_hash != hash(moved),
+          "C17 distinct non-UTF8 path bytes serialize losslessly without exceptions");
+    check(eval::pipeline_config_for(make_case("identity"), cfg, "").probe_bin == cfg.probe_bin,
+          "C17 launch honors explicit probe override");
+    write_text(explicit_probe.string(), "other-2");
+    check(explicit_hash != hash(cfg), "C17 explicit probe bytes invalidate");
+    write_text(probe.string(), "unused!");
+    const auto explicit_changed = hash(cfg);
+    write_text(probe.string(), "ignored");
+    check(explicit_changed == hash(cfg), "C17 overridden default probe is unused");
+    const auto disabled = hash(cfg);
+    write_text(cfg.capture_bin, "capture-2");
+    check(disabled == hash(cfg), "C17 producer none ignores capture bytes");
+    cfg.producer = "lavfi";
+    const auto enabled = hash(cfg);
+    write_text(cfg.capture_bin, "capture-3");
+    check(enabled != hash(cfg), "C17 enabled capture bytes invalidate");
+    const auto target = entries / "probe-target";
+    write_text(target.string(), "target-1");
+    fs::remove(explicit_probe);
+    fs::create_symlink(target, explicit_probe);
+    const auto symlink_hash = hash(cfg);
+    const auto replacement = entries / "replacement";
+    write_text(replacement.string(), "target-2");
+    fs::rename(replacement, target);
+    check(symlink_hash != hash(cfg), "C17 symlink target bytes invalidate");
+
+    // Controlled executable fixtures exercise the real Process backend. They emit
+    // synthetic metrics only: this is not media/device or model acceptance.
+    const std::string cued_fixture = "#!" + fs::read_symlink("/proc/self/exe").string() +
+                                    " --c17-fixture\n# version-1\n";
+    const std::string probe_fixture = cued_fixture;
+    const std::string capture_fixture = cued_fixture;
+    auto executable = [](const std::string& path, const std::string& bytes) {
+      check(write_text(path, bytes), "C17 write executable fixture");
+      fs::permissions(path, fs::perms::owner_all);
+    };
+    auto version2 = [](std::string bytes) {
+      bytes.replace(bytes.find("version-1"), 9, "version-2");
+      return bytes;
+    };
+    executable(cfg.cued_bin, cued_fixture);
+    executable(target.string(), probe_fixture);
+    executable(cfg.capture_bin, capture_fixture);
+    fs::remove(bytepath_a);
+    fs::create_symlink(target, bytepath_a);
+    cfg.probe_bin = bytepath_a.string();
+    cfg.agent_mode = "scripted";
+    cfg.record_tools_dir = (tmp / "process-recordings").string();
+    cfg.sla_settle_ms = 0;
+
+    // Successful Engine outcomes really pass through append/load/reuse. File length proves
+    // reuse without relying on a private cache helper or a claimed fingerprint alone.
+    eval::Case c;
+    c.id = "identity";
+    c.fault_kind = "none";
+    c.expect_root_cause = "network_loss";
+    c.evidence_candidates = {"fps"};
+    c.sla_fps_min = 1;
+    cfg.producer = "none";
+    const auto first = eval::Engine(cfg).run({c});
+    check(first.fatal_error.empty() && first.cases.size() == 1 && first.cases[0].score.all(),
+          "C17 Engine creates successful Process cache with non-UTF8 entry path");
+    cfg.resume_run_id = first.run_id;
+    const auto state = fs::path(cfg.out_dir) / first.run_id / "state.jsonl";
+    const auto size = fs::file_size(state);
+    const auto resumed = eval::Engine(cfg).run({c});
+    check(resumed.fatal_error.empty() && resumed.executed == 1 && fs::file_size(state) == size,
+          "C17 unchanged Engine resume reuses successful case without append");
+    auto gated_cfg = cfg;
+    gated_cfg.max_yuan = 0.001;
+    const auto gated = eval::Engine(gated_cfg).run({c});
+    check(gated.fatal_error.empty() && gated.gated && gated.fingerprint == first.fingerprint &&
+              fs::file_size(state) == size, "C17 lowered cost gate still applies to reused outcomes");
+    const auto runtime_stamp = fs::last_write_time(target);
+    executable(target.string(), version2(probe_fixture));
+    fs::last_write_time(target, runtime_stamp);
+    const auto changed = eval::Engine(cfg).run({c});
+    check(changed.fatal_error.empty() && changed.cases.size() == 1 && changed.cases[0].score.all() &&
+              changed.fingerprint != first.fingerprint &&
+              fs::file_size(state) > size, "C17 probe replacement reruns Engine cached case");
+    cfg.producer = "lavfi";
+    const auto capture_first = eval::Engine(cfg).run({c});
+    const auto capture_size = fs::file_size(state);
+    executable(cfg.capture_bin, version2(capture_fixture));
+    const auto capture_next = eval::Engine(cfg).run({c});
+    check(capture_first.fatal_error.empty() && capture_first.cases.size() == 1 &&
+              capture_first.cases[0].score.all() && capture_next.fatal_error.empty() &&
+              capture_next.cases.size() == 1 && capture_next.cases[0].score.all() &&
+              capture_first.fingerprint != capture_next.fingerprint && fs::file_size(state) > capture_size,
+          "C17 capture replacement reruns Engine cached case");
+    const auto valid_size = fs::file_size(state);
+    fs::remove(target);
+    const auto missing = eval::Engine(cfg).run({c});
+    check(missing.fatal_error == "process entry identity unreadable: probe" &&
+              missing.executed == 0 && fs::file_size(state) == valid_size,
+          "C17 missing required probe rejects successful cache before reuse/write");
+    fs::create_directory(target);
+    const auto directory = eval::Engine(cfg).run({c});
+    check(!directory.fatal_error.empty() && directory.executed == 0 && fs::file_size(state) == valid_size,
+          "C17 directory required probe rejects successful cache before reuse/write");
+    fs::remove(target);
+    executable(target.string(), version2(probe_fixture));
+    fs::permissions(target, fs::perms::none);
+    const auto unreadable = eval::Engine(cfg).run({c});
+    check(!unreadable.fatal_error.empty() && unreadable.executed == 0 &&
+              fs::file_size(state) == valid_size,
+          "C17 permission-denied probe refuses successful cache before reuse/write");
+    fs::permissions(target, fs::perms::owner_all);
+    for (const auto& required : {cfg.cued_bin, cfg.capture_bin}) {
+      const auto saved = required + ".saved";
+      fs::rename(required, saved);
+      const auto absent = eval::Engine(cfg).run({c});
+      check(!absent.fatal_error.empty() && absent.executed == 0 && fs::file_size(state) == valid_size,
+            "C17 missing cued/capture also refuses successful cache");
+      fs::rename(saved, required);
+    }
+    auto playback = cfg;
+    playback.producer = "none";
+    playback.record_tools_dir.clear();
+    playback.replay_tools_dir = cfg.record_tools_dir;
+    playback.resume_run_id.clear();
+    const auto replay_case = eval::Engine(playback).run({c});
+    playback.cued_bin = "/missing-cued";
+    playback.probe_bin = "/missing-probe";
+    playback.capture_bin = "/missing-capture";
+    const auto replay_with_endpoint = eval::Engine(playback).run({c});
+    check(replay_case.fatal_error.empty() && replay_case.cases.size() == 1 &&
+              replay_case.cases[0].score.all() && replay_case.cases[0].tool_misses == 0 &&
+              replay_with_endpoint.fatal_error.empty() && replay_with_endpoint.cases.size() == 1 &&
+              replay_with_endpoint.cases[0].score.all() && replay_with_endpoint.cases[0].tool_misses == 0 &&
+              replay_case.fingerprint == replay_with_endpoint.fingerprint,
+          "C17 actual recorded Engine replay ignores unused local entry paths");
+    cfg.producer = "none";
+    const auto uncapped = hash(cfg);
+    cfg.max_yuan = 0.001;
+    cfg.out_dir += "-other";
+    check(uncapped == hash(cfg), "C17 cost gate and output directory remain outside identity");
+    cfg.endpoint = "http://127.0.0.1:1";
+    const auto http = hash(cfg);
+    auto http_config = cfg;
+    http_config.resume_run_id.clear();
+    check(!http.empty() && eval::Engine(http_config).run({}).fatal_error.empty(),
+          "C17 HTTP fingerprint/run needs no Process entries");
+    write_text(cfg.cued_bin, "cued-v2");
+    write_text(target.string(), "target-4");
+    fs::remove(cfg.capture_bin);
+    check(http == hash(cfg), "C17 HTTP ignores all local entry contents and missing capture");
+    const auto recordings = tmp / "identity-recordings";
+    fs::create_directory(recordings);
+    write_text((recordings / "identity.jsonl").string(), "record-1");
+    cfg.replay_tools_dir = recordings.string();
+    const auto replay = hash(cfg);
+    cfg.endpoint = "http://127.0.0.1:2";
+    cfg.cued_bin = "/missing-cued";
+    cfg.probe_bin = "/missing-probe";
+    cfg.capture_bin = "/missing-capture";
+    check(replay == hash(cfg), "C17 tools replay precedence ignores endpoint and local entries");
+    const auto replay_http_policy = hash(cfg);
+    cfg.endpoint.clear();
+    check(replay_http_policy != hash(cfg), "C17 replay retains effective HTTP/Process sampling policy");
+    cfg.endpoint = "http://127.0.0.1:2";
+    write_text((recordings / "identity.jsonl").string(), "record-2");
+    check(replay != hash(cfg), "C17 tools recording bytes still invalidate");
+    cfg.agent_mode = "real";
+    cfg.llm_mode = "replay";
+    cfg.cassette_dir = recordings.string();
+    const auto cassette = hash(cfg);
+    write_text((recordings / "llm.jsonl").string(), "cassette-1");
+    check(cassette != hash(cfg), "C17 real LLM cassette contents remain part of identity");
+    cfg.agent_mode = "scripted";
+    cfg.replay_tools_dir.clear();
+    cfg.record_tools_dir.clear();
+    cfg.endpoint.clear();
+    cfg.resume_run_id.clear();
+    const auto selftest = eval::Engine(cfg).run({c});
+    check(selftest.fatal_error.empty() && selftest.executed == 1 && selftest.cases[0].score.all(),
+          "C17 plain scripted selftest uses no local executable identities");
+    cfg.agent_mode = "real";
+    cfg.producer = "none";
+    auto skipped_case = c;
+    skipped_case.manual_only = true;
+    const auto skipped = eval::Engine(cfg).run({skipped_case});
+    check(skipped.fatal_error.empty() && skipped.executed == 0 && skipped.cases.empty() &&
+              !skipped.run_notes.empty(), "C17 all-manual-only real suite skips without unused entries");
+    check(hash(cfg).empty(), "C17 public config-only hash still assumes runnable real cases");
+    cfg.resume_run_id = skipped.run_id;
+    const auto skip_state = fs::path(cfg.out_dir) / skipped.run_id / "state.jsonl";
+    const auto skip_size = fs::file_size(skip_state);
+    auto runnable_case = c;
+    runnable_case.id = "runnable";
+    const auto mixed = eval::Engine(cfg).run({skipped_case, runnable_case});
+    check(!mixed.fatal_error.empty() && mixed.executed == 0 && fs::file_size(skip_state) == skip_size,
+          "C17 mixed real suite still rejects required missing entry before resume/write");
+  }
+
   // C05: persistence retains raw scores; eligibility is derived on read.
   {
     auto raw = make_outcome("excluded", true, true, true);
@@ -380,6 +683,7 @@ int main() {
           "C05 reloaded cached outcome keeps denominator exclusion");
   }
 
+  fs::remove_all(tmp, ec);
   if (failures == 0) {
     std::printf("test_state: OK\n");
     return 0;

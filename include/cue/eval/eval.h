@@ -572,8 +572,11 @@ class Engine {
   // 终端摘要（FR-EVAL.10）：纯函数，输入 RunReport 输出约 10-15 行文本。
   // 纯函数的意义是可快照测试——不能靠"跑一次看看"验证摘要字段。
   std::string render_terminal_summary(const RunReport& r) const;
-  // 生效配置指纹：模式/repeat/成本闸门/模型/cued 二进制内容。
-  // 不含它时「换 SUT、换 model、换 mode」指纹相同，续跑会跨配置复用缓存（实测）。
+  // Effective configuration and used Process entry identities; excludes cost gate.
+  // Empty on unreadable required entry. run() reports that error through fatal_error
+  // before reading/reusing state. HTTP/replay/manual/selftest ignore unused entries.
+  // This config-only API assumes runnable cases; run() can also omit Process
+  // entries when every real-mode case is manual_only and will be skipped.
   std::string config_hash() const;
 
  private:
@@ -583,7 +586,8 @@ class Engine {
   CaseOutcome run_scripted_case_pipeline(const Case& c) const;
   CaseOutcome run_real_case(const Case& c) const;
   void run_real_case_impl(const Case& c, CaseOutcome& o) const;
-  std::string config_hash_with_manual_snapshot(const std::string& hash) const;
+  std::expected<std::string, std::string> config_hash_with_manual_snapshot(
+      const std::string& hash, bool runnable_cases = true) const;
   void run_cases(const std::vector<Case>& cases, RunReport& r);
   bool cancelled() const;
 
