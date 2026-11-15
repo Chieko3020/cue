@@ -7,6 +7,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -176,6 +177,187 @@ int main() {
       unlink(path);
       unlink((std::string(path) + ".lock").c_str());
     }
+  }
+
+  // C19: actual Runner uses the same live verify factory configured by Engine::real.
+  // Controlled handlers and ScriptedClient, not a full Engine/media/model acceptance run.
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    auto c = make_case();
+    c.allowed_actions = {"pipeline_set_param"};
+    c.sla_frame_completion_min = 0.9;
+    c.sla_stalls_max = 2;
+    auto m = good_metrics();
+    m.frames_in = 100;
+    m.frames_out = scenario == 1 ? 89 : 100;
+    m.probe.samples = 1;
+    m.probe.stalls = scenario == 0 ? 3 : 2;
+    cue::tool::Registry reg;
+    reg.add({.name = "query_metrics", .desc = "C19", .risk = cue::tool::Risk::ReadOnly,
+             .params = {}}, [](const auto&) { return cue::tool::ToolResult{"injected=59"}; });
+    reg.add({.name = "pipeline_set_param", .desc = "C19", .risk = cue::tool::Risk::Mutating,
+             .params = {}}, [](const auto&) { return cue::tool::ToolResult{"changed"}; });
+    struct RecordingClient : cue::llm::ScriptedClient {
+      std::vector<cue::llm::ChatRequest> requests;
+      std::expected<cue::llm::ChatResponse, std::string> chat(const cue::llm::ChatRequest& r) override {
+        requests.push_back(r);
+        return ScriptedClient::chat(r);
+      }
+    } client;
+    auto push = [&](const std::string& name, const nlohmann::json& args) {
+      cue::llm::ChatResponse response;
+      response.tool_calls.push_back({.id = std::to_string(client.remaining()),
+                                     .name = name, .arguments = args.dump()});
+      client.push(std::move(response));
+    };
+    push("query_metrics", nlohmann::json::object());
+    push("stage_complete", {{"next", "diagnose"}});
+    push("stage_complete", {{"next", "repair"}, {"root_cause", "network_loss"},
+                            {"evidence", {"injected=59"}}, {"confidence", 0.8}});
+    push("pipeline_set_param", nlohmann::json::object());
+    push("stage_complete", {{"next", "verify"}});
+    push("stage_complete", {{"next", "done"}});
+    agent::Runner::Config cfg;
+    cfg.model = "scripted";
+    cfg.ctx = eval::real_agent_call_context(c);
+    int server_reads = 0, probe_reads = 0, measured = 0;
+    cfg.verify_sla = eval::make_real_sla_verifier(c,
+        [&] { ++server_reads; return m; }, [&] { ++probe_reads; return m.probe; });
+    bool measured_pass = false;
+    std::string reason;
+    agent::Budget budget;
+    budget.max_turns = 7;
+    agent::Runner runner(client, reg, cfg);
+    const auto result = runner.run("C19 SLA verify", budget, [&](const agent::Event& e) {
+      if (e.type == "verify.measured") { ++measured; measured_pass = e.data.value("pass", false); }
+      if (e.type == "guard.reject") reason = e.data.value("reason", "");
+    });
+    const bool expected = scenario == 2;
+    const auto judged = eval::judge_case(c, good_result(), make_obs(), m);
+    std::printf("C19 scenario=%d measured=%d done=%d final_sla=%d\n", scenario,
+                measured_pass, result.final_stage == agent::Stage::Done, judged.sla);
+    check(judged.sla == expected, "C19 final judge rejects isolated stalls/ratio failure");
+    check(measured == 1 && measured_pass == expected, "C19 actual Runner measured result");
+    check((result.final_stage == agent::Stage::Done) == expected,
+          "C19 actual Runner done requires full SLA");
+    check(server_reads == 1 && probe_reads == (scenario == 1 ? 0 : 1),
+          "C19 live reads probe only after server criteria pass");
+    if (expected) {
+      auto later = m;
+      later.probe.stalls = 3;
+      check(!eval::judge_case(c, result, make_obs(), later).sla,
+            "C19 later independent post window may degrade after a successful verify");
+    }
+    if (!expected) {
+      check(reason.find("实测未达标") != std::string::npos, "C19 actual stage refusal text");
+      bool reply = false;
+      for (const auto& request : client.requests) for (const auto& message : request.messages) {
+        if (message.role == "tool" && message.content.find("实测未达标") != std::string::npos)
+          reply = true;
+      }
+      check(reply, "C19 model receives measured refusal tool reply");
+    }
+  }
+
+  // Shared predicate table: exact inclusive boundaries and each independent failure.
+  {
+    eval::Case all;
+    all.sla_fps_min = 25;
+    all.sla_dropped_max = 5;
+    all.sla_frame_completion_min = 0.9;
+    all.sla_lat_p50_ms = 10;
+    all.sla_lat_p99_ms = 20;
+    all.sla_max_stall_ms = 30;
+    all.sla_stalls_max = 2;
+    eval::Metrics edge;
+    edge.samples = 1;
+    edge.fps = 25;
+    edge.dropped = 5;
+    edge.frames_in = 100;
+    edge.frames_out = 90;
+    edge.probe.samples = 1;
+    edge.probe.e2e.p50 = 10;
+    edge.probe.e2e.p99 = 20;
+    edge.probe.max_stall_ms = 30;
+    edge.probe.stalls = 2;
+    int rows = 0;
+    auto row = [&](const char* name, const eval::Case& c, const eval::Metrics& m, bool expected) {
+      ++rows;
+      int server_reads = 0, probe_reads = 0;
+      const auto verify = eval::make_real_sla_verifier(c,
+          [&] { ++server_reads; return m; }, [&] { ++probe_reads; return m.probe; });
+      const bool live = verify({});
+      const bool final = eval::judge_case(c, good_result(), make_obs(), m).sla;
+      if (live != expected || final != expected || eval::sla_satisfied(c, m) != expected)
+        std::printf("C19 table row failed: %s\n", name);
+      check(live == expected && final == expected && eval::sla_satisfied(c, m) == expected,
+            "C19 shared SLA table live/final/expected agreement");
+      check(server_reads == 1 && probe_reads <= 1, "C19 conditional single probe read");
+      const bool probe_required = eval::has_value(c.sla_lat_p50_ms) ||
+          eval::has_value(c.sla_lat_p99_ms) || eval::has_value(c.sla_max_stall_ms) ||
+          c.sla_stalls_max != UINT64_MAX;
+      if (!probe_required) check(probe_reads == 0, "C19 no E2E threshold never consumes probe");
+    };
+    row("all inclusive boundaries", all, edge, true);
+    auto bad = edge; bad.fps = 24; row("fps only", all, bad, false);
+    bad = edge; bad.dropped = 6; row("dropped only", all, bad, false);
+    bad = edge; bad.frames_out = 89; row("ratio only", all, bad, false);
+    bad = edge; bad.probe.e2e.p50 = 11; row("p50 only", all, bad, false);
+    bad = edge; bad.probe.e2e.p99 = 21; row("p99 only", all, bad, false);
+    bad = edge; bad.probe.max_stall_ms = 31; row("max stall only", all, bad, false);
+    bad = edge; bad.probe.stalls = 3; row("stalls only", all, bad, false);
+    bad = edge; bad.samples = 0; row("no server samples", all, bad, false);
+    bad = edge; bad.frames_in = 0; row("zero frame denominator", all, bad, false);
+    bad = edge; bad.probe.samples = 0; row("numeric probe without samples", all, bad, false);
+    for (double value : {eval::kNoValue, std::numeric_limits<double>::infinity(),
+                         -std::numeric_limits<double>::infinity()}) {
+      bad = edge; bad.fps = value; row("nonfinite fps", all, bad, false);
+      bad = edge; bad.probe.e2e.p50 = value; row("nonfinite p50", all, bad, false);
+      bad = edge; bad.probe.e2e.p99 = value; row("nonfinite p99", all, bad, false);
+      bad = edge; bad.probe.max_stall_ms = value; row("nonfinite max stall", all, bad, false);
+    }
+    for (int field = 0; field < 4; ++field) {
+      eval::Case only;
+      if (field == 0) only.sla_lat_p50_ms = 10;
+      if (field == 1) only.sla_lat_p99_ms = 20;
+      if (field == 2) only.sla_max_stall_ms = 30;
+      if (field == 3) only.sla_stalls_max = 2;
+      bad = edge; bad.probe.samples = 0;
+      row("each E2E declaration needs its own probe samples", only, bad, false);
+    }
+    eval::Case disabled;
+    bad = {}; bad.samples = 1; bad.fps = eval::kNoValue;
+    row("no SLA / disabled fields", disabled, bad, true);
+    bad.samples = 0; row("no SLA still needs server samples", disabled, bad, false);
+    disabled.sla_fps_min = -1;
+    row("negative fps threshold disabled", disabled, edge, true);
+    auto server_only = all;
+    server_only.sla_lat_p50_ms = server_only.sla_lat_p99_ms = server_only.sla_max_stall_ms = eval::kNoValue;
+    server_only.sla_stalls_max = UINT64_MAX;
+    bad = edge; bad.probe = {};
+    row("server-only SLA needs no probe", server_only, bad, true);
+
+    // The production adapters carry counters and units from the shared observation PODs.
+    cue::pipeline::PipelineMetrics raw;
+    raw.samples = 1; raw.fps = 25; raw.frames_in = 100; raw.frames_out = 90; raw.dropped = 5;
+    cue::pipeline::ProbeMetrics probe;
+    probe.samples = 1; probe.stalls = 2; probe.max_stall_us = 30000;
+    probe.lat_p50_ms = 10; probe.lat_p99_ms = 20;
+    auto normalized = eval::sla_server_snapshot(raw);
+    normalized.probe = eval::sla_probe_snapshot(probe);
+    check(normalized.frames_in == 100 && normalized.frames_out == 90 && normalized.dropped == 5 &&
+          normalized.probe.stalls == 2 && normalized.probe.max_stall_ms == 30 &&
+          normalized.probe.e2e.p50 == 10 && normalized.probe.e2e.p99 == 20,
+          "C19 production adapters preserve real counters and convert us to ms once");
+    row("production normalized boundary", all, normalized, true);
+    probe.max_stall_us = 30001;
+    normalized.probe = eval::sla_probe_snapshot(probe);
+    row("production adapter over boundary by one us", all, normalized, false);
+    probe.samples = 0;
+    normalized.probe = eval::sla_probe_snapshot(probe);
+    check(!eval::has_value(normalized.probe.max_stall_ms) &&
+          !eval::has_value(normalized.probe.e2e.p50), "C19 absent probe never normalized to zero");
+    row("production adapter no probe samples", all, normalized, false);
+    std::printf("C19 shared SLA table rows=%d\n", rows);
   }
 
   // 1) 全对

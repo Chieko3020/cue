@@ -618,6 +618,49 @@ bool evidence_hits_candidates(const std::string& evidence, const std::vector<Obs
 
 }  // namespace
 
+namespace {
+bool sla_requires_probe(const Case& c) {
+  return has_value(c.sla_lat_p99_ms) || has_value(c.sla_lat_p50_ms) ||
+         has_value(c.sla_max_stall_ms) || c.sla_stalls_max != UINT64_MAX;
+}
+
+bool server_sla_satisfied(const Case& c, const Metrics& m) {
+  if (m.samples == 0) return false;
+  if (c.sla_fps_min > 0 && (!std::isfinite(m.fps) || m.fps < c.sla_fps_min)) return false;
+  if (c.sla_frame_completion_min > 0 &&
+      (m.frames_in == 0 || double(m.frames_out) / double(m.frames_in) < c.sla_frame_completion_min)) {
+    return false;
+  }
+  return m.dropped <= c.sla_dropped_max;
+}
+}  // namespace
+
+bool sla_satisfied(const Case& c, const Metrics& m) {
+  if (!server_sla_satisfied(c, m)) return false;
+  if (!sla_requires_probe(c)) return true;
+  if (m.probe.samples == 0) return false;
+  // Keep has_value's global NaN sentinel semantics; finite checks belong to this predicate.
+  const auto ceiling = [](double measured, double limit) {
+    return !has_value(limit) ||
+           (std::isfinite(limit) && std::isfinite(measured) && measured <= limit);
+  };
+  return ceiling(m.probe.e2e.p99, c.sla_lat_p99_ms) &&
+         ceiling(m.probe.e2e.p50, c.sla_lat_p50_ms) &&
+         ceiling(m.probe.max_stall_ms, c.sla_max_stall_ms) &&
+         m.probe.stalls <= c.sla_stalls_max;
+}
+
+std::function<bool(const agent::Diagnosis&)> make_real_sla_verifier(
+    const Case& c, std::function<Metrics()> server, std::function<ProbeSummary()> probe) {
+  return [c, server = std::move(server), probe = std::move(probe)](const agent::Diagnosis&) {
+    auto m = server();
+    // Preserve early rejection before consuming probe reads; counters are current-epoch totals.
+    if (!server_sla_satisfied(c, m)) return false;
+    if (sla_requires_probe(c)) m.probe = probe();
+    return sla_satisfied(c, m);
+  };
+}
+
 Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<Observation>& obs,
                  const Metrics& m) {
   Score s;
@@ -644,33 +687,7 @@ Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<O
     }
   }
 
-  s.sla = true;
-  if (c.sla_fps_min > 0 && m.fps < c.sla_fps_min) s.sla = false;
-  if (c.sla_frame_completion_min > 0 && m.frames_in > 0) {
-    const double ratio = double(m.frames_out) / double(m.frames_in);
-    if (ratio < c.sla_frame_completion_min) s.sla = false;
-  }
-  if (m.dropped > c.sla_dropped_max) s.sla = false;
-  // 没有采样 = 无法证明达成，按不达标处理
-  if (m.samples == 0) s.sla = false;
-
-  // 端到端阈值：判据只有 probe 的样本。探针不在（samples=0）时一律不达标——
-  // 「cued 的 fps 正常」不能证明端到端时延达标，用服务端自报顶替就是假绿灯。
-  if (has_value(c.sla_lat_p99_ms)) {
-    if (!has_value(m.probe.e2e.p99) || m.probe.e2e.p99 > c.sla_lat_p99_ms) s.sla = false;
-  }
-  if (has_value(c.sla_lat_p50_ms)) {
-    if (!has_value(m.probe.e2e.p50) || m.probe.e2e.p50 > c.sla_lat_p50_ms) s.sla = false;
-  }
-  if (has_value(c.sla_max_stall_ms)) {
-    if (!has_value(m.probe.max_stall_ms) || m.probe.max_stall_ms > c.sla_max_stall_ms) {
-      s.sla = false;
-    }
-  }
-  if (c.sla_stalls_max != UINT64_MAX) {
-    // 卡顿是累计量的窗口增量；没有探针样本就读不到增量，按不达标处理
-    if (m.probe.samples == 0 || m.probe.stalls > c.sla_stalls_max) s.sla = false;
-  }
+  s.sla = sla_satisfied(c, m);
   return s;
 }
 
@@ -1609,7 +1626,9 @@ pipeline::PipelineEndpoint to_endpoint(const PipelineConfig& pc) {
   return out;
 }
 
-Metrics to_metrics(const pipeline::PipelineMetrics& m) {
+}  // namespace
+
+Metrics sla_server_snapshot(const pipeline::PipelineMetrics& m) {
   Metrics out;
   out.fps = m.fps;
   out.frames_in = m.frames_in;
@@ -1649,7 +1668,7 @@ Metrics to_metrics(const pipeline::PipelineMetrics& m) {
 
 // pipeline::ProbeMetrics → 评测层 POD。NaN 一个都不补成 0：端到端的"没测到"
 // 与"测到 0 ms"在判分上是相反的结论（前者不可证明、后者是优秀）。
-ProbeSummary to_probe_summary(const pipeline::ProbeMetrics& p) {
+ProbeSummary sla_probe_snapshot(const pipeline::ProbeMetrics& p) {
   ProbeSummary out;
   out.alive = p.alive;
   out.samples = p.samples;
@@ -1681,6 +1700,8 @@ ProbeSummary to_probe_summary(const pipeline::ProbeMetrics& p) {
   out.unavailable_reason = p.unavailable_reason;
   return out;
 }
+
+namespace {
 
 struct SamplePoint {
   int64_t t_us = 0;
@@ -1727,7 +1748,7 @@ class MetricMonitor {
           (pr.samples != 0 && pr.samples != last_probe)) {
         last = m.samples;
         last_probe = pr.samples;
-        const SamplePoint p{now_us(), to_metrics(m), pr};
+        const SamplePoint p{now_us(), sla_server_snapshot(m), pr};
         std::lock_guard<std::mutex> lk(mu_);
         points_.push_back(p);
       }
@@ -1763,7 +1784,7 @@ ProbeSummary summarize_probe_window(const std::vector<SamplePoint>& pts) {
   const SamplePoint* last = nullptr;
   for (const auto& s : pts) {
     if (s.probe.samples == 0) continue;
-    const ProbeSummary one = to_probe_summary(s.probe);
+    const ProbeSummary one = sla_probe_snapshot(s.probe);
     if (first == nullptr) first = &s;
     last = &s;
     if (has_value(one.e2e.p50)) p50.push_back(one.e2e.p50);
@@ -1775,11 +1796,11 @@ ProbeSummary summarize_probe_window(const std::vector<SamplePoint>& pts) {
   if (last == nullptr) {
     // 一条探针指标都没收到：字段保持 NaN，但**原因**必须带出去（探针没起/绑不上端口/
     // 根本没上报），否则调用方只能看到"没有样本"，定位不到是哪一种。
-    if (!pts.empty()) out = to_probe_summary(pts.back().probe);
+    if (!pts.empty()) out = sla_probe_snapshot(pts.back().probe);
     out.samples = 0;
     return out;
   }
-  out = to_probe_summary(last->probe);
+  out = sla_probe_snapshot(last->probe);
   out.e2e.p50 = median(p50);
   out.e2e.p95 = median(p95);
   out.e2e.p99 = median(p99);
@@ -1807,7 +1828,7 @@ double window_probe_p99(const std::vector<SamplePoint>& pts, int64_t from_us, in
   for (const auto& s : pts) {
     if (s.t_us < from_us || s.t_us > to_us) continue;
     if (s.probe.samples == 0) continue;
-    const ProbeSummary one = to_probe_summary(s.probe);
+    const ProbeSummary one = sla_probe_snapshot(s.probe);
     if (has_value(one.e2e.p99)) v.push_back(one.e2e.p99);
   }
   return median(v);
@@ -2205,7 +2226,7 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
 
   // 故障窗口的端到端读数：注入后、修复前取一次探针快照。调用点是固定的（不按时间/
   // 不按数值决定是否调用），所以录制与回放消费同一条记录，窗口口径可复现。
-  const ProbeSummary fault_probe = to_probe_summary(pipe->probe_latest());
+  const ProbeSummary fault_probe = sla_probe_snapshot(pipe->probe_latest());
   // 「注入是否真的生效」（N-23）：同一时刻取一次 cued 侧计数快照，判 rate/drop/
   // ingress_drop 的故障有没有真的发生。取在故障窗口内、修复动作之前，读数就是
   // 该窗口的累计值（cued 每 case 重启，计数器从 0 起）。
@@ -2290,7 +2311,7 @@ CaseOutcome Engine::run_scripted_case_pipeline(const Case& c) const {
   std::vector<SamplePoint> post;
   auto take_sample = [&]() {
     const auto cued = pipe->latest();
-    post.push_back(SamplePoint{now_us(), to_metrics(cued), pipe->probe_latest()});
+    post.push_back(SamplePoint{now_us(), sla_server_snapshot(cued), pipe->probe_latest()});
     return cued;
   };
   // 收敛期：见 RunConfig::sla_settle_ms 的注释。回放模式跳过——录制时已经等过，
@@ -2681,30 +2702,9 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   // SPEC §7.5 的 verify→done 守卫：harness 重测，不信 agent 自报（事件里标 verify=measured）。
   // 声明了端到端阈值的 case，守卫也必须看探针：只看 cued 的 fps 会让 agent 在"延迟还没降下来"
   // 时就过 verify→done，把没修好的状态记成修好了。
-  ac.verify_sla = [&pipe, &c](const agent::Diagnosis&) {
-    const auto m = pipe->latest();
-    if (m.samples == 0) return false;
-    if (c.sla_fps_min > 0 && m.fps < c.sla_fps_min) return false;
-    if (m.dropped > c.sla_dropped_max) return false;
-    const bool e2e_required = has_value(c.sla_lat_p99_ms) || has_value(c.sla_lat_p50_ms) ||
-                              has_value(c.sla_max_stall_ms) || c.sla_stalls_max != UINT64_MAX;
-    if (!e2e_required) return true;
-    const auto p = pipe->probe_latest();
-    if (p.samples == 0) return false;  // 探针没有样本 = 无法证明端到端达标
-    if (has_value(c.sla_lat_p99_ms) &&
-        (!has_value(p.lat_p99_ms) || p.lat_p99_ms > c.sla_lat_p99_ms)) {
-      return false;
-    }
-    if (has_value(c.sla_lat_p50_ms) &&
-        (!has_value(p.lat_p50_ms) || p.lat_p50_ms > c.sla_lat_p50_ms)) {
-      return false;
-    }
-    if (has_value(c.sla_max_stall_ms) &&
-        double(p.max_stall_us) / 1000.0 > c.sla_max_stall_ms) {
-      return false;
-    }
-    return true;
-  };
+  ac.verify_sla = make_real_sla_verifier(c,
+      [&pipe] { return sla_server_snapshot(pipe->latest()); },
+      [&pipe] { return sla_probe_snapshot(pipe->probe_latest()); });
 
   agent::Runner runner(*client, reg, ac);
   agent::Budget budget;
@@ -2740,7 +2740,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
       const auto pm = pipe->latest();
       const auto pr = pipe->probe_latest();
       if (pm.samples > 0) {
-        post.push_back(SamplePoint{now_us(), to_metrics(pm), pr});
+        post.push_back(SamplePoint{now_us(), sla_server_snapshot(pm), pr});
       } else if (!replay_tools) {
         std::this_thread::sleep_for(std::chrono::milliseconds(kSleepStepMs));
       }
@@ -2750,7 +2750,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
       const auto pm = pipe->latest();
       const auto pr = pipe->probe_latest();
       if (pm.samples == 0) continue;
-      post.push_back(SamplePoint{now_us(), to_metrics(pm), pr});
+      post.push_back(SamplePoint{now_us(), sla_server_snapshot(pm), pr});
     }
   } else {
     const int64_t deadline_us = t_agent_end_us + int64_t(kRetestWaitMs) * 1000;

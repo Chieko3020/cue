@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -50,7 +51,8 @@ struct ProbeSummary {
   uint64_t frames = 0;
   uint64_t decoded = 0;
   uint64_t decode_errors = 0;
-  // 重测窗口内的卡顿增量（探针侧是进程累计值，跨窗口要差分；探针重启会清零，按 0 重计）
+  // 最终判分为重测窗口增量；live verify 为当前 epoch 累计值，不能称为窗口增量。
+  // 探针重启会清零，最终窗口跨重启按 0 重计。
   uint64_t stalls = 0;
   double max_stall_ms = kNoValue;  // 窗口内最长卡顿（ms）；NaN = 无样本
   Latency e2e;                     // 端到端 p50/p95/p99（ms）
@@ -68,7 +70,7 @@ struct Metrics {
   double fps = 0;
   uint64_t frames_in = 0;
   uint64_t frames_out = 0;
-  uint64_t dropped = 0;  // 重测窗口内的丢帧增量（不是进程累计值，累计值随重启清零）
+  uint64_t dropped = 0;  // 最终判分为窗口增量；live verify 为当前 epoch 累计值，随重启清零
   uint64_t injected = 0;
   uint64_t decoded = 0;
   uint64_t decode_errors = 0;
@@ -249,6 +251,20 @@ EvidenceCandidate parse_evidence_candidate(const std::string& raw);
 // 能承载该引用的观测上调用它。why 写不成立的原因（中文，可直接进日志/报告）。
 bool evidence_candidate_matches(const std::string& evidence, const Observation& obs,
                                 const EvidenceCandidate& cand, std::string& why);
+
+// One SLA decision for normalized measurements, independent of root/evidence grading.
+// Zero server samples, missing required probe samples, nonfinite active measurements and
+// a zero frame denominator for a positive completion threshold fail closed.
+bool sla_satisfied(const Case& c, const Metrics& m);
+
+// Snapshot adapters use only the shared observation PODs, never a pipeline implementation.
+Metrics sla_server_snapshot(const pipeline::PipelineMetrics& m);
+ProbeSummary sla_probe_snapshot(const pipeline::ProbeMetrics& p);
+
+// Live verify reads one server snapshot and, only when needed, one probe snapshot.
+// Counters here are cumulative in the current epoch, not final-window deltas.
+std::function<bool(const agent::Diagnosis&)> make_real_sla_verifier(
+    const Case& c, std::function<Metrics()> server, std::function<ProbeSummary()> probe);
 
 Score judge_case(const Case& c, const agent::RunResult& res, const std::vector<Observation>& obs,
                  const Metrics& final_metrics);

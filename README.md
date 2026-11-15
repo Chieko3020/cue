@@ -233,6 +233,11 @@ REPEAT=3 ./scripts/test-real-faults.sh
 2. **证据**：每条 evidence 必须是对某次工具观测的逐字 `key=value` 摘抄——归一化后必须是观测的子串，或由观测里的同名 key 值一致（计数类精确匹配，连续量允许 ±2%）。出现解释性文字、中文句子、合并多次观测都会判伪；任何一个 key 不存在或值不符即失配（fail-closed）。这条是防幻觉的唯一闸门。
 3. **SLA**：agent 结束后由 harness 重新测量（取最后 3 条采样、约 1 秒一条的中位 fps；`dropped` 取窗口增量而非进程累计值），不采信 agent 自报。
 
+real Runner 的 `verify → done` 与最终判分共用 `eval::sla_satisfied`，覆盖 fps（含 `usable_fps_min` 别名）、丢帧、帧完成率、端到端 p50/p99、最长卡顿与卡顿次数。边界含等号通过；服务端无样本、正帧完成率阈值的分母为零、声明的端到端指标无探针样本或有效有限读数时，均不能证明达标。未声明的字段不增加要求，未声明端到端阈值时不读取探针。
+
+verify 使用当时单点快照，丢帧与卡顿计数是当前 epoch 累计值，可能比最终窗口更保守；它们不是窗口增量。最终判分仍在 agent 结束后独立重测，按原规则聚合丢帧与卡顿增量。相同标准化输入的判据一致，但 verify 通过后若后续窗口退化，最终 SLA 仍可失败。MTTR 的恢复窗口口径保持原规则。
+
+
 `run_error` 的 case 不计入成功率分母。`pass^k` 是 repeat=k 时 k 次全部通过的 case 占比。
 
 **产帧源（`--producer lavfi`）**：默认 `none` = 靠外部推流，行为与以前完全一致（不多起进程、命令行不多参数）。`lavfi` 让 `cue-eval` 自己起 `cue-capture`（`testsrc2` 合成画面，默认 640×360@1200 kbps，参数形式同 `scripts/run.sh`）：每个 case 在 `cued` 起来之后拉起，case 结束（成功/失败/run_error）连同它的 `ffmpeg` 子进程一起收掉，会话日志落在 `<run_dir>/producer.log`。需要它是因为 `rate` 类故障注入的是**发送速率上限**——令牌桶只有在源码率高于上限时才会耗尽；外部脚本推的是同一个 64×64 静止 IDR（约 677 B/帧），经 x264 后码率极低，30 fps 合计远低于 0.1 Mbps，于是 `budget_drops=0`、`fps 30`，故障根本没发生而 SLA（`fps_min=25`）恒真。起不来/找不到时该 case 记 `run_error=producer_start_failed`，不会静默变成「无流」；与 `--endpoint` / `--replay-tools` 同用会直接拒（那两个后端不起进程，没有可推流的目标）。
