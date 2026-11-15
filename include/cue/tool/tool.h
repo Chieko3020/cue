@@ -5,6 +5,7 @@
 #include <expected>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,14 +26,11 @@ struct CallContext {
   ApprovalMode mode = ApprovalMode::Auto;
   // 评测模式下 case 允许的危险动作白名单（空 = 不允许 dangerous）
   std::vector<std::string> allowed_dangerous;
-  // 评测模式下 case 允许的**写动作**白名单（空 = 全部放行，保持 Mutating 的既有语义）。
-  // 存在的理由：pipeline_stop / pipeline_restart 是 Mutating 而不是 Dangerous——
-  // 它们不需要"危险动作"那一级审批（不碰沙箱、不改代码），但一次 pipeline_stop
-  // 会让正在评测的 case 直接断流、计数器归零，等于把判分对象拆掉。
-  // 所以评测器把 case.expect.allowed_actions 也传进来，当白名单**非空**时，
-  // Auto 模式下未列出的写工具一律拒绝；交互模式（cue run / cue serve）不设这一项，
-  // Mutating 的行为与以前完全一致。
-  std::vector<std::string> allowed_mutating;
+  // Mutating 工具的限制，Auto/Ask 均适用：未设置保留交互行为；
+  // 显式空 vector 拒绝全部 Mutating；非空只允许列出的工具。
+  // 用 std::vector<std::string>{} 表示空授权，reset()/nullopt 解除限制。
+  // Dangerous 仍独立遵守 allowed_dangerous (Auto) 或人工审批 (Ask)。
+  std::optional<std::vector<std::string>> allowed_mutating;
   // Ask 模式的回调，返回是否批准。参数带 Risk 是为了让审批 UI 能按风险分级呈现；
   // 阶段（agent::Stage）不在这里传——tool 层不得 include agent 层（SPEC §7.3）。
   std::function<bool(const ToolSpec&, Risk, const json& args)> approve;
@@ -122,7 +120,8 @@ class Registry {
 
   // 风险策略的唯一实现处（SPEC §7.4：dangerous 必须显式授权）：
   //   Deny → 拒一切非只读；Auto → 只放行 allowed_dangerous 内的 dangerous；
-  //   Ask  → 交给 ctx.approve，未提供回调按拒绝处理；未知工具按 Dangerous + 拒绝。
+  //   Mutating 的显式限制在 Auto/Ask 审批前生效。
+  //   Ask → 限制内交给 ctx.approve，未提供回调按拒绝处理；未知工具拒绝。
   // on_approved 在"已批准、尚未执行"时调用（审计事件需要记录意图先于结果）。
   GuardedCall call_guarded(const std::string& name, const json& args, const CallContext& ctx,
                            const std::function<void(Risk)>& on_approved = nullptr) const;

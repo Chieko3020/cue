@@ -266,7 +266,7 @@ cassette 只覆盖 LLM 侧，不覆盖工具观测。所以：
 
 ## 安全边界
 
-工具按风险分三级：`ReadOnly`（`query_metrics`、`fetch_observation`）、`Mutating`（`pipeline_set_param`）、`Dangerous`（`inject_fault`、`run_shell`）。审批模式 `Ask` 逐条等审批回调：控制台有审批队列，`cue run` 没接回调，非只读动作会被直接拒绝；`Auto` 自动批准但全量留痕，`Deny` 拒绝一切非只读动作。评测里 `Dangerous` 还受 case 的 `allowed_actions` 白名单约束。
+工具按风险分三级：`ReadOnly`（`query_metrics`、`fetch_observation`）、`Mutating`（`pipeline_set_param`、`pipeline_start/stop/restart`）、`Dangerous`（`inject_fault`、`run_shell`）。`Deny` 拒绝一切非只读动作。交互未设置 `allowed_mutating` 时，`Auto` 保留普通写工具自动批准并留痕，`Ask` 逐条等审批回调；控制台有审批队列，`cue run` 未接回调时拒绝非只读动作。显式 Mutating 限制在 Auto/Ask 中均生效，超出限制直接拒绝，不进入审批队列。Dangerous 在 Auto 中必须列入 `allowed_dangerous`，Ask 仍由人工回调审批。real 评测把 case 的 `allowed_actions` 同时作为 Mutating 限制与 Auto 危险授权；空集合或省略该字段都拒绝 agent 的全部写动作，仍允许只读观测。harness 自身声明的注入、重测和脚本修复使用独立内部路径。API 中 `allowed_mutating = std::vector<std::string>{}` 表示显式空授权，`reset()`/`std::nullopt` 表示未设置。
 
 `run_shell` 是防御最深的一层：只允许 25 个只读诊断命令（`cat` / `ls` / `ps` / `ss` / `df` / `free` / `stat` / `grep` / `head` 等），按命令名精确匹配、不读 `PATH`、**不经 shell**（`execve` 直接启动，参数不拼接）；进入子进程后设 `RLIMIT_CPU=5s`、`RLIMIT_AS=256 MiB`、`RLIMIT_FSIZE=8 MiB`、`RLIMIT_NPROC=16`、`RLIMIT_NOFILE=64`，再用 landlock 放行 `/usr`、`/lib`、`/lib64`（可读可执行）、`/etc`、`/proc`、`/sys`（只读）、工作目录（只读）、`/dev/null`（可写），并且**只**给临时目录与本次 run 的目录（`runs/<run_id>/`）写权限。以 root 启动时，子进程在 `execve` 前 `setgid`/`setuid` 到 `nobody`（顺序是 rlimit → landlock → 降权：landlock 不需要特权，而降权之后就改不了规则集）；非 root 启动时结果与审计里显式记 `not_root(uid=…)`，不静默。要求可写 `/`、`/etc`、`~/.ssh`、项目根这类路径会被**直接拒绝执行**（不是静默忽略），建不出来的可写路径如实列进 `paths_not_applied`。每次调用——包括被白名单或审批拒绝的——都写一行审计 jsonl（`runs/audit.jsonl` 或 `runs/<run_id>/audit.jsonl`），带参数、退出码、耗时、实际后端、生效的可写路径、降权结果与截断标记。
 

@@ -283,6 +283,10 @@ struct PipelineConfig {
 
 // ---------------------------------------------------------------- 解析
 
+// real Runner 的 case 授权配置；省略 allowed_actions 也表示显式空授权。
+// harness 自己的脚本修复/注入不经过此 agent 配置。
+tool::CallContext real_agent_call_context(const Case& c);
+
 std::expected<Case, std::string> parse_case(const json& j, const std::string& suite_name);
 std::expected<std::vector<Case>, std::string> load_suite(const std::string& path);
 

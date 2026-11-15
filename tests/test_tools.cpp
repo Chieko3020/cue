@@ -286,13 +286,13 @@ int main() {
           "超时参数越界分类为 Argument（schema 层拦下，不是 Timeout）");
   }
 
-  // ---------- 6) 写白名单只影响 Auto；空列表 = 全部放行（旧行为不变） ----------
+  // ---------- 6) 未设置写限制保留 Auto 交互行为 ----------
   {
     tool::CallContext open;
     open.mode = tool::ApprovalMode::Auto;
     check(reg.call_guarded("pipeline_stop", json::object(), open).status ==
               tool::GuardedCall::Status::Executed,
-          "Auto + 空写白名单：mutating 照旧放行");
+          "Auto + 未设置写限制：mutating 照旧放行");
     check(reg.risk_of("pipeline_stop") == tool::Risk::Mutating,
           "pipeline_stop 没有升成 dangerous（审批口径不变）");
 
@@ -311,6 +311,79 @@ int main() {
     check(reg.call_guarded("pipeline_start", json::object(), deny).status ==
               tool::GuardedCall::Status::ApprovalDenied,
           "Deny 模式仍然拒绝 lifecycle");
+  }
+
+  // C18: an explicitly empty case grant must never execute a real write handler.
+  {
+    tool::CallContext empty;
+    empty.allowed_mutating = std::vector<std::string>{};
+    const int stops = pipe.stops;
+    const auto denied = reg.call_guarded("pipeline_stop", json::object(), empty);
+    check(denied.status == tool::GuardedCall::Status::ApprovalDenied,
+          "C18 explicit empty grant denies pipeline_stop");
+    check(pipe.stops == stops, "C18 denied stop leaves real handler untouched");
+  }
+
+  // C18: the actual Registry policy across modes, grant presence, risk and Ask decisions.
+  for (auto mode : {tool::ApprovalMode::Auto, tool::ApprovalMode::Ask, tool::ApprovalMode::Deny}) {
+    for (int grant = 0; grant < 3; ++grant) {
+      for (bool consent : {false, true}) {
+        for (const auto& name : {"read", "write", "other_write", "danger", "unknown"}) {
+          int handlers = 0, approvals = 0, approved_events = 0;
+          tool::Registry r;
+          for (const auto& entry : std::vector<std::pair<std::string, tool::Risk>>{
+                   {"read", tool::Risk::ReadOnly}, {"write", tool::Risk::Mutating},
+                   {"other_write", tool::Risk::Mutating}, {"danger", tool::Risk::Dangerous}}) {
+            r.add({.name = entry.first, .desc = "C18", .risk = entry.second, .params = {}},
+                  [&](const json&) { ++handlers; return tool::ToolResult{"executed"}; });
+          }
+          tool::CallContext ctx;
+          ctx.mode = mode;
+          if (grant != 0) ctx.allowed_mutating = std::vector<std::string>{};
+          if (grant == 2) ctx.allowed_mutating = std::vector<std::string>{"write"};
+          if (grant == 2) ctx.allowed_dangerous = {"danger", "unknown"};
+          ctx.approve = [&](const tool::ToolSpec&, tool::Risk, const json&) {
+            ++approvals;
+            return consent;
+          };
+          const std::string n = name;
+          const bool read = n == "read", danger = n == "danger", unknown = n == "unknown";
+          const bool cap = !read && !danger && !unknown &&
+                           (grant == 1 || (grant == 2 && n != "write"));
+          const bool asks = !read && !unknown && !cap && mode == tool::ApprovalMode::Ask;
+          const bool allow = read || (!unknown && !cap &&
+              ((mode == tool::ApprovalMode::Ask && consent) ||
+               (mode == tool::ApprovalMode::Auto && (!danger || grant == 2))));
+          const auto result = r.call_guarded(n, json::object(), ctx,
+                                             [&](tool::Risk) { ++approved_events; });
+          check((result.status == tool::GuardedCall::Status::Executed) == allow,
+                "C18 matrix execution agrees with mode/grant/risk");
+          check(handlers == int(allow) && approved_events == int(allow),
+                "C18 matrix denied handler and on_approved never run");
+          check(approvals == int(asks), "C18 matrix Ask cap rejects before callback");
+          if (!allow) check(!result.outcome && result.outcome.error().kind ==
+                               tool::ToolError::Kind::ApprovalDenied,
+                            "C18 matrix denial keeps approval error category");
+        }
+      }
+    }
+  }
+  {
+    tool::CallContext ctx;
+    ctx.allowed_mutating = std::vector<std::string>{};
+    const int starts = pipe.starts, stops = pipe.stops;
+    const auto writes = pipe.set_calls.size(), faults = pipe.faults.size();
+    for (const auto& name : {"pipeline_start", "pipeline_stop", "pipeline_restart",
+                             "pipeline_set_param", "inject_fault", "run_shell"}) {
+      const auto result = reg.call_guarded(name, json::object(), ctx);
+      check(result.status == tool::GuardedCall::Status::ApprovalDenied && !result.outcome &&
+                result.outcome.error().kind == tool::ToolError::Kind::ApprovalDenied,
+            "C18 empty case denies each real write before argument validation");
+    }
+    check(pipe.starts == starts && pipe.stops == stops && pipe.set_calls.size() == writes &&
+              pipe.faults.size() == faults, "C18 empty grant preserves backend state");
+    check(reg.call_guarded("query_metrics", json::object(), ctx).status !=
+              tool::GuardedCall::Status::ApprovalDenied, "C18 read remains accessible");
   }
 
   // ---------- 8) query_metrics 的观测面：N-02 的证据候选真实存在 ----------

@@ -792,6 +792,14 @@ bool string_array(const json& j, const char* k, const std::string& case_id,
 
 }  // namespace
 
+tool::CallContext real_agent_call_context(const Case& c) {
+  tool::CallContext ctx;
+  ctx.mode = tool::ApprovalMode::Auto;
+  ctx.allowed_dangerous = c.allowed_actions;
+  ctx.allowed_mutating = c.allowed_actions;
+  return ctx;
+}
+
 std::expected<Case, std::string> parse_case(const json& j, const std::string& suite_name) {
   try {
     if (!j.is_object()) return std::unexpected("case 不是对象");
@@ -2664,12 +2672,7 @@ void Engine::run_real_case_impl(const Case& c, CaseOutcome& o) const {
   agent::Runner::Config ac;
   ac.model = cfg_.model;
   ac.system_prompt = pipeline::real_ops_system_prompt();
-  ac.ctx.mode = tool::ApprovalMode::Auto;
-  // SPEC §7.4：dangerous 工具必须由 case 显式授权；空集合 = 一个都不允许
-  ac.ctx.allowed_dangerous = c.allowed_actions;
-  // 写工具（含 lifecycle）同样受 case 的 allowed_actions 约束：pipeline_stop 会直接
-  // 停掉被测管线，让 case 断流（脚本路径不走 agent，所以只影响 real 模式）。
-  ac.ctx.allowed_mutating = c.allowed_actions;
+  ac.ctx = real_agent_call_context(c);
   ac.yuan_per_mtok = cfg_.yuan_per_mtok;
   // AC-8：评测路径同样要能被打断。RunConfig::cancel 由 apps/cue-eval.cpp 的信号处理置位，
   // Runner 每轮/每次 LLM 调用前检查，并把指针写进 ChatRequest.cancel 交给 curl 的中止回调。

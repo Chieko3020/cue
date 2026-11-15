@@ -170,6 +170,19 @@ else: raise RuntimeError(mode)
         if expected_error:
             checks["error"] = error.startswith(expected_error)
             checks["no_fake_score"] = bool(report) and report["raw_scored"] == 0 and report["run_errors"] == 1
+        if label == "missing":
+            # C17 validates entry identity before creating run state or children.
+            # Missing paths therefore fail as CLI fatal errors, not case run_errors.
+            diagnostics = []
+            for line in (work / "eval.log").read_text().splitlines():
+                try:
+                    diagnostics.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+            fatals = [row for row in diagnostics if isinstance(row, dict) and row.get("event") == "fatal"]
+            checks["entry_identity_diagnostic"] = len(fatals) == 1 and fatals[0].get("err") == "process entry identity unreadable: capture"
+            checks["no_processes_spawned"] = not seen and not fake_pids and not pidlog.exists()
+            checks["no_fake_score_or_run_state"] = not reports and not (work / "runs").exists()
         if label == "forced-timeout":
             checks["forced_timeout_with_descendant"] = timed_out and len(fake_pids) >= 2
         if label == "none":
@@ -191,7 +204,7 @@ else: raise RuntimeError(mode)
         print(label, code, error, checks, flush=True)
 
     run("none", fake, producer="none", record=False, expected_exit=0)
-    run("missing", out / "missing", expected_error="producer_start_failed", expected_exit=1)
+    run("missing", out / "missing", expected_exit=2)
     run("no-exec", noexec, expected_error="producer_start_failed", expected_exit=1)
     run("early", fake, mode="early", expected_error="producer_start_failed", expected_exit=1)
     run("no-stream", fake, mode="no-stream", expected_error="no_media_stream", expected_exit=1)

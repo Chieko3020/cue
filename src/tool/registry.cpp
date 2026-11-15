@@ -1,5 +1,6 @@
 #include "cue/tool/tool.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -163,11 +164,17 @@ GuardedCall Registry::call_guarded(const std::string& name, const json& args, co
   const ToolSpec* spec = find_spec(name);
 
   bool approved = true;
+  bool mutating_restricted = false;
   if (out.risk != Risk::ReadOnly) {
     if (spec == nullptr) {
       approved = false;  // 未知工具按最危险处理：无 spec 就没有可审批的对象
     } else if (ctx.mode == ApprovalMode::Deny) {
       approved = false;
+    } else if (out.risk == Risk::Mutating && ctx.allowed_mutating &&
+               std::find(ctx.allowed_mutating->begin(), ctx.allowed_mutating->end(), name) ==
+                   ctx.allowed_mutating->end()) {
+      approved = false;  // 显式限制不能被 Ask 回调覆盖，也不进入等待审批。
+      mutating_restricted = true;
     } else if (ctx.mode == ApprovalMode::Auto) {
       if (out.risk == Risk::Dangerous) {
         bool allowed = false;
@@ -178,18 +185,6 @@ GuardedCall Registry::call_guarded(const std::string& name, const json& args, co
           }
         }
         approved = allowed;
-      } else if (out.risk == Risk::Mutating && !ctx.allowed_mutating.empty()) {
-        // 只有调用方显式给了写白名单才收紧（空 = 全部放行，旧行为不变）。
-        // 这一条是为评测加的：pipeline_stop 会把被测管线停掉，必须受 case 的
-        // allowed_actions 约束，但它不值得升成 Dangerous（那会让所有 case 都要
-        // 重新授权一遍写工具）。
-        approved = false;
-        for (const auto& a : ctx.allowed_mutating) {
-          if (a == name) {
-            approved = true;
-            break;
-          }
-        }
       }
     } else {  // Ask：没有回调就等于没人批准
       approved = ctx.approve ? ctx.approve(*spec, out.risk, args) : false;
@@ -198,9 +193,10 @@ GuardedCall Registry::call_guarded(const std::string& name, const json& args, co
 
   if (!approved) {
     out.status = GuardedCall::Status::ApprovalDenied;
-    // 文案要能直接指导模型：它看到"被拒绝"时唯一正确的动作是去申请审批，
-    // 而不是改参数重试（那样会陷进死循环）。
+    // 显式限制需要调用方调整授权；普通审批拒绝仍提示申请审批。
+    // 两者都不应被当作参数错误重试。
     out.outcome = std::unexpected(ToolError{ToolError::Kind::ApprovalDenied,
+                                           mutating_restricted ? "被拒绝：工具不在显式写授权内；需要调整授权，不要改参数重试" :
                                            std::string("被拒绝（") + risk_name(out.risk) +
                                                "）；如确需执行，请先申请审批，不要改参数重试"});
     return out;

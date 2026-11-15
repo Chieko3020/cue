@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "cue/eval/eval.h"
+#include "cue/agent/session.h"
 #include "cue/common/recorded_pipeline.h"
 
 namespace eval = cue::eval;
@@ -76,6 +77,107 @@ bool evidence_of(const std::string& ev) {
 }  // namespace
 
 int main() {
+  // C18: use the same case configuration builder as Engine::real plus the actual Runner.
+  // This is a controlled LLM seam, not a full pipeline/Engine startup or SLA acceptance.
+  {
+    std::ifstream fixture("suites/m4-diagnosis.json");
+    nlohmann::json suite;
+    fixture >> suite;
+    const std::vector<std::string> writes = {"pipeline_stop", "pipeline_restart",
+        "pipeline_start", "pipeline_set_param", "inject_fault", "run_shell"};
+    for (int scenario = 0; scenario < 7; ++scenario) {
+      auto source = suite["cases"][0];
+      if (scenario == 0) source["expect"].erase("allowed_actions");
+      else source["expect"]["allowed_actions"] = scenario == 2 ?
+          nlohmann::json(writes) : nlohmann::json::array();
+      const auto parsed = eval::parse_case(source, "C18");
+      check(bool(parsed), "C18 real case parses omitted/empty/nonempty grants");
+      if (!parsed) continue;
+      auto ctx = eval::real_agent_call_context(*parsed);
+      check(ctx.allowed_mutating.has_value(), "C18 eval always sets a Mutating restriction");
+      if (scenario == 3 || scenario == 4 || scenario == 6) ctx.allowed_mutating.reset();
+      int approvals = 0;
+      if (scenario >= 4) {
+        ctx.mode = cue::tool::ApprovalMode::Ask;
+        ctx.approve = [&](const auto&, auto, const auto&) { ++approvals; return scenario != 6; };
+      }
+      // 0 omitted, 1 empty, 2 all granted, 3 default interaction,
+      // 4 unrestricted Ask accept, 5 capped Ask accept, 6 Ask user reject.
+      int write_calls = 0, reads = 0;
+      cue::tool::Registry reg;
+      for (const auto& name : writes) {
+        const auto risk = (name == "inject_fault" || name == "run_shell") ?
+            cue::tool::Risk::Dangerous : cue::tool::Risk::Mutating;
+        reg.add({.name = name, .desc = "C18", .risk = risk, .params = {}},
+                [&](const auto&) { ++write_calls; return cue::tool::ToolResult{"changed"}; });
+      }
+      reg.add({.name = "query_metrics", .desc = "C18", .risk = cue::tool::Risk::ReadOnly,
+               .params = {}}, [&](const auto&) { ++reads; return cue::tool::ToolResult{"observed"}; });
+      cue::llm::ScriptedClient llm;
+      auto enqueue = [&](const std::string& name) {
+        cue::llm::ChatResponse response;
+        response.tool_calls.push_back({.id = name, .name = name, .arguments = "{}"});
+        llm.push(std::move(response));
+      };
+      for (const auto& name : writes) enqueue(name);
+      enqueue("query_metrics");
+      char path[] = "/tmp/cue-c18-session-XXXXXX";
+      const int fd = mkstemp(path);
+      check(fd >= 0, "C18 session temporary file created");
+      if (fd < 0) continue;
+      close(fd);
+      auto session = agent::SessionLog::open(path, true);
+      check(bool(session), "C18 persistent session opens");
+      if (!session) { unlink(path); continue; }
+      agent::Runner::Config cfg;
+      cfg.model = "scripted";
+      cfg.ctx = ctx;
+      cfg.session = session->get();
+      agent::Budget budget;
+      budget.max_turns = 7;
+      int denied = 0, calls = 0, results = 0, errors = 0;
+      agent::Runner runner(llm, reg, cfg);
+      const auto outcome = runner.run("C18 authorization", budget, [&](const agent::Event& e) {
+        if (e.type == "approval.denied") ++denied;
+        if (e.type == "tool.call") ++calls;
+        if (e.type == "tool.result") ++results;
+        if (e.type == "tool.error") ++errors;
+      });
+      session->reset();
+      const int allowed = scenario == 2 || scenario == 4 ? 6 : scenario == 3 ? 4 :
+                          scenario == 5 ? 2 : 0;
+      check(write_calls == allowed && reads == 1, "C18 Runner real handlers obey grants");
+      check(denied == 6 - allowed && calls == allowed + 1 && results == allowed + 1 && errors == 0,
+            "C18 Runner denial events exclude tool.call/result/error");
+      check(approvals == (scenario == 4 || scenario == 6 ? 6 : scenario == 5 ? 2 : 0),
+            "C18 Runner capped Ask never waits for ordinary writes");
+      check(outcome.final_stage != agent::Stage::Done && !outcome.error.empty(),
+            "C18 bounded authorization probe never reports successful repair");
+      int stored_denied = 0, stored_ok = 0;
+      std::ifstream persisted(path);
+      std::string line;
+      while (std::getline(persisted, line)) {
+        const auto row = nlohmann::json::parse(line);
+        if (row.value("t", "") == "tool") {
+          if (row.value("approval_denied", false)) ++stored_denied;
+          if (row.value("ok", false)) ++stored_ok;
+        }
+      }
+      const auto loaded = agent::load_session(path);
+      check(bool(loaded), "C18 session denial evidence reloads");
+      if (loaded) check(loaded->used_mutating == (allowed > 0) && loaded->used_observe,
+                        "C18 persistent stage guards count only executed writes/observations");
+      int returned_denials = 0;
+      if (loaded) for (const auto& msg : loaded->messages) {
+        if (msg.role == "tool" && msg.content.find("被拒绝") != std::string::npos) ++returned_denials;
+      }
+      check(stored_denied == denied && stored_ok == allowed + 1 && returned_denials == denied,
+            "C18 persisted approval_denied and model error replies match events");
+      unlink(path);
+      unlink((std::string(path) + ".lock").c_str());
+    }
+  }
+
   // 1) 全对
   {
     const auto s = eval::judge_case(make_case(), good_result(), make_obs(), good_metrics());
