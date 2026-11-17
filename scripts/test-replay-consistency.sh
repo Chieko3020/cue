@@ -20,7 +20,7 @@
 #   REPEAT=3 BUILD_DIR=build ./scripts/test-replay-consistency.sh
 #
 # 环境变量：BUILD_DIR（默认 build）、REPEAT（默认 3）、SUITE（默认 suites/m4-diagnosis.json）、
-#           WORK_ROOT（默认 runs/ac6-replay）、PUSH_SECONDS（每次推流秒数，默认 2）
+#           WORK_ROOT（默认 runs/ac6-replay）、PUSH_SECONDS（每次连接实际推流秒数，默认 5）
 #
 # 前置：node（scripts/test-client.mjs 合成推流）、python3（状态断言）。
 # 端口：cue-eval 的子进程后端把 cued 的 WS/probe 端口固定在 9000/9001，被占用时直接失败，
@@ -34,7 +34,7 @@ BUILD_DIR="${BUILD_DIR:-build}"
 REPEAT="${REPEAT:-3}"
 SUITE="${SUITE:-suites/m4-diagnosis.json}"
 WORK="${WORK_ROOT:-$ROOT/runs/ac6-replay}"
-PUSH_SECONDS="${PUSH_SECONDS:-2}"
+PUSH_SECONDS="${PUSH_SECONDS:-5}"
 WS_PORT=9000
 PROBE_PORT=9001
 
@@ -58,6 +58,22 @@ case "$REPEAT" in
   ''|*[!0-9]*) fail "REPEAT 必须是正整数（收到 $REPEAT）" ;;
 esac
 [ "$REPEAT" -ge 1 ] || fail "REPEAT 必须 >= 1"
+
+# test-client 在推流前最多等待 8 次 200ms 时钟探测，关闭后还有 200ms 退出等待。
+# 外层超时为连接、对时和退出留出 3 秒；检查 Node 定时器可表示的秒数。
+PUSH_TIMEOUT=$(python3 - "$PUSH_SECONDS" <<'PY'
+import re
+import sys
+
+seconds = sys.argv[1]
+if not re.fullmatch(r"[0-9]+(?:\.[0-9]*)?|\.[0-9]+", seconds):
+    sys.exit("PUSH_SECONDS 必须是正数秒")
+duration = float(seconds)
+if not 0 < duration <= 2_147_483.647:
+    sys.exit("PUSH_SECONDS 超出 Node 定时器范围")
+print(f"{duration + 3:.6f}")
+PY
+) || fail "无效的推流时长（PUSH_SECONDS=$PUSH_SECONDS）"
 
 port_busy_tcp() { ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .; }
 port_busy_udp() { ss -H -lun "sport = :$1" 2>/dev/null | grep -q .; }
@@ -83,17 +99,18 @@ port_busy_udp "$PROBE_PORT" && fail "UDP :$PROBE_PORT 已被占用（cue-eval �
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
-note "工作目录 $WORK（BUILD_DIR=$BUILD_DIR REPEAT=$REPEAT）"
+note "工作目录 $WORK（BUILD_DIR=$BUILD_DIR REPEAT=$REPEAT PUSH_SECONDS=$PUSH_SECONDS PUSH_TIMEOUT=$PUSH_TIMEOUT）"
 
 # ---- 合成推流：真 WS 帧 → cued 解码 → 指标里就有真实抖动 ----
 # probe 由 harness 自己托管（T-02 起），本脚本不再单独拉起：先起 probe 再起 cued
 # 是 harness 的职责，重复起会撞 :9001 端口、让 case 报 probe_unavailable。
 setsid bash -c '
   while :; do
-    timeout "$3" node "$1/scripts/test-client.mjs" "ws://127.0.0.1:$2/" >/dev/null 2>&1 || true
+    # --foreground 让 timeout 与 node 保持在 setsid 成组的清理范围内。
+    timeout --foreground --kill-after=1s "$4" node "$1/scripts/test-client.mjs" "ws://127.0.0.1:$2/" "$3" || true
     sleep 0.1
   done
- ' _ "$ROOT" "$WS_PORT" "$PUSH_SECONDS" >"$WORK/pusher.log" 2>&1 &
+ ' _ "$ROOT" "$WS_PORT" "$PUSH_SECONDS" "$PUSH_TIMEOUT" >"$WORK/pusher.log" 2>&1 &
 PUSH_PID=$!
 sleep 0.3
 
@@ -214,8 +231,9 @@ PY
 # ---- 4) 负向：改掉录制里一个 set_param 的 key，回放必须报错 ----
 note "负向用例：改 key 后回放必须失败"
 cp -r "$WORK/tools" "$WORK/tools-bad"
-python3 - "$WORK/tools-bad" <<'PY'
+NEG_RECORDING=$(python3 - "$WORK/tools-bad" <<'PY'
 import glob
+from pathlib import Path
 import sys
 
 bad_dir = sys.argv[1]
@@ -227,19 +245,60 @@ for path in sorted(glob.glob(f"{bad_dir}/*.tools.jsonl")):
             lines[i] = line.replace('"key":"bitrate_kbps"', '"key":"gop"', 1)
             with open(path, "w", encoding="utf-8") as out:
                 out.write("\n".join(lines) + "\n")
-            print(path)
+            print(Path(path).name.removesuffix(".tools.jsonl"))
             sys.exit(0)
 sys.exit("录制里找不到 set_param(key=bitrate_kbps) 的条目，负向用例无法构造")
 PY
+)
 
 NEG_LOG="$WORK/negative.log"
 if "$EVAL" --suite "$SUITE" --mode scripted --replay-tools "$WORK/tools-bad" \
       --cued "$CUED" --out "$WORK/negative" >"$NEG_LOG" 2>&1; then
   fail "负向用例竟然通过了：参数不符必须报错，不能静默给默认值"
+else
+  NEG_RC=$?
 fi
-grep -q "参数不符" "$NEG_LOG" || fail "负向用例失败但没有「参数不符」说明（见 $NEG_LOG）"
-grep -q "tools_replay_miss" "$NEG_LOG" || fail "负向用例失败但没有记 tools_replay_miss（见 $NEG_LOG）"
-grep -q "run_error\[.*tools_replay_miss" "$NEG_LOG" || fail "负向用例没有把 miss 记成 run_error（见 $NEG_LOG）"
-note "负向用例按预期失败（日志：$NEG_LOG）"
+note "负向回放 recording=$NEG_RECORDING exit=$NEG_RC（日志：$NEG_LOG）"
+if grep -q "启动 cued" "$NEG_LOG"; then
+  fail "负向回放启动了 cued（回放必须只读录制，不 spawn 后端）"
+fi
+python3 - "$WORK/negative" "$NEG_RECORDING" "$SUITE" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+run_dir, recording, suite_path = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+
+
+def recording_stem(case_id):
+    # recorded_pipeline.cpp sanitizes each byte of the case ID for the filename.
+    stem = re.sub(rb"[^A-Za-z0-9._-]", b"-", case_id.encode()).decode("ascii")
+    return stem if stem.strip(".") else "case"
+
+
+with suite_path.open(encoding="utf-8") as suite:
+    case_ids = [case["id"] for case in json.load(suite)["cases"]
+                if recording_stem(case["id"]) == recording]
+if len(case_ids) != 1:
+    sys.exit(f"录制 {recording} 应对应一个 case，实际 {case_ids}")
+case_id = case_ids[0]
+paths = list(run_dir.glob("run-*/state.jsonl"))
+if len(paths) != 1:
+    sys.exit(f"负向回放应当恰好有一个 state.jsonl，实际 {paths}")
+with paths[0].open(encoding="utf-8") as state:
+    rows = [json.loads(line) for line in state if line.strip()]
+matches = [row["outcome"] for row in rows
+           if row["t"] == "case" and row["outcome"]["id"] == case_id]
+if len(matches) != 1:
+    sys.exit(f"负向回放的 {case_id} 应当恰好出现一次，实际 {len(matches)}")
+outcome = matches[0]
+error = outcome["error_kind"]
+if not error.startswith("tools_replay_miss:") or "参数不符" not in error:
+    sys.exit(f"负向回放的 {case_id} 没有因参数不符记为 tools_replay_miss：{error!r}")
+if outcome["scored"] is not False or outcome["rate_eligible"] is not False:
+    sys.exit(f"负向回放的 {case_id} 不应计分或纳入计分率")
+PY
+note "负向用例按预期失败（状态：$WORK/negative/run-*/state.jsonl）"
 
 note "全部通过。证据：$WORK（record.log / replay-*.log / negative.log / tools/*.tools.jsonl）"
