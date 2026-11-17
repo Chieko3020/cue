@@ -426,7 +426,8 @@ print()
 print("一致性：每个 case 的 %d 次 root_cause 完全相同、SLA 判定完全相同（全部通过）。" % repeat)
 print("离散度（故障态是 cued 的 1 s 窗口读数，编码/限速受限时窗口本身就抖；修复态取 %d 条中位）：" % repeat)
 for cid, v in verdicts.items():
-    print(f"  {cid}: [{v[0]}] 故障态 {v[1]:.2f} fps（repeat 间 {v[3]:.0%}）、修复态 {v[2]:.2f} fps")
+    fault_spread = "N/A" if v[3] is None else f"{v[3]:.0%}"
+    print(f"  {cid}: [{v[0]}] 故障态 {v[1]:.2f} fps（repeat 间 {fault_spread}）、修复态 {v[2]:.2f} fps")
 print("判据：故障态每条读数在丢包/限速/编码/排队类上低于阈值 ≥3 fps（中位 ≥5 fps）；"
       "时延类（network_delay）反过来要求故障态 fps 仍然达标（它不降 fps），"
       "且故障窗口 e2e p99 越过声明阈值、修复后回落。修复态每次都高于阈值 ≥1 fps。")

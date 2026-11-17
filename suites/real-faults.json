@@ -462,7 +462,7 @@
       }
     },
     {
-      "id": "res-4k-veryfast",
+      "id": "res-4k-faster",
       "seed": 53,
       "fault": {
         "kind": "none"
@@ -473,14 +473,14 @@
         "height": 2160,
         "bitrate_kbps": 4000,
         "gop": 60,
-        "preset": "veryfast"
+        "preset": "faster"
       },
       "repair": {
         "width": 1280,
         "height": 720,
         "preset": "ultrafast"
       },
-      "prompt": "输出分辨率被改成了 4K：fps 掉到 22 以下，encode 与 op（缩放）两段都吃满 CPU。用工具观测后定位根因并修复，使 cued 的 fps 恢复到 25 以上。",
+      "prompt": "当前输出为 4K，实际帧率和编码耗时需通过工具观测确认。请定位根因并修复，使 cued 达到 25 fps。",
       "expect": {
         "root_cause": "resolution_too_high",
         "evidence_candidates": [
