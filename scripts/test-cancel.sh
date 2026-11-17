@@ -84,16 +84,24 @@ command -v python3 >/dev/null 2>&1 || fail "需要 python3（scripts/fake-llm.py
 
 # 端口预检：cue run 把 cued 的 ws/probe 端口写死在 9000/9001；被占用会让
 # 「管线在跑」这个场景根本起不来，报出来的失败会指向错误的方向。
-for port in "$WS_PORT" "$PROBE_PORT"; do
+for endpoint in "tcp:$WS_PORT" "udp:$PROBE_PORT"; do
+  transport="${endpoint%%:*}"
+  port="${endpoint##*:}"
   if ! python3 -c 'import socket,sys
-s = socket.socket()
+transport, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM if transport == "tcp" else socket.SOCK_DGRAM)
 try:
-    s.bind(("127.0.0.1", int(sys.argv[1])))
+    if transport == "tcp":
+        # Match cued: TIME_WAIT permits a new listener, an active listener does not.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port))
+    if transport == "tcp":
+        s.listen(1)
 except OSError:
     sys.exit(1)
 finally:
-    s.close()' "$port"; then
-    fail "端口 $port 已被占用（cue run 的 cued 端口写死为 $WS_PORT/$PROBE_PORT）"
+    s.close()' "$transport" "$port"; then
+    fail "$transport 端口 $port 已被占用（cue run 的 cued 端口写死为 $WS_PORT/$PROBE_PORT）"
   fi
 done
 
