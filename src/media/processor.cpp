@@ -134,17 +134,17 @@ ProcessorRegistry ProcessorRegistry::builtins() {
   ProcessorRegistry r;
   r.add("passthrough", [](const ProcessorOptions&) -> std::expected<std::unique_ptr<Processor>, std::string> {
     return std::make_unique<Passthrough>();
-  });
+  }).value();
   r.add("scale", [](const ProcessorOptions& o) -> std::expected<std::unique_ptr<Processor>, std::string> {
     if (o.width <= 0 || o.height <= 0 || o.width % 2 || o.height % 2)
       return std::unexpected("scale dimensions must be positive and even");
     return std::make_unique<Scale>(o.width, o.height);
-  });
+  }).value();
   r.add("transcode", [](const ProcessorOptions& o) -> std::expected<std::unique_ptr<Processor>, std::string> {
     auto p = std::make_unique<Transcode>(); std::string err;
     if (!p->open(o, err)) return std::unexpected(err);
     return p;
-  });
+  }).value();
   return r;
 }
 std::expected<void, ProcessorError> ProcessorChain::configure(const ProcessorRegistry& registry,
